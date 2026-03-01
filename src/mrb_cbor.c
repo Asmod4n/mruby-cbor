@@ -419,12 +419,11 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
   uint8_t* tmp = (uint8_t*)mrb_alloca(mrb, len);
   memcpy(tmp, buf, len);
 
-  /* 2) Für negative Werte: n -> n+1 (immer big-endian) */
+  /* Tag 3: n -> n+1, damit value = -(n+1) = -1-n */
   if (negative) {
     increment_be(tmp, len);
   }
 
-  /* 3) Endian-Konvertierung für MRuby-BigInt */
 #ifndef MRB_ENDIAN_BIG
   /* MRuby läuft auf little-endian → Bytes umdrehen */
   for (size_t i = 0, j = len - 1; i < j; i++, j--) {
@@ -434,16 +433,17 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
   }
 #endif
 
-  /* 4) Bytes → BigInt */
+  /* Bytes → BigInt */
   mrb_value bn = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
 
-  /* 5) Vorzeichen anwenden */
+  /* Vorzeichen anwenden */
   if (negative) {
-    return mrb_bint_neg(mrb, bn);
+    return mrb_bint_neg(mrb, bn);   /* -(n+1) */
   }
   return bn;
 }
 #endif
+
 
 
 // ============================================================================
@@ -478,12 +478,12 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
       uint64_t tag = read_len(mrb, r, info);
 
 #ifdef MRB_USE_BIGINT
-      if (tag == 2 || tag == 3) {
+      if (likely(tag == 2 || tag == 3)) {
         uint8_t b2 = reader_read8(mrb, r);
         uint8_t major2 = (uint8_t)(b2 >> 5);
         uint8_t info2  = (uint8_t)(b2 & 0x1F);
 
-        if (major2 == 2) {
+        if (likely(major2 == 2)) {
           uint64_t len = read_len(mrb, r, info2);
           size_t off   = reader_offset(r);
           r->p        += len;
@@ -499,7 +499,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
       }
 #endif
 
-      return decode_value(mrb, r, src);
+      mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without BigInt Support");
     }
 
     case 7:
@@ -710,48 +710,65 @@ encode_bignum(Writer* w, mrb_value obj)
   mrb_state* mrb = w->mrb;
 
   mrb_int sign = mrb_bint_sign(mrb, obj);
-  mrb_value abs = (sign < 0) ? mrb_bint_abs(mrb, obj) : obj;
 
-  /* 1) BigInt → Hex (BIG-ENDIAN) */
-  mrb_value hex = mrb_bint_to_s(mrb, abs, 16);
+  /* Betrag holen */
+  mrb_value mag = mrb_bint_abs(mrb, obj);
+
+  /* Tag 3: n = |value| - 1 */
+  if (sign < 0) {
+    mrb_value one = mrb_bint_new_int(mrb, 1);
+    mag = mrb_bint_sub(mrb, mag, one);
+  }
+
+  /* Betrag (oder Betrag-1) als Hex */
+  mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
   const char* p = RSTRING_PTR(hex);
   mrb_int len = RSTRING_LEN(hex);
 
-  /* 2) ungerade Länge → führende '0' */
+  /* ungerade Länge → führende 0 */
   mrb_bool odd = (len & 1);
   mrb_int nibs = odd ? (len + 1) : len;
-  mrb_int blen = nibs / 2;
 
-  uint8_t* buf = (uint8_t*)mrb_alloca(mrb, blen);
+  /* führende Null-Bytes bestimmen */
+  mrb_int leading_zero_nibbles = 0;
+  while (leading_zero_nibbles < len && p[leading_zero_nibbles] == '0')
+    leading_zero_nibbles++;
 
-  /* 3) Hex → Bytes (BIG-ENDIAN) */
+  mrb_int off_bytes   = leading_zero_nibbles / 2;
+  mrb_int total_bytes = nibs / 2;
+  mrb_int final_len   = total_bytes - off_bytes;
+
+  /* CBOR Tag */
+  cbor_writer_putc(w, (sign < 0) ? 0xC3 : 0xC2);
+
+  /* Länge */
+  encode_len(w, 2, (uint64_t)final_len);
+
+  /* Bytes direkt streamen */
   mrb_int si = 0;
-  mrb_int di = 0;
 
+  /* odd → erster Nibble ist low-only */
   if (odd) {
-    buf[di++] = hex_nibble(p[0]);
+    uint8_t b = hex_nibble(p[0]);
+    if (off_bytes == 0) cbor_writer_putc(w, b);
     si = 1;
   }
+
+  mrb_int byte_index = odd ? 1 : 0;
 
   while (si < len) {
     uint8_t hi = hex_nibble(p[si++]);
     uint8_t lo = hex_nibble(p[si++]);
-    buf[di++] = (uint8_t)((hi << 4) | lo);
+    uint8_t b  = (uint8_t)((hi << 4) | lo);
+
+    if (byte_index >= off_bytes)
+      cbor_writer_putc(w, b);
+
+    byte_index++;
   }
-
-  /* 4) führende 0-Bytes trimmen */
-  mrb_int off = 0;
-  while (off < blen - 1 && buf[off] == 0) off++;
-
-  mrb_int final_len = blen - off;
-
-  /* 5) CBOR Tag 2/3 */
-  cbor_writer_putc(w, (sign < 0) ? 0xC3 : 0xC2);
-
-  /* 6) Länge + Bytes */
-  encode_len(w, 2, (uint64_t)final_len);
-  cbor_writer_write(w, buf + off, final_len);
 }
+
+
 #endif
 
 // ============================================================================
@@ -774,16 +791,12 @@ encode_array(Writer* w, mrb_value ary)
   }
 }
 
-typedef struct {
-  Writer *w;
-  mrb_state *mrb;
-} encode_map_ctx;
+
 
 static int
 encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
-  encode_map_ctx *ctx = (encode_map_ctx*)data;
-  Writer *w = ctx->w;
+  Writer *w = (Writer*)data;
 
   encode_value(w, key);
   encode_value(w, val);
@@ -801,11 +814,8 @@ encode_map(Writer* w, mrb_value hash)
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
 
-  /* Kontext für foreach */
-  encode_map_ctx ctx = { w, mrb };
-
   /* direkte Iteration über Hash-Table */
-  mrb_hash_foreach(mrb, h, encode_map_foreach, &ctx);
+  mrb_hash_foreach(mrb, h, encode_map_foreach, w);
 }
 
 
@@ -1164,102 +1174,77 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
 static mrb_value
 cbor_lazy_aref(mrb_state *mrb, mrb_value self)
 {
-    cbor_lazy_t *p = DATA_PTR(self);
-    mrb_value key;
-    mrb_get_args(mrb, "o", &key);
+  cbor_lazy_t *p = DATA_PTR(self);
+  mrb_value key;
+  mrb_get_args(mrb, "o", &key);
 
-    const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
-    size_t total_len = (size_t)RSTRING_LEN(p->buf);
+  const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
+  size_t total_len    = (size_t)RSTRING_LEN(p->buf);
 
-    if (unlikely(p->offset >= total_len)) {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
+  if (unlikely(p->offset >= total_len)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
+  }
+
+  Reader r;
+  /* WICHTIG: wie bei cbor_lazy_value – base ist immer der Anfang des gesamten Buffers */
+  r.base = base;
+  r.p    = base + p->offset;
+  r.end  = base + total_len;
+
+  uint8_t b    = reader_read8(mrb, &r);
+  uint8_t major = (uint8_t)(b >> 5);
+  uint8_t info  = (uint8_t)(b & 0x1F);
+
+  switch (major) {
+    case 4: { /* Array */
+      key = mrb_ensure_int_type(mrb, key);
+
+      mrb_int idx = mrb_integer(key);
+      uint64_t len = read_len(mrb, &r, info);
+
+      if (idx < 0) idx += (mrb_int)len;
+      if (unlikely((uint64_t)idx >= len || idx < 0)) {
+        mrb_raisef(mrb, E_INDEX_ERROR,
+                   "index %d outside of array bounds: %d...%d",
+                   idx, -(mrb_int)len, (mrb_int)len);
+      }
+
+      for (mrb_int i = 0; i < idx; i++) {
+        skip_cbor(mrb, &r);
+      }
+
+      uint32_t elem_offset = (uint32_t)(r.p - base);
+      return cbor_lazy_new(mrb, p->buf, elem_offset);
     }
 
-    Reader r;
-    reader_init(&r, base + p->offset, total_len - p->offset);
+    case 5: { /* Map */
+      uint64_t pairs = read_len(mrb, &r, info);
 
-    uint8_t b = reader_read8(mrb, &r);
-    uint8_t major = b >> 5;
-    uint8_t info  = b & 0x1F;
+      for (uint64_t i = 0; i < pairs; i++) {
+        /* Key vollständig decodieren */
+        mrb_value decoded_key = decode_value(mrb, &r, p->buf);
 
-    switch (major) {
-        case 4: { // Array
-            key = mrb_ensure_int_type(mrb, key);
+        /* Value beginnt jetzt an r.p */
+        uint32_t value_offset = (uint32_t)(r.p - base);
 
-            mrb_int idx = mrb_integer(key);
-            uint64_t len = read_len(mrb, &r, info);
-
-            if (idx < 0) idx += (mrb_int)len;
-            if (unlikely((uint64_t)idx >= len || idx < 0)) {
-                mrb_raisef(mrb, E_INDEX_ERROR, "index %d outside of array bounds: %d...%d", idx, -(mrb_int)len, (mrb_int)len);
-            }
-
-            // skip elements until idx
-            for (mrb_int i = 0; i < idx; i++) {
-                skip_cbor(mrb, &r);
-            }
-
-            // element offset points to the element header
-            uint32_t elem_offset = (uint32_t)(r.p - base);
-            return cbor_lazy_new(mrb, p->buf, elem_offset);
+        if (mrb_equal(mrb, decoded_key, key)) {
+          return cbor_lazy_new(mrb, p->buf, value_offset);
         }
 
-        case 5: { // Map
-            key = mrb_obj_as_string(mrb, key);
+        /* Value überspringen, wenn Key nicht passt */
+        skip_cbor(mrb, &r);
+      }
 
-            const char *kptr = RSTRING_PTR(key);
-            size_t klen = RSTRING_LEN(key);
-
-            uint64_t pairs = read_len(mrb, &r, info);
-
-            for (uint64_t i = 0; i < pairs; i++) {
-                if (r.p >= r.end) mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
-
-                // read key
-                const uint8_t *key_start = r.p;
-                uint8_t kb = reader_read8(mrb, &r);
-                uint8_t kmaj = kb >> 5;
-                uint8_t kinfo = kb & 0x1F;
-
-                if (kmaj != 3) {
-                    // skip non-string key
-                    r.p = key_start;
-                    skip_cbor(mrb, &r); // key
-                    skip_cbor(mrb, &r); // value
-                    continue;
-                }
-
-                uint64_t key_bytes_len = read_len(mrb, &r, kinfo);
-                if ((uint64_t)(r.end - r.p) < key_bytes_len) {
-                    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR string out of bounds");
-                }
-
-                const char *kbytes = (const char*)r.p;
-                r.p += key_bytes_len; // move past key bytes
-
-                uint32_t value_offset = (uint32_t)(r.p - base);
-
-                // peek value header to decide if it's indexable
-                (void)reader_read8(mrb, &r);
-                r.p = base + value_offset; // restore
-
-                if (key_bytes_len == klen && memcmp(kbytes, kptr, klen) == 0) {
-                    return cbor_lazy_new(mrb, p->buf, value_offset);
-                }
-
-                // skip value if key doesn't match
-                skip_cbor(mrb, &r);
-            }
-
-            mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%S\"", key);
-        }
-
-        default:
-            mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
+      mrb_raisef(mrb, E_KEY_ERROR, "key not found: %S", key);
     }
 
-    return mrb_undef_value(); // unreachable
+    default:
+      mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
+  }
+
+  return mrb_undef_value(); /* unreachable */
 }
+
 
 
 /* Lazy.from_bytes */
@@ -1270,7 +1255,6 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
   mrb_get_args(mrb, "S", &buf);
   return cbor_lazy_new(mrb, buf, 0);
 }
-
 
 MRB_BEGIN_DECL
 

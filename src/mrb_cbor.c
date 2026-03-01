@@ -256,8 +256,6 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 
     case 22:
     case 23:
-      return mrb_nil_value();
-
     case 24:
       return mrb_nil_value();
 
@@ -308,25 +306,24 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
       uint8_t b3 = reader_read8(mrb, r);
       uint8_t b4 = reader_read8(mrb, r);
 
-      if (sizeof(mrb_float) == 4) {
-        mrb_value bin = mrb_str_new(mrb, NULL, 4);
-        uint8_t *dst = (uint8_t*)RSTRING_PTR(bin);
-        dst[0] = b1;
-        dst[1] = b2;
-        dst[2] = b3;
-        dst[3] = b4;
-        return MRB_DECODE_FLO_BE(mrb, bin);
-      }
-      else {
-        uint32_t u =
-          ((uint32_t)b1 << 24) |
-          ((uint32_t)b2 << 16) |
-          ((uint32_t)b3 << 8)  |
-          ((uint32_t)b4);
-        float f32;
-        memcpy(&f32, &u, sizeof(float));
-        return mrb_float_value(mrb, (mrb_float)f32);
-      }
+#ifdef MRB_USE_FLOAT32
+      mrb_value bin = mrb_str_new(mrb, NULL, 4);
+      uint8_t *dst = (uint8_t*)RSTRING_PTR(bin);
+      dst[0] = b1;
+      dst[1] = b2;
+      dst[2] = b3;
+      dst[3] = b4;
+      return MRB_DECODE_FLO_BE(mrb, bin);
+#else
+      uint32_t u =
+        ((uint32_t)b1 << 24) |
+        ((uint32_t)b2 << 16) |
+        ((uint32_t)b3 << 8)  |
+        ((uint32_t)b4);
+      float f32;
+      memcpy(&f32, &u, sizeof(float));
+      return mrb_float_value(mrb, (mrb_float)f32);
+#endif
     }
 
     case 27: { /* Float64 */
@@ -339,24 +336,32 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
       uint8_t b7 = reader_read8(mrb, r);
       uint8_t b8 = reader_read8(mrb, r);
 
-      if (sizeof(mrb_float) == 8) {
-        mrb_value bin = mrb_str_new(mrb, NULL, 8);
-        return MRB_DECODE_FLO_BE(mrb, bin);
-      }
-      else {
-        uint64_t u =
-          ((uint64_t)b1 << 56) |
-          ((uint64_t)b2 << 48) |
-          ((uint64_t)b3 << 40) |
-          ((uint64_t)b4 << 32) |
-          ((uint64_t)b5 << 24) |
-          ((uint64_t)b6 << 16) |
-          ((uint64_t)b7 << 8)  |
-          ((uint64_t)b8);
-        double f64;
-        memcpy(&f64, &u, sizeof(double));
-        return mrb_float_value(mrb, (mrb_float)f64);
-      }
+#ifndef MRB_USE_FLOAT32
+      mrb_value bin = mrb_str_new(mrb, NULL, 8);
+      uint8_t *dst = (uint8_t*)RSTRING_PTR(bin);
+      dst[0] = b1;
+      dst[1] = b2;
+      dst[2] = b3;
+      dst[3] = b4;
+      dst[4] = b5;
+      dst[5] = b6;
+      dst[6] = b7;
+      dst[7] = b8;
+      return MRB_DECODE_FLO_BE(mrb, bin);
+#else
+      uint64_t u =
+        ((uint64_t)b1 << 56) |
+        ((uint64_t)b2 << 48) |
+        ((uint64_t)b3 << 40) |
+        ((uint64_t)b4 << 32) |
+        ((uint64_t)b5 << 24) |
+        ((uint64_t)b6 << 16) |
+        ((uint64_t)b7 << 8)  |
+        ((uint64_t)b8);
+      double f64;
+      memcpy(&f64, &u, sizeof(double));
+      return mrb_float_value(mrb, (mrb_float)f64);
+#endif
     }
 
     case 31:
@@ -370,10 +375,22 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 static mrb_value
 decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 {
-  (void)mrb;
-  (void)r;
-  (void)info;
-  return mrb_nil_value();
+  if (info < 20) return mrb_nil_value();
+
+  switch (info) {
+    case 20:
+      return mrb_false_value();
+
+    case 21:
+      return mrb_true_value();
+
+    case 22:
+    case 23:
+    case 24:
+      return mrb_nil_value();
+  }
+
+  mrb_raise(mrb, E_NOTIMP_ERROR, "can't unpack floats or doubles since its disables for this mruby runtime").
 }
 #endif
 
@@ -1056,12 +1073,12 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
 
 /* Lazy.from_bytes */
 static mrb_value
-mrb_cbor_lazy_from_bytes(mrb_state *mrb, mrb_value self)
+mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
 {
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
   mrb_value cbor = cbor_lazy_new(mrb, buf, 0);
-  /* optional: store original buffer in ivar to keep it alive */
+
   mrb_iv_set(mrb, cbor, MRB_SYM(buf), buf);
   return cbor;
 }
@@ -1077,15 +1094,14 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, mod, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, mod, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1));
 
-  // Lazy
-  struct RClass *lazy = mrb_define_class_under(mrb, mod, "Lazy", mrb->object_class);
+  struct RClass *lazy = mrb_define_class_under_id(mrb, mod, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_DATA);
 
-  mrb_define_method(mrb, lazy, "[]",    cbor_lazy_aref,  MRB_ARGS_REQ(1));
-  mrb_define_method(mrb, lazy, "value", cbor_lazy_value, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),    cbor_lazy_aref,  MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, lazy, MRB_SYM(value), cbor_lazy_value, MRB_ARGS_NONE());
 
-  mrb_define_module_function_id(mrb, mod, MRB_SYM(lazy_from_bytes),
-                                mrb_cbor_lazy_from_bytes, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, mod, MRB_SYM(decode_lazy),
+                                mrb_cbor_decode_lazy, MRB_ARGS_REQ(1));
 }
 
 

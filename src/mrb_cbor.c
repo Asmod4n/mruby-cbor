@@ -369,7 +369,7 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
-  return mrb_nil_value();
+  return mrb_undef_value();
 }
 #else
 static mrb_value
@@ -495,7 +495,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
         }
 
         mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum tag payload");
-        return mrb_nil_value();
+        return mrb_undef_value();
       }
 #endif
 
@@ -510,79 +510,186 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
   return mrb_nil_value();
 }
 
-// ============================================================================
-// CBOR Encoder
-// ============================================================================
+#define CBOR_SBO_STACK_CAP (16 * 1024)
+
 typedef struct {
-  mrb_state* mrb;
-  mrb_value  str;
-} Writer;
+  mrb_state *mrb;
+
+  /* Stack-Buffer (SBO) */
+  uint8_t stack_buf[CBOR_SBO_STACK_CAP];
+  size_t  stack_len;
+
+  /* Heap-Buffer (Ruby-String) */
+  mrb_value heap_str;  /* mrb_undef_value() solange nur Stack */
+  char    *heap_ptr;
+  size_t   heap_len;
+  size_t   heap_capa;
+} CborWriter;
 
 static void
-writer_init(Writer* w, mrb_state* mrb, mrb_int capa)
+cbor_writer_init(CborWriter *w, mrb_state *mrb)
 {
-  w->mrb = mrb;
-  w->str = mrb_str_new_capa(mrb, capa);
+  w->mrb      = mrb;
+  w->stack_len = 0;
+
+  w->heap_str  = mrb_undef_value();
+  w->heap_ptr  = NULL;
+  w->heap_len  = 0;
+  w->heap_capa = 0;
+}
+
+static inline size_t next_pow2(size_t x)
+{
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+#if SIZE_MAX > UINT32_MAX
+  x |= x >> 32;
+#endif
+  x++;
+  return x;
 }
 
 static void
-writer_putc(Writer* w, uint8_t c)
+cbor_writer_init_heap(CborWriter *w, size_t need)
 {
-  mrb_str_cat(w->mrb, w->str, (const char*)&c, 1);
+  mrb_state *mrb = w->mrb;
+
+  size_t initial = w->stack_len + need;
+  size_t capa = next_pow2(initial);
+
+  w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
+  mrb_gc_protect(mrb, w->heap_str);
+
+
+  struct RString *s = RSTRING(w->heap_str);
+  w->heap_ptr  = RSTR_PTR(s);
+  w->heap_capa = (size_t)RSTR_CAPA(s);
+
+  /* Stack → Heap kopieren */
+  if (w->stack_len > 0) {
+    memcpy(w->heap_ptr, w->stack_buf, w->stack_len);
+    w->heap_len = w->stack_len;
+  } else {
+    w->heap_len = 0;
+  }
 }
 
 static void
-writer_write(Writer* w, const uint8_t* p, size_t len)
+cbor_writer_ensure_heap(CborWriter *w, size_t add)
 {
-  mrb_str_cat(w->mrb, w->str, (const char*)p, (mrb_int)len);
+  size_t need = w->heap_len + add;
+  if (need <= w->heap_capa) return;
+
+  size_t capa = next_pow2(need);
+
+  mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
+
+  struct RString *s = RSTRING(w->heap_str);
+  w->heap_ptr  = RSTR_PTR(s);
+  w->heap_capa = (size_t)RSTR_CAPA(s);
 }
+
+static void
+cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
+{
+  if (len == 0) return;
+
+  /* Nur Stack? */
+  if (mrb_undef_p(w->heap_str) &&
+      w->stack_len + len <= CBOR_SBO_STACK_CAP) {
+
+    memcpy(w->stack_buf + w->stack_len, buf, len);
+    w->stack_len += len;
+    return;
+  }
+
+  /* Heap initialisieren, falls noch nicht geschehen */
+  if (mrb_undef_p(w->heap_str)) {
+    cbor_writer_init_heap(w, len);
+  }
+
+  cbor_writer_ensure_heap(w, len);
+  memcpy(w->heap_ptr + w->heap_len, buf, len);
+  w->heap_len += len;
+}
+
+static void
+cbor_writer_putc(CborWriter *w, uint8_t b)
+{
+  cbor_writer_write(w, &b, 1);
+}
+
+static mrb_value
+cbor_writer_finish(CborWriter *w)
+{
+  mrb_state *mrb = w->mrb;
+
+  if (mrb_undef_p(w->heap_str)) {
+    /* alles im Stack geblieben */
+    return mrb_str_new(mrb,
+                       (const char*)w->stack_buf,
+                       (mrb_int)w->stack_len);
+  }
+
+  struct RString *s = RSTRING(w->heap_str);
+  RSTR_SET_LEN(s, (mrb_int)w->heap_len);
+  w->heap_ptr[w->heap_len] = '\0';
+
+  return w->heap_str;
+}
+
+typedef CborWriter Writer;
+
 
 static void
 encode_len(Writer* w, uint8_t major, uint64_t len)
 {
+  uint8_t buf[1 + 8];   /* max: header + 8 bytes */
+  size_t  n = 0;
+
   if (len < 24) {
-    writer_putc(w, (uint8_t)((major << 5) | (uint8_t)len));
-    return;
+    buf[0] = (uint8_t)((major << 5) | (uint8_t)len);
+    n = 1;
+  }
+  else if (len <= 0xFFu) {
+    buf[0] = (uint8_t)((major << 5) | 24);
+    buf[1] = (uint8_t)len;
+    n = 2;
+  }
+  else if (len <= 0xFFFFu) {
+    buf[0] = (uint8_t)((major << 5) | 25);
+    buf[1] = (uint8_t)(len >> 8);
+    buf[2] = (uint8_t)(len);
+    n = 3;
+  }
+  else if (len <= 0xFFFFFFFFu) {
+    buf[0] = (uint8_t)((major << 5) | 26);
+    buf[1] = (uint8_t)(len >> 24);
+    buf[2] = (uint8_t)(len >> 16);
+    buf[3] = (uint8_t)(len >> 8);
+    buf[4] = (uint8_t)(len);
+    n = 5;
+  }
+  else {
+    buf[0] = (uint8_t)((major << 5) | 27);
+    buf[1] = (uint8_t)(len >> 56);
+    buf[2] = (uint8_t)(len >> 48);
+    buf[3] = (uint8_t)(len >> 40);
+    buf[4] = (uint8_t)(len >> 32);
+    buf[5] = (uint8_t)(len >> 24);
+    buf[6] = (uint8_t)(len >> 16);
+    buf[7] = (uint8_t)(len >> 8);
+    buf[8] = (uint8_t)(len);
+    n = 9;
   }
 
-  if (len <= 0xFFu) {
-    writer_putc(w, (uint8_t)((major << 5) | 24));
-    writer_putc(w, (uint8_t)len);
-    return;
-  }
-
-  if (len <= 0xFFFFu) {
-    writer_putc(w, (uint8_t)((major << 5) | 25));
-    uint8_t b[2];
-    b[0] = (uint8_t)(len >> 8);
-    b[1] = (uint8_t)(len);
-    writer_write(w, b, 2);
-    return;
-  }
-
-  if (len <= 0xFFFFFFFFu) {
-    writer_putc(w, (uint8_t)((major << 5) | 26));
-    uint8_t b[4];
-    b[0] = (uint8_t)(len >> 24);
-    b[1] = (uint8_t)(len >> 16);
-    b[2] = (uint8_t)(len >> 8);
-    b[3] = (uint8_t)(len);
-    writer_write(w, b, 4);
-    return;
-  }
-
-  writer_putc(w, (uint8_t)((major << 5) | 27));
-  uint8_t b[8];
-  b[0] = (uint8_t)(len >> 56);
-  b[1] = (uint8_t)(len >> 48);
-  b[2] = (uint8_t)(len >> 40);
-  b[3] = (uint8_t)(len >> 32);
-  b[4] = (uint8_t)(len >> 24);
-  b[5] = (uint8_t)(len >> 16);
-  b[6] = (uint8_t)(len >> 8);
-  b[7] = (uint8_t)(len);
-  writer_write(w, b, 8);
+  cbor_writer_write(w, buf, n);
 }
+
 
 // ============================================================================
 // BigInt encoding (Tag 2/3) – mrb_bint_to_s ist native endian → korrigieren
@@ -639,11 +746,11 @@ encode_bignum(Writer* w, mrb_value obj)
   mrb_int final_len = blen - off;
 
   /* 5) CBOR Tag 2/3 */
-  writer_putc(w, (sign < 0) ? 0xC3 : 0xC2);
+  cbor_writer_putc(w, (sign < 0) ? 0xC3 : 0xC2);
 
   /* 6) Länge + Bytes */
   encode_len(w, 2, (uint64_t)final_len);
-  writer_write(w, buf + off, final_len);
+  cbor_writer_write(w, buf + off, final_len);
 }
 #endif
 
@@ -655,32 +762,52 @@ static void encode_value(Writer* w, mrb_value obj);
 static void
 encode_array(Writer* w, mrb_value ary)
 {
-  mrb_int len = RARRAY_LEN(ary);
+  struct RArray *a = mrb_ary_ptr(ary);
+
+  mrb_int len = ARY_LEN(a);
   encode_len(w, 4, (uint64_t)len);
 
+  mrb_value *ptr = ARY_PTR(a);
+
   for (mrb_int i = 0; i < len; i++) {
-    encode_value(w, mrb_ary_ref(w->mrb, ary, i));
+    encode_value(w, ptr[i]);
   }
+}
+
+typedef struct {
+  Writer *w;
+  mrb_state *mrb;
+} encode_map_ctx;
+
+static int
+encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
+{
+  encode_map_ctx *ctx = (encode_map_ctx*)data;
+  Writer *w = ctx->w;
+
+  encode_value(w, key);
+  encode_value(w, val);
+
+  return 0; /* continue */
 }
 
 static void
 encode_map(Writer* w, mrb_value hash)
 {
-  mrb_state* mrb = w->mrb;
+  mrb_state *mrb = w->mrb;
+  struct RHash *h = mrb_hash_ptr(hash);
+
+  /* Anzahl der Paare */
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
 
-mrb_value keys = mrb_hash_keys(mrb, hash);
+  /* Kontext für foreach */
+  encode_map_ctx ctx = { w, mrb };
 
-  mrb_int klen = RARRAY_LEN(keys);
-
-  for (mrb_int i = 0; i < klen; i++) {
-    mrb_value key = mrb_ary_ref(mrb, keys, i);
-    mrb_value val = mrb_hash_get(mrb, hash, key);
-    encode_value(w, key);
-    encode_value(w, val);
-  }
+  /* direkte Iteration über Hash-Table */
+  mrb_hash_foreach(mrb, h, encode_map_foreach, &ctx);
 }
+
 
 // ============================================================================
 // Text
@@ -694,11 +821,11 @@ encode_string(Writer* w, mrb_value str)
   if (mrb_str_is_utf8(str)) {
     /* UTF‑8 → CBOR Text (Major 3) */
     encode_len(w, 3, (uint64_t)blen);
-    writer_write(w, (const uint8_t*)p, (size_t)blen);
+    cbor_writer_write(w, (const uint8_t*)p, (size_t)blen);
   } else {
     /* Nicht UTF‑8 → CBOR Bytes (Major 2) */
     encode_len(w, 2, (uint64_t)blen);
-    writer_write(w, (const uint8_t*)p, (size_t)blen);
+    cbor_writer_write(w, (const uint8_t*)p, (size_t)blen);
   }
 }
 
@@ -708,22 +835,111 @@ encode_string(Writer* w, mrb_value str)
 static void
 encode_simple(Writer* w, mrb_value obj)
 {
+  uint8_t b;
+
   if (mrb_nil_p(obj)) {
-    writer_putc(w, 0xF6);
-    return;
+    b = 0xF6;
+  }
+  else if (!mrb_bool(obj)) {
+    b = 0xF4;
+  }
+  else {
+    b = 0xF5;
   }
 
-  if (!mrb_bool(obj)) {
-    writer_putc(w, 0xF4);
-    return;
-  }
-
-  writer_putc(w, 0xF5);
+  cbor_writer_write(w, &b, 1);
 }
 
-// ============================================================================
-// encode_value dispatch
-// ============================================================================
+static void
+encode_integer(Writer *w, mrb_int n)
+{
+  uint8_t buf[1 + 8];
+  size_t  nbytes = 0;
+  uint8_t major;
+  uint64_t v;
+
+  if (n >= 0) {
+    major = 0;
+    v = (uint64_t)n;
+  }
+  else {
+    major = 1;
+    v = (uint64_t)(-1 - n);
+  }
+
+  if (v < 24) {
+    buf[0] = (uint8_t)((major << 5) | (uint8_t)v);
+    nbytes = 1;
+  }
+  else if (v <= 0xFFu) {
+    buf[0] = (uint8_t)((major << 5) | 24);
+    buf[1] = (uint8_t)v;
+    nbytes = 2;
+  }
+  else if (v <= 0xFFFFu) {
+    buf[0] = (uint8_t)((major << 5) | 25);
+    buf[1] = (uint8_t)(v >> 8);
+    buf[2] = (uint8_t)(v);
+    nbytes = 3;
+  }
+  else if (v <= 0xFFFFFFFFu) {
+    buf[0] = (uint8_t)((major << 5) | 26);
+    buf[1] = (uint8_t)(v >> 24);
+    buf[2] = (uint8_t)(v >> 16);
+    buf[3] = (uint8_t)(v >> 8);
+    buf[4] = (uint8_t)(v);
+    nbytes = 5;
+  }
+  else {
+    buf[0] = (uint8_t)((major << 5) | 27);
+    buf[1] = (uint8_t)(v >> 56);
+    buf[2] = (uint8_t)(v >> 48);
+    buf[3] = (uint8_t)(v >> 40);
+    buf[4] = (uint8_t)(v >> 32);
+    buf[5] = (uint8_t)(v >> 24);
+    buf[6] = (uint8_t)(v >> 16);
+    buf[7] = (uint8_t)(v >> 8);
+    buf[8] = (uint8_t)(v);
+    nbytes = 9;
+  }
+
+  cbor_writer_write(w, buf, nbytes);
+}
+
+
+#ifndef MRB_NO_FLOAT
+static void
+encode_float(Writer *w, mrb_float f)
+{
+#ifdef MRB_USE_FLOAT32
+  uint8_t buf[1 + 4];
+  buf[0] = 0xFA;
+  uint32_t u;
+  memcpy(&u, &f, sizeof(uint32_t));
+  buf[1] = (uint8_t)(u >> 24);
+  buf[2] = (uint8_t)(u >> 16);
+  buf[3] = (uint8_t)(u >> 8);
+  buf[4] = (uint8_t)(u);
+  cbor_writer_write(w, buf, 5);
+#else
+  uint8_t buf[1 + 8];
+  buf[0] = 0xFB;
+  double d = (double)f;
+  uint64_t u;
+  memcpy(&u, &d, sizeof(uint64_t));
+  buf[1] = (uint8_t)(u >> 56);
+  buf[2] = (uint8_t)(u >> 48);
+  buf[3] = (uint8_t)(u >> 40);
+  buf[4] = (uint8_t)(u >> 32);
+  buf[5] = (uint8_t)(u >> 24);
+  buf[6] = (uint8_t)(u >> 16);
+  buf[7] = (uint8_t)(u >> 8);
+  buf[8] = (uint8_t)(u);
+  cbor_writer_write(w, buf, 9);
+#endif
+}
+#endif
+
 static void
 encode_value(Writer* w, mrb_value obj)
 {
@@ -731,40 +947,18 @@ encode_value(Writer* w, mrb_value obj)
 
   switch (mrb_type(obj)) {
     case MRB_TT_FALSE:
-      encode_simple(w, obj);
-      return;
-
     case MRB_TT_TRUE:
       encode_simple(w, obj);
       return;
 
-    case MRB_TT_INTEGER: {
-      mrb_int n = mrb_integer(obj);
-
-      if (n >= 0) {
-        encode_len(w, 0, (uint64_t)n);
-        return;
-      }
-
-      {
-        uint64_t v = (uint64_t)(-1 - n);
-        encode_len(w, 1, v);
-        return;
-      }
-    }
+    case MRB_TT_INTEGER:
+      encode_integer(w, mrb_integer(obj));
+      return;
 
 #ifndef MRB_NO_FLOAT
-    case MRB_TT_FLOAT: {
-      mrb_float f = mrb_float(obj);
-      mrb_value bin = MRB_ENCODE_FLO_BE(mrb, f);
-#if defined(MRB_USE_FLOAT32)
-      writer_putc(w, 0xFA);
-#else
-      writer_putc(w, 0xFB);
-#endif
-      writer_write(w, (const uint8_t*)RSTRING_PTR(bin), (size_t)RSTRING_LEN(bin));
-      return;
-    }
+  case MRB_TT_FLOAT:
+    encode_float(w, mrb_float(obj));
+    return;
 #endif
 
     case MRB_TT_STRING:
@@ -793,6 +987,7 @@ encode_value(Writer* w, mrb_value obj)
   }
 }
 
+
 // ============================================================================
 // Ruby bindings
 // ============================================================================
@@ -804,10 +999,11 @@ mrb_cbor_encode(mrb_state* mrb, mrb_value self)
 
   mrb_get_args(mrb, "o", &obj);
 
-  Writer w;
-  writer_init(&w, mrb, 32);
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
   encode_value(&w, obj);
-  return w.str;
+  return cbor_writer_finish(&w);
+
 }
 
 static mrb_value
@@ -856,15 +1052,10 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, uint32_t offset)
 
   p->buf    = buf;
   p->offset = offset;
-
-  return mrb_obj_value(data);
+  mrb_value obj = mrb_obj_value(data);
+  mrb_iv_set(mrb, obj, MRB_SYM(buf), buf);
+  return obj;
 }
-
-/* Reader, reader_init, reader_read8, read_len, skip_cbor, decode_value
-   müssen in der Datei vorhanden sein (wie in deiner ursprünglichen Implementierung).
-   Diese Lazy-Funktionen verwenden diese Hilfsroutinen. */
-
-/* Lazy#value: vollständiges Dekodieren ab Offset */
 
 static void
 skip_cbor(mrb_state *mrb, Reader *r)
@@ -1077,10 +1268,7 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
 {
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
-  mrb_value cbor = cbor_lazy_new(mrb, buf, 0);
-
-  mrb_iv_set(mrb, cbor, MRB_SYM(buf), buf);
-  return cbor;
+  return cbor_lazy_new(mrb, buf, 0);
 }
 
 

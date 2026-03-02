@@ -351,8 +351,7 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
       return mrb_float_value(mrb, (mrb_float)f64);
     }
 
-    case 31:
-      return mrb_nil_value();
+    case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
@@ -376,9 +375,10 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
     case 23:
     case 24:
       return mrb_nil_value();
+    case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
   }
 
-  mrb_raise(mrb, E_NOTIMP_ERROR, "can't unpack floats or doubles since its disables for this mruby runtime").
+  mrb_raise(mrb, E_NOTIMP_ERROR, "can't unpack floats or doubles since its disabled for this mruby runtime").
 }
 #endif
 
@@ -1246,6 +1246,8 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
 {
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
+
+  if(mrb_block_given_p(mrb)) puts("block!");
 
   return cbor_lazy_new(mrb, mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf)), 0);
 }

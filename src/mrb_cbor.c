@@ -1126,7 +1126,7 @@ skip_cbor(mrb_state *mrb, Reader *r)
         case 27:
           if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
           mrb_raise(mrb, E_RUNTIME_ERROR, "float64 out of bounds");
-        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode")
+        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
       }
     }
   }

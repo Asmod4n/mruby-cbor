@@ -193,19 +193,21 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
   uint64_t blen = read_len(mrb, r, info);
   size_t off    = reader_offset(r);
 
-  r->p += blen;
 
-  if (likely(off + blen <= (size_t)RSTRING_LEN(src))) {
-    mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
+  if (likely(blen <= SIZE_MAX - off && off + blen <= (size_t)RSTRING_LEN(src))) {
+      mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
+
 #ifdef MRB_UTF8_STRING
-    if (unlikely(!mrb_str_is_utf8(slice))) {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
-    }
+      if (unlikely(!mrb_str_is_utf8(slice))) {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
+      }
 #endif
-    return slice;
-  }
-  else {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
+
+      r->p += blen;
+      return slice;
+  } else {
+      // alles andere ist wirklich out-of-bounds oder würde overflowen
+      mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
   }
 
   return mrb_nil_value();
@@ -217,13 +219,12 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
   uint64_t blen = read_len(mrb, r, info);
   size_t off    = reader_offset(r);
 
-  r->p += blen;
-
-  if (likely(off + blen <= (size_t)RSTRING_LEN(src))) {
-    return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
-  }
-  else {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "byte string out of bounds");
+  if (likely(blen <= SIZE_MAX - off && off + blen <= (size_t)RSTRING_LEN(src))) {
+      r->p += blen;
+      return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);;
+  } else {
+      // alles andere ist wirklich out-of-bounds oder würde overflowen
+      mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
   }
 
   return mrb_nil_value();
@@ -471,8 +472,8 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
         if (likely(major2 == 2)) {
           uint64_t len = read_len(mrb, r, info2);
           size_t off   = reader_offset(r);
-          r->p        += len;
           ensure_slice_bounds(mrb, src, off, len);
+          r->p        += len;
 
           const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
           mrb_bool negative  = (tag == 3);
@@ -556,7 +557,7 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
   w->heap_capa = (size_t)RSTR_CAPA(s);
 
   /* Stack → Heap kopieren */
-  if (w->stack_len > 0) {
+  if (likely(w->stack_len > 0)) {
     memcpy(w->heap_ptr, w->stack_buf, w->stack_len);
     w->heap_len = w->stack_len;
   } else {
@@ -585,8 +586,8 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
   if (len == 0) return;
 
   /* Nur Stack? */
-  if (mrb_undef_p(w->heap_str) &&
-      w->stack_len + len <= CBOR_SBO_STACK_CAP) {
+  if (likely(mrb_undef_p(w->heap_str) &&
+      w->stack_len + len <= CBOR_SBO_STACK_CAP)) {
 
     memcpy(w->stack_buf + w->stack_len, buf, len);
     w->stack_len += len;
@@ -776,8 +777,6 @@ encode_array(Writer* w, mrb_value ary)
     encode_value(w, ptr[i]);
   }
 }
-
-
 
 static int
 encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
@@ -1127,6 +1126,7 @@ skip_cbor(mrb_state *mrb, Reader *r)
         case 27:
           if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
           mrb_raise(mrb, E_RUNTIME_ERROR, "float64 out of bounds");
+        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode")
       }
     }
   }
@@ -1246,8 +1246,6 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
 {
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
-
-  if(mrb_block_given_p(mrb)) puts("block!");
 
   return cbor_lazy_new(mrb, mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf)), 0);
 }

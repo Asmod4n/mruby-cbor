@@ -14,6 +14,8 @@ MRB_END_DECL
 #include <mruby/data.h>
 #include <mruby/variable.h>
 
+#include "hex_simd.h"
+
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -560,7 +562,6 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
     size_t capa = next_pow2(initial);
 
     w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
-    mrb_gc_protect(mrb, w->heap_str);
     w->arena_index = mrb_gc_arena_save(mrb);
 
     struct RString *s = RSTRING(w->heap_str);
@@ -610,37 +611,37 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
 static void
 cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
 {
-  if (len == 0) return;
+  if (likely(len > 0)) {
+    size_t stack_len = w->stack_len;
 
-  size_t stack_len = w->stack_len;
+    /* Fast path: nur Stack, kein Overflow */
+    if (likely(mrb_undef_p(w->heap_str) &&
+              len <= CBOR_SBO_STACK_CAP - stack_len)) {
 
-  /* Fast path: nur Stack, kein Overflow */
-  if (likely(mrb_undef_p(w->heap_str) &&
-             len <= CBOR_SBO_STACK_CAP - stack_len)) {
+      memcpy(w->stack_buf + stack_len, buf, len);
+      w->stack_len = stack_len + len;
 
-    memcpy(w->stack_buf + stack_len, buf, len);
-    w->stack_len = stack_len + len;
+    } else {
+      /* Slow path: entweder Heap nötig oder Overflow im Stack-Pfad */
 
-  } else {
-    /* Slow path: entweder Heap nötig oder Overflow im Stack-Pfad */
-
-    /* Heap initialisieren, falls noch nicht geschehen */
-    if (mrb_undef_p(w->heap_str)) {
-      /* positiver Overflow-Guard */
-      if (likely(len <= SIZE_MAX - stack_len)) {
-        cbor_writer_init_heap(w, len);
-      } else {
-        mrb_state *mrb = w->mrb;
-        mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
+      /* Heap initialisieren, falls noch nicht geschehen */
+      if (mrb_undef_p(w->heap_str)) {
+        /* positiver Overflow-Guard */
+        if (likely(len <= SIZE_MAX - stack_len)) {
+          cbor_writer_init_heap(w, len);
+        } else {
+          mrb_state *mrb = w->mrb;
+          mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
+        }
       }
+
+      /* Heap erweitern */
+      cbor_writer_ensure_heap(w, len);
+
+      memcpy(w->heap_ptr + w->heap_len, buf, len);
+      w->heap_len += len;
+      mrb_gc_arena_restore(w->mrb, w->arena_index);
     }
-
-    /* Heap erweitern */
-    cbor_writer_ensure_heap(w, len);
-
-    memcpy(w->heap_ptr + w->heap_len, buf, len);
-    w->heap_len += len;
-    mrb_gc_arena_restore(w->mrb, w->arena_index);
   }
 }
 
@@ -722,20 +723,13 @@ encode_len(Writer* w, uint8_t major, uint64_t len)
 // BigInt encoding (Tag 2/3) – mrb_bint_to_s ist native endian → korrigieren
 // ============================================================================
 #ifdef MRB_USE_BIGINT
-static uint8_t
-hex_nibble(char c)
-{
-  if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-  if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
-  if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
-  return 0;
-}
-
 static void
-encode_bignum(Writer* w, mrb_value obj)
+encode_bignum(CborWriter *w, mrb_value obj)
 {
-  mrb_state* mrb = w->mrb;
+  mrb_state *mrb = w->mrb;
+  mrb_int idx = mrb_gc_arena_save(mrb);
 
+  /* Sign bestimmen */
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
   /* Betrag holen */
@@ -747,55 +741,60 @@ encode_bignum(Writer* w, mrb_value obj)
     mag = mrb_bint_sub(mrb, mag, one);
   }
 
-  /* Betrag (oder Betrag-1) als Hex */
+  /* Betrag als Hexstring */
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
-  const char* p = RSTRING_PTR(hex);
+  const char *p = RSTRING_PTR(hex);
   mrb_int len = RSTRING_LEN(hex);
 
-  /* ungerade Länge → führende 0 */
+  /* führende Nullen überspringen */
+  while (len > 0 && *p == '0') {
+    p++;
+    len--;
+  }
+
+  /* Spezialfall: Wert == 0 */
+  if (len == 0) {
+    uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
+    cbor_writer_write(w, &tag, 1);
+    encode_len(w, 2, 1);
+    uint8_t zero = 0;
+    cbor_writer_write(w, &zero, 1);
+    return;
+  }
+
+  /* ungerade Länge → führende '0' hinzufügen */
   mrb_bool odd = (len & 1);
   mrb_int nibs = odd ? (len + 1) : len;
 
-  /* führende Null-Bytes bestimmen */
-  mrb_int leading_zero_nibbles = 0;
-  while (leading_zero_nibbles < len && p[leading_zero_nibbles] == '0')
-    leading_zero_nibbles++;
-
-  mrb_int off_bytes   = leading_zero_nibbles / 2;
-  mrb_int total_bytes = nibs / 2;
-  mrb_int final_len   = total_bytes - off_bytes;
+  /* Byteanzahl */
+  mrb_int byte_len = nibs / 2;
 
   /* CBOR Tag */
-  cbor_writer_putc(w, (sign < 0) ? 0xC3 : 0xC2);
+  uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
+  cbor_writer_write(w, &tag, 1);
 
   /* Länge */
-  encode_len(w, 2, (uint64_t)final_len);
+  encode_len(w, 2, (uint64_t)byte_len);
 
-  /* Bytes direkt streamen */
-  mrb_int si = 0;
-
-  /* odd → erster Nibble ist low-only */
+  /* Hexstring normalisieren (ggf. führende '0') */
+  char *hexbuf = (char*)mrb_alloca(mrb, nibs);
   if (odd) {
-    uint8_t b = hex_nibble(p[0]);
-    if (off_bytes == 0) cbor_writer_putc(w, b);
-    si = 1;
+    hexbuf[0] = '0';
+    memcpy(hexbuf + 1, p, len);
+  } else {
+    memcpy(hexbuf, p, len);
   }
 
-  mrb_int byte_index = odd ? 1 : 0;
+  /* Zielpuffer für Bytes */
+  uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
 
-  while (si < len) {
-    uint8_t hi = hex_nibble(p[si++]);
-    uint8_t lo = hex_nibble(p[si++]);
-    uint8_t b  = (uint8_t)((hi << 4) | lo);
+  /* SIMD‑Hex‑Decode */
+  hex_decode(out, hexbuf, nibs);
 
-    if (byte_index >= off_bytes)
-      cbor_writer_putc(w, b);
-
-    byte_index++;
-  }
+  /* Bulk‑Write */
+  cbor_writer_write(w, out, (size_t)byte_len);
+  mrb_gc_arena_restore(mrb, idx);
 }
-
-
 #endif
 
 // ============================================================================
@@ -1300,6 +1299,7 @@ MRB_BEGIN_DECL
 void
 mrb_mruby_cbor_gem_init(mrb_state* mrb)
 {
+  hex_decode_init();
   struct RClass* mod = mrb_define_module_id(mrb, MRB_SYM(CBOR));
 
   mrb_define_module_function_id(mrb, mod, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));

@@ -3,6 +3,7 @@
 #include <mruby/array.h>
 #include <mruby/hash.h>
 #include <mruby/class.h>
+#include <stdlib.h>
 MRB_BEGIN_DECL
 #include <mruby/internal.h>
 MRB_END_DECL
@@ -393,37 +394,18 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 #endif
 
 #ifdef MRB_USE_BIGINT
-static void
-increment_be(uint8_t* buf, size_t len)
-{
-  size_t i = len;
-  while (i > 0) {
-    i--;
-    if (buf[i] != 0xFF) {
-      buf[i] = (uint8_t)(buf[i] + 1);
-      return;
-    }
-    buf[i] = 0x00;
-  }
-}
-
 static mrb_value
 decode_bignum_from_cbor_bytes(mrb_state* mrb,
                               const uint8_t* buf,
                               size_t len,
                               mrb_bool negative)
 {
-  /* 1) CBOR-Bytes kopieren (big-endian) */
-  uint8_t* tmp = (uint8_t*)mrb_alloca(mrb, len);
+  mrb_int idx = mrb_gc_arena_save(mrb);
+  uint8_t *tmp = mrb_alloca(mrb, len);
   memcpy(tmp, buf, len);
 
-  /* Tag 3: n -> n+1, damit value = -(n+1) = -1-n */
-  if (negative) {
-    increment_be(tmp, len);
-  }
-
 #ifndef MRB_ENDIAN_BIG
-  /* MRuby läuft auf little-endian → Bytes umdrehen */
+  /* 2) Für MRuby in little-endian drehen */
   for (size_t i = 0, j = len - 1; i < j; i++, j--) {
     uint8_t t = tmp[i];
     tmp[i] = tmp[j];
@@ -431,15 +413,27 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
   }
 #endif
 
-  /* Bytes → BigInt */
-  mrb_value bn = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
-
-  /* Vorzeichen anwenden */
-  if (negative) {
-    return mrb_bint_neg(mrb, bn);   /* -(n+1) */
+  /* 3) Bytes → positiver BigInt n */
+  mrb_value n = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
+  mrb_gc_arena_restore(mrb, idx);
+  mrb_gc_protect(mrb, n);
+  if (!negative) {
+    return n; /* Tag 2 */
   }
-  return bn;
+
+  /* 4) Tag 3: value = -1 - n  */
+
+  /* n_plus_1 = n + 1 */
+  mrb_value one = mrb_fixnum_value(1);
+  mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
+
+  /* result = -(n+1) */
+  mrb_value result = mrb_bint_neg(mrb, n_plus_1);
+  mrb_gc_arena_restore(mrb, idx);
+  mrb_gc_protect(mrb, result);
+  return result;
 }
+
 #endif
 
 // ============================================================================

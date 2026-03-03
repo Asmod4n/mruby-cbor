@@ -8,4 +8,5 @@ MRuby::Gem::Specification.new('mruby-cbor') do |spec|
   spec.add_dependency 'mruby-time'
   spec.add_dependency 'mruby-string-is-utf8'
   spec.add_test_dependency 'mruby-random'
+  spec.add_test_dependency 'mruby-io'
 end

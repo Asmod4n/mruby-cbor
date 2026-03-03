@@ -113,3 +113,68 @@ assert('CBOR::Lazy independent caches') do
   assert_equal 1, x.value
   assert_equal 2, y.value
 end
+
+assert('CBOR bignum roundtrip') do
+  big = (1 << 200) + 12345
+  assert_equal big, CBOR.decode(CBOR.encode(big))
+end
+
+
+assert('CBOR negative bignum roundtrip') do
+  big = -(1 << 200) - 999
+  assert_equal(big, CBOR.decode(CBOR.encode(big)))
+end
+
+assert('CBOR bignum boundary: exactly 64-bit') do
+  n = (1 << 64) - 1
+  assert_equal(n, CBOR.decode(CBOR.encode(n)))
+end
+
+assert('CBOR bignum boundary: just above 64-bit') do
+  n = (1 << 64)
+  assert_equal(n, CBOR.decode(CBOR.encode(n)))
+end
+
+assert('CBOR negative bignum boundary: -(2^64)') do
+  n = -(1 << 64)
+  assert_equal(n, CBOR.decode(CBOR.encode(n)))
+end
+
+assert('CBOR very large bignum (4 KB)') do
+  # 32768-bit number
+  big = (1 << 32768) + 123456789
+  assert_equal big, CBOR.decode(CBOR.encode(big))
+end
+
+assert('CBOR bignum zero encoded as normal integer') do
+  assert_equal 0, CBOR.decode(CBOR.encode(0))
+end
+
+assert('CBOR bignum small negative encoded as normal integer') do
+  assert_equal -1, CBOR.decode(CBOR.encode(-1))
+  assert_equal -10, CBOR.decode(CBOR.encode(-10))
+end
+
+assert('CBOR bignum lazy decode') do
+  big = (1 << 200) + 123
+  lazy = CBOR.decode_lazy(CBOR.encode(big))
+  assert_equal big, lazy.value
+end
+
+assert('CBOR negative bignum lazy decode') do
+  big = -(1 << 200) - 55
+  lazy = CBOR.decode_lazy(CBOR.encode(big))
+  assert_equal big, lazy.value
+end
+
+assert('CBOR bignum does not corrupt following lazy values') do
+  h = {
+    "a" => (1 << 200) + 1,
+    "b" => (1 << 150) + 2,
+    "c" => 123
+  }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+  assert_equal h["a"], lazy["a"].value
+  assert_equal h["b"], lazy["b"].value
+  assert_equal 123, lazy["c"].value
+end

@@ -180,7 +180,14 @@ read_len(mrb_state* mrb, Reader* r, uint8_t info)
 static void
 ensure_slice_bounds(mrb_state* mrb, mrb_value src, size_t off, uint64_t len)
 {
-  if (likely(off + len <= (size_t)RSTRING_LEN(src))) return;
+  size_t slen = (size_t)RSTRING_LEN(src);
+
+  /* Fast path: alles im gültigen Bereich, ohne Overflow-Risiko */
+  if (likely(off <= slen && len <= slen - off)) {
+    return;
+  }
+
+  /* Slow path: irgendwas ist out of bounds */
   mrb_raise(mrb, E_RUNTIME_ERROR, "slice out of bounds");
 }
 
@@ -198,19 +205,21 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
       mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
 
 #ifdef MRB_UTF8_STRING
-      if (unlikely(!mrb_str_is_utf8(slice))) {
+      if (likely(mrb_str_is_utf8(slice))) {
+        r->p += blen;
+        return slice;
+      } else {
         mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
       }
-#endif
-
+#else
       r->p += blen;
       return slice;
+#endif
   } else {
       // alles andere ist wirklich out-of-bounds oder würde overflowen
       mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
+      return mrb_undef_value();
   }
-
-  return mrb_nil_value();
 }
 
 static mrb_value
@@ -443,7 +452,6 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
   uint8_t major = (uint8_t)(b >> 5);
   uint8_t info = (uint8_t)(b & 0x1F);
 
-
   switch (major) {
     case 0:
       return decode_unsigned(mrb, r, info);
@@ -463,28 +471,34 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
     case 6: {
       uint64_t tag = read_len(mrb, r, info);
 
+      switch (tag) {
+        case 2:
+        case 3: {
 #ifdef MRB_USE_BIGINT
-      if (likely(tag == 2 || tag == 3)) {
-        uint8_t b2 = reader_read8(mrb, r);
-        uint8_t major2 = (uint8_t)(b2 >> 5);
-        uint8_t info2  = (uint8_t)(b2 & 0x1F);
+          uint8_t b2 = reader_read8(mrb, r);
+          uint8_t major2 = (uint8_t)(b2 >> 5);
+          uint8_t info2  = (uint8_t)(b2 & 0x1F);
 
-        if (likely(major2 == 2)) {
-          uint64_t len = read_len(mrb, r, info2);
-          size_t off   = reader_offset(r);
-          ensure_slice_bounds(mrb, src, off, len);
-          r->p        += len;
+          if (likely(major2 == 2)) {
+            uint64_t len = read_len(mrb, r, info2);
+            size_t off   = reader_offset(r);
+            ensure_slice_bounds(mrb, src, off, len);
+            r->p        += len;
 
-          const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
-          mrb_bool negative  = (tag == 3);
-          return decode_bignum_from_cbor_bytes(mrb, buf, (size_t)len, negative);
-        }
-      }
-      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
-      return mrb_undef_value();
-#endif
+            const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
+            mrb_bool negative  = (tag == 3);
+            return decode_bignum_from_cbor_bytes(mrb, buf, (size_t)len, negative);
+          }
+          mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
 
+#else
       mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without BigInt Support");
+#endif
+        } break;
+
+      }
+      return mrb_undef_value();
+
     }
 
     case 7:
@@ -544,40 +558,59 @@ static void
 cbor_writer_init_heap(CborWriter *w, size_t need)
 {
   mrb_state *mrb = w->mrb;
+  size_t stack_len = w->stack_len;
 
-  size_t initial = w->stack_len + need;
-  size_t capa = next_pow2(initial);
+  /* Fast path: Addition ohne Overflow möglich */
+  if (likely(need <= SIZE_MAX - stack_len)) {
+    size_t initial = stack_len + need;
+    size_t capa = next_pow2(initial);
 
-  w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
-  mrb_gc_protect(mrb, w->heap_str);
-  w->arena_index = mrb_gc_arena_save(mrb);
+    w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
+    mrb_gc_protect(mrb, w->heap_str);
+    w->arena_index = mrb_gc_arena_save(mrb);
 
-  struct RString *s = RSTRING(w->heap_str);
-  w->heap_ptr  = RSTR_PTR(s);
-  w->heap_capa = (size_t)RSTR_CAPA(s);
+    struct RString *s = RSTRING(w->heap_str);
+    w->heap_ptr  = RSTR_PTR(s);
+    w->heap_capa = (size_t)RSTR_CAPA(s);
 
-  /* Stack → Heap kopieren */
-  if (likely(w->stack_len > 0)) {
-    memcpy(w->heap_ptr, w->stack_buf, w->stack_len);
-    w->heap_len = w->stack_len;
-  } else {
-    w->heap_len = 0;
+    if (likely(stack_len > 0)) {
+      memcpy(w->heap_ptr, w->stack_buf, stack_len);
+      w->heap_len = stack_len;
+    } else {
+      w->heap_len = 0;
+    }
+    return;
   }
+
+  /* Slow path: Overflow → Fehler */
+  mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
 }
 
 static void
 cbor_writer_ensure_heap(CborWriter *w, size_t add)
 {
-  size_t need = w->heap_len + add;
-  if (need <= w->heap_capa) return;
+  size_t heap_len  = w->heap_len;
+  size_t heap_capa = w->heap_capa;
 
-  size_t capa = next_pow2(need);
+  /* Fast path: genug Platz, keine Arbeit */
+  if (likely(add <= heap_capa - heap_len)) {
+    return;
+  }
 
-  mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
+  /* Jetzt müssen wir wachsen; Overflow dabei verhindern, aber wieder mit positivem likely-Guard */
+  if (likely(add <= SIZE_MAX - heap_len)) {
+    size_t need = heap_len + add;
+    size_t capa = next_pow2(need);
 
-  struct RString *s = RSTRING(w->heap_str);
-  w->heap_ptr  = RSTR_PTR(s);
-  w->heap_capa = (size_t)RSTR_CAPA(s);
+    mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
+
+    struct RString *s = RSTRING(w->heap_str);
+    w->heap_ptr  = RSTR_PTR(s);
+    w->heap_capa = (size_t)RSTR_CAPA(s);
+  } else {
+    mrb_state *mrb = w->mrb;
+    mrb_raise(mrb, E_RUNTIME_ERROR, "heap size overflow");
+  }
 }
 
 static void
@@ -585,25 +618,38 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
 {
   if (len == 0) return;
 
-  /* Nur Stack? */
+  size_t stack_len = w->stack_len;
+
+  /* Fast path: nur Stack, kein Overflow */
   if (likely(mrb_undef_p(w->heap_str) &&
-      w->stack_len + len <= CBOR_SBO_STACK_CAP)) {
+             len <= CBOR_SBO_STACK_CAP - stack_len)) {
 
-    memcpy(w->stack_buf + w->stack_len, buf, len);
-    w->stack_len += len;
-    return;
+    memcpy(w->stack_buf + stack_len, buf, len);
+    w->stack_len = stack_len + len;
+
+  } else {
+    /* Slow path: entweder Heap nötig oder Overflow im Stack-Pfad */
+
+    /* Heap initialisieren, falls noch nicht geschehen */
+    if (mrb_undef_p(w->heap_str)) {
+      /* positiver Overflow-Guard */
+      if (likely(len <= SIZE_MAX - stack_len)) {
+        cbor_writer_init_heap(w, len);
+      } else {
+        mrb_state *mrb = w->mrb;
+        mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
+      }
+    }
+
+    /* Heap erweitern */
+    cbor_writer_ensure_heap(w, len);
+
+    memcpy(w->heap_ptr + w->heap_len, buf, len);
+    w->heap_len += len;
+    mrb_gc_arena_restore(w->mrb, w->arena_index);
   }
-
-  /* Heap initialisieren, falls noch nicht geschehen */
-  if (mrb_undef_p(w->heap_str)) {
-    cbor_writer_init_heap(w, len);
-  }
-
-  cbor_writer_ensure_heap(w, len);
-  memcpy(w->heap_ptr + w->heap_len, buf, len);
-  w->heap_len += len;
-  mrb_gc_arena_restore(w->mrb, w->arena_index);
 }
+
 
 static void
 cbor_writer_putc(CborWriter *w, uint8_t b)
@@ -1079,10 +1125,11 @@ skip_cbor(mrb_state *mrb, Reader *r)
     case 2: /* byte string */
     case 3: { /* text string */
       uint64_t len = read_len(mrb, r, info);
-      if ((uint64_t)(r->end - r->p) < len) {
+      if (likely((uint64_t)(r->end - r->p) >= len)) {
+        r->p += len;
+      } else {
         mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR string out of bounds");
       }
-      r->p += len;
       return;
     }
 
@@ -1131,7 +1178,7 @@ skip_cbor(mrb_state *mrb, Reader *r)
     }
   }
 
-  mrb_raise(mrb, E_RUNTIME_ERROR, "invalid CBOR major type");
+  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
 }
 
 
@@ -1147,19 +1194,20 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len    = (size_t)RSTRING_LEN(p->buf);
 
-  if (unlikely(p->offset >= total_len)) {
+  if (likely(p->offset < total_len)) {
+    Reader r;
+    r.base = base;
+    r.p    = base + p->offset;
+    r.end  = base + total_len;
+
+
+    mrb_value value = decode_value(mrb, &r, p->buf);
+    mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
+    return value;
+  } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
+    return mrb_undef_value();
   }
-
-  Reader r;
-  r.base = base;
-  r.p    = base + p->offset;
-  r.end  = base + total_len;
-
-
-  mrb_value value = decode_value(mrb, &r, p->buf);
-  mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
-  return value;
 }
 
 static mrb_value
@@ -1169,8 +1217,12 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
   mrb_value key;
   mrb_get_args(mrb, "o", &key);
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
-  mrb_value cached_key = mrb_hash_fetch(mrb, kcache, key, mrb_undef_value());
-  if (!mrb_undef_p(cached_key)) return cached_key;
+  if (likely(mrb_hash_p(kcache))) {
+    mrb_value cached_key = mrb_hash_fetch(mrb, kcache, key, mrb_undef_value());
+    if (!mrb_undef_p(cached_key)) return cached_key;
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
+  }
 
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len    = (size_t)RSTRING_LEN(p->buf);
@@ -1215,7 +1267,6 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
       uint64_t pairs = read_len(mrb, &r, info);
 
       for (uint64_t i = 0; i < pairs; i++) {
-        /* Key vollständig decodieren */
         mrb_value decoded_key = decode_value(mrb, &r, p->buf);
 
         /* Value beginnt jetzt an r.p */

@@ -178,3 +178,61 @@ assert('CBOR bignum does not corrupt following lazy values') do
   assert_equal h["b"], lazy["b"].value
   assert_equal 123, lazy["c"].value
 end
+
+assert('CBOR shared ref: two refs to same array (eager)') do
+  # 82 D8 1C 82 01 02 D8 1D 00
+  buf = "\x82\xD8\x1C\x82\x01\x02\xD8\x1D\x00"
+  result = CBOR.decode(buf)
+  assert_equal [[1, 2], [1, 2]], result
+  assert_same result[0], result[1]
+end
+
+assert('CBOR shared ref: map with shared value (eager)') do
+  # A2 61 61 D8 1C 83 01 02 03 61 62 D8 1D 00
+  buf = "\xA2\x61\x61\xD8\x1C\x83\x01\x02\x03\x61\x62\xD8\x1D\x00"
+  result = CBOR.decode(buf)
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR shared ref: cyclic array (eager)') do
+  # D8 1C 81 D8 1D 00
+  buf = "\xD8\x1C\x81\xD8\x1D\x00"
+  result = CBOR.decode(buf)
+  assert_same result, result[0]
+end
+
+assert('CBOR shared ref: two refs to same array (lazy)') do
+  buf = "\x82\xD8\x1C\x82\x01\x02\xD8\x1D\x00"
+  result = CBOR.decode_lazy(buf).value
+  assert_equal [[1, 2], [1, 2]], result
+  assert_same result[0], result[1]
+end
+
+assert('CBOR shared ref: map with shared value (lazy)') do
+  buf = "\xA2\x61\x61\xD8\x1C\x83\x01\x02\x03\x61\x62\xD8\x1D\x00"
+  result = CBOR.decode_lazy(buf).value
+  assert_equal [1, 2, 3], result["a"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR shared ref: cyclic array (lazy)') do
+  buf = "\xD8\x1C\x81\xD8\x1D\x00"
+  result = CBOR.decode_lazy(buf).value
+  assert_same result, result[0]
+end
+
+assert('CBOR shared ref: invalid index raises') do
+  # Standalone Tag29(99) - shareable table is empty, index 99 not found
+  # D8 1D 18 63  =  Tag(29), uint8(99)
+  buf = "\xD8\x1D\x18\x63"
+  assert_raise(RuntimeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR shared ref: scalar shareable (integer)') do
+  # [Tag28(42), Tag29(0)]
+  buf = "\x82\xD8\x1C\x18\x2A\xD8\x1D\x00"
+  result = CBOR.decode(buf)
+  assert_equal [42, 42], result
+end

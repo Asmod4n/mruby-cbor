@@ -846,7 +846,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
 
         /* ---- Tag 28: shareable ---- */
         case 28: {
-          if (likely(!mrb_undef_p(shareable))) {
+          if (likely(mrb_hash_p(shareable))) {
             mrb_int share_idx = mrb_hash_size(mrb, shareable);
             mrb_value idx_key = mrb_int_value(mrb, share_idx);
 
@@ -885,7 +885,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
 
         /* ---- Tag 29: sharedref ---- */
         case 29: {
-          if (likely(!mrb_undef_p(shareable))) {
+          if (likely(mrb_hash_p(shareable))) {
             uint8_t ref_b     = reader_read8(mrb, r);
             uint8_t ref_major = ref_b >> 5;
             uint8_t ref_info  = ref_b & 0x1F;
@@ -1490,7 +1490,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
     case 6: {
       uint64_t tag = read_len(mrb, r, info);
 
-      if (likely(!mrb_undef_p(shareable))) {
+      if (likely(mrb_hash_p(shareable))) {
         if (tag == 28) {
           /* inner item offset - register as Lazy before skipping */
           mrb_int share_idx = mrb_hash_size(mrb, shareable);

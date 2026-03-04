@@ -9,7 +9,6 @@ A fast, spec-compliant [CBOR](https://cbor.io) (RFC 8949) implementation for [mr
 - Float16/32/64 decode including subnormals, Inf and NaN
 - Shared references (tags 28/29) including cyclic structures
 - `CBOR::Lazy` for zero-copy, on-demand decoding of nested structures
-- SIMD-accelerated hex decoding (AVX2, SSE2, NEON) for BigInt encoding
 - ~30% faster than msgpack on typical workloads
 - `CBOR::Lazy` is ~2x faster than simdjson on-demand parsing on real-world data
 

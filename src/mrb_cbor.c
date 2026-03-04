@@ -23,345 +23,34 @@ MRB_END_DECL
  * scalar fallback
  * ============================================================ */
 
-static inline uint8_t hex_nibble_scalar(char c)
-{
-    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-    if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
-    return 0;
-}
+static const uint8_t hex_lut[256] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x00-0x0F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x10-0x1F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x20-0x2F */
+    0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0, /* 0x30-0x3F  '0'-'9' */
+    0,10,11,12,13,14,15,0,0,0,0,0,0,0,0,0, /* 0x40-0x4F  'A'-'F' */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x50-0x5F */
+    0,10,11,12,13,14,15,0,0,0,0,0,0,0,0,0, /* 0x60-0x6F  'a'-'f' */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x70-0x7F */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
 
 static inline void hex_decode_scalar(uint8_t *out, const char *in, size_t len)
 {
     for (size_t i = 0; i < len; i += 2) {
-        uint8_t hi = hex_nibble_scalar(in[i]);
-        uint8_t lo = hex_nibble_scalar(in[i+1]);
-        out[i/2] = (uint8_t)((hi << 4) | lo);
+        out[i / 2] = (uint8_t)(
+            (hex_lut[(uint8_t)in[i]]     << 4) |
+             hex_lut[(uint8_t)in[i + 1]]
+        );
     }
 }
-
-/* ============================================================
- * portable CPUID wrapper (nur auf x86!)
- * ============================================================ */
-
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-
-# if defined(_MSC_VER)
-#  include <intrin.h>
-   static inline void cpuid(int out[4], int leaf, int subleaf) {
-       __cpuidex(out, leaf, subleaf);
-   }
-# else
-#  include <cpuid.h>
-   static inline void cpuid(int out[4], int leaf, int subleaf) {
-       __cpuid_count(leaf, subleaf, out[0], out[1], out[2], out[3]);
-   }
-# endif
-
-#endif /* x86 */
-
-/* ============================================================
- * SSE2 detection
- * ============================================================ */
-
-static inline int cpu_has_sse2(void)
-{
-#if defined(__x86_64__) || defined(_M_X64)
-    return 1;
-#elif defined(__i386__) || defined(_M_IX86)
-    int r[4];
-    cpuid(r, 1, 0);
-    return (r[3] & (1 << 26)) != 0;
-#else
-    return 0;
-#endif
-}
-
-/* ============================================================
- * AVX / AVX2 detection
- * ============================================================ */
-
-static inline int cpu_has_avx(void)
-{
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    int r[4];
-    cpuid(r, 1, 0);
-
-    int os_uses_xsave_xrstore = (r[2] & (1 << 27)) != 0;
-    int cpu_avx_support       = (r[2] & (1 << 28)) != 0;
-
-    if (!(os_uses_xsave_xrstore && cpu_avx_support))
-        return 0;
-
-# if defined(_MSC_VER)
-    unsigned long long xcr = _xgetbv(0);
-# else
-    unsigned eax, edx;
-    __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
-    unsigned long long xcr = ((unsigned long long)edx << 32) | eax;
-# endif
-
-    return (xcr & 0x6) == 0x6;
-#else
-    return 0;
-#endif
-}
-
-static inline int cpu_has_avx2(void)
-{
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    if (!cpu_has_avx()) return 0;
-    int r[4];
-    cpuid(r, 7, 0);
-    return (r[1] & (1 << 5)) != 0;
-#else
-    return 0;
-#endif
-}
-
-/* ============================================================
- * NEON detection (ohne Linux-Header)
- * ============================================================ */
-
-#if defined(__aarch64__) || defined(__ARM_NEON)
-# include <arm_neon.h>
-#endif
-
-static inline int cpu_has_neon(void)
-{
-#if defined(__aarch64__)
-    return 1;
-#elif defined(__ARM_NEON)
-    return 1;
-#else
-    return 0;
-#endif
-}
-
-/* ============================================================
- * SIMD dispatch pointer
- * ============================================================ */
-
-typedef void (*hex_decode_fn)(uint8_t *out, const char *in, size_t len);
-static hex_decode_fn hex_decode_impl = hex_decode_scalar;
-
-#if defined(__SSE2__)
-#include <emmintrin.h>
-
-static inline __m128i hex_to_nibble_sse2(__m128i c)
-{
-    __m128i zero = _mm_set1_epi8('0');
-    __m128i nine = _mm_set1_epi8('9');
-    __m128i A    = _mm_set1_epi8('A');
-    __m128i F    = _mm_set1_epi8('F');
-    __m128i a    = _mm_set1_epi8('a');
-    __m128i f    = _mm_set1_epi8('f');
-    __m128i ten  = _mm_set1_epi8(10);
-
-    __m128i val0 = _mm_sub_epi8(c, zero);
-    __m128i valA = _mm_add_epi8(_mm_sub_epi8(c, A), ten);
-    __m128i vala = _mm_add_epi8(_mm_sub_epi8(c, a), ten);
-
-    __m128i is_digit = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_sub_epi8(zero,_mm_set1_epi8(1))),
-                                     _mm_cmplt_epi8(c, _mm_add_epi8(nine,_mm_set1_epi8(1))));
-    __m128i is_upper = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_sub_epi8(A,_mm_set1_epi8(1))),
-                                     _mm_cmplt_epi8(c, _mm_add_epi8(F,_mm_set1_epi8(1))));
-    __m128i is_lower = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_sub_epi8(a,_mm_set1_epi8(1))),
-                                     _mm_cmplt_epi8(c, _mm_add_epi8(f,_mm_set1_epi8(1))));
-
-    __m128i res = _mm_and_si128(is_digit, val0);
-    res = _mm_or_si128(res, _mm_and_si128(is_upper, valA));
-    res = _mm_or_si128(res, _mm_and_si128(is_lower, vala));
-
-    return res;
-}
-
-static inline void hex_decode_sse2(uint8_t *out, const char *in, size_t len)
-{
-    size_t i = 0;
-
-    for (; i + 32 <= len; i += 32) {
-        __m128i c0 = _mm_loadu_si128((const __m128i*)(in + i));
-        __m128i c1 = _mm_loadu_si128((const __m128i*)(in + i + 16));
-
-        // unpack hi/lo nibbles
-        __m128i hi_nibble = hex_to_nibble_sse2(_mm_unpacklo_epi8(c0, c1));
-        __m128i lo_nibble = hex_to_nibble_sse2(_mm_unpackhi_epi8(c0, c1));
-
-        // shift hi nibble
-        __m128i hi_shifted = _mm_slli_epi16(hi_nibble, 4);
-
-        // combine
-        __m128i bytes = _mm_or_si128(hi_shifted, lo_nibble);
-
-        // pack 16-bit -> 8-bit
-        bytes = _mm_packus_epi16(bytes, _mm_setzero_si128());
-
-        _mm_storeu_si128((__m128i*)(out + i/2), bytes);
-    }
-
-    if (i < len)
-        hex_decode_scalar(out + i/2, in + i, len - i);
-}
-
-#endif /* SSE2 */
-
-/* ============================================================
- * AVX2 implementation (256-bit)
- * ============================================================ */
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-
-static inline __m256i hex_to_nibble_avx2(__m256i c)
-{
-    __m256i zero = _mm256_set1_epi8('0');
-    __m256i nine = _mm256_set1_epi8('9');
-    __m256i A    = _mm256_set1_epi8('A');
-    __m256i F    = _mm256_set1_epi8('F');
-    __m256i a    = _mm256_set1_epi8('a');
-    __m256i f    = _mm256_set1_epi8('f');
-    __m256i ten  = _mm256_set1_epi8(10);
-
-    __m256i val0 = _mm256_sub_epi8(c, zero);
-    __m256i valA = _mm256_sub_epi8(c, A);
-    __m256i vala = _mm256_sub_epi8(c, a);
-
-    __m256i ge_zero = _mm256_cmpeq_epi8(c, _mm256_max_epu8(c, zero));
-    __m256i le_nine = _mm256_cmpeq_epi8(c, _mm256_min_epu8(c, nine));
-    __m256i is_digit = _mm256_and_si256(ge_zero, le_nine);
-
-    __m256i ge_A = _mm256_cmpeq_epi8(c, _mm256_max_epu8(c, A));
-    __m256i le_F = _mm256_cmpeq_epi8(c, _mm256_min_epu8(c, F));
-    __m256i is_upper = _mm256_and_si256(ge_A, le_F);
-
-    __m256i ge_a = _mm256_cmpeq_epi8(c, _mm256_max_epu8(c, a));
-    __m256i le_f = _mm256_cmpeq_epi8(c, _mm256_min_epu8(c, f));
-    __m256i is_lower = _mm256_and_si256(ge_a, le_f);
-
-    __m256i res = _mm256_and_si256(is_digit, val0);
-    res = _mm256_or_si256(res,
-                          _mm256_and_si256(is_upper, _mm256_add_epi8(valA, ten)));
-    res = _mm256_or_si256(res,
-                          _mm256_and_si256(is_lower, _mm256_add_epi8(vala, ten)));
-
-    return res;
-}
-
-static inline void hex_decode_avx2(uint8_t *out, const char *in, size_t len)
-{
-    const __m256i mul = _mm256_setr_epi8(
-        0x10,1, 0x10,1, 0x10,1, 0x10,1,
-        0x10,1, 0x10,1, 0x10,1, 0x10,1,
-        0x10,1, 0x10,1, 0x10,1, 0x10,1,
-        0x10,1, 0x10,1, 0x10,1, 0x10,1
-    );
-
-    size_t i = 0;
-
-    for (; i + 32 <= len; i += 32) {
-        __m256i ascii = _mm256_loadu_si256((const __m256i*)(in + i));
-        __m256i n     = hex_to_nibble_avx2(ascii);
-        __m256i words = _mm256_maddubs_epi16(n, mul); // 16x16-bit
-
-        // Lane 0
-        __m128i w0 = _mm256_castsi256_si128(words);
-        __m128i b0 = _mm_packus_epi16(w0, w0);        // 8 Bytes in low 8
-        _mm_storel_epi64((__m128i*)(out + i/2), b0);
-
-        // Lane 1
-        __m128i w1 = _mm256_extracti128_si256(words, 1);
-        __m128i b1 = _mm_packus_epi16(w1, w1);
-        _mm_storel_epi64((__m128i*)(out + i/2 + 8), b1);
-    }
-
-    if (i < len) {
-        hex_decode_scalar(out + i/2, in + i, len - i);
-    }
-}
-
-
-#endif /* AVX2 */
-
-/* ============================================================
- * NEON implementation
- * ============================================================ */
-
-#if defined(__ARM_NEON) || defined(__aarch64__)
-
-static inline uint8x16_t hex_to_nibble_neon(uint8x16_t c)
-{
-    uint8x16_t zero = vdupq_n_u8('0');
-    uint8x16_t nine = vdupq_n_u8('9');
-    uint8x16_t A    = vdupq_n_u8('A');
-    uint8x16_t F    = vdupq_n_u8('F');
-    uint8x16_t a    = vdupq_n_u8('a');
-    uint8x16_t f    = vdupq_n_u8('f');
-    uint8x16_t ten  = vdupq_n_u8(10);
-
-    uint8x16_t val0 = vsubq_u8(c, zero);
-    uint8x16_t valA = vsubq_u8(c, A);
-    uint8x16_t vala = vsubq_u8(c, a);
-
-    uint8x16_t is_digit = vandq_u8(vcgeq_u8(c, zero), vcleq_u8(c, nine));
-    uint8x16_t is_upper = vandq_u8(vcgeq_u8(c, A),    vcleq_u8(c, F));
-    uint8x16_t is_lower = vandq_u8(vcgeq_u8(c, a),    vcleq_u8(c, f));
-
-    uint8x16_t res = vandq_u8(is_digit, val0);
-    res = vorrq_u8(res, vandq_u8(is_upper, vaddq_u8(valA, ten)));
-    res = vorrq_u8(res, vandq_u8(is_lower, vaddq_u8(vala, ten)));
-    return res;
-}
-
-static inline void hex_decode_neon(uint8_t *out, const char *in, size_t len)
-{
-    size_t i = 0;
-
-    for (; i + 32 <= len; i += 32) {
-        uint8x16_t ascii0 = vld1q_u8((const uint8_t*)(in + i));
-        uint8x16_t ascii1 = vld1q_u8((const uint8_t*)(in + i + 16));
-
-        uint8x16_t hi_ascii = vuzp1q_u8(ascii0, ascii1);
-        uint8x16_t lo_ascii = vuzp2q_u8(ascii0, ascii1);
-
-        uint8x16_t hi = hex_to_nibble_neon(hi_ascii);
-        uint8x16_t lo = hex_to_nibble_neon(lo_ascii);
-
-        uint8x16_t hi_shift = vshlq_n_u8(hi, 4);
-        uint8x16_t bytes    = vorrq_u8(hi_shift, lo);
-
-        vst1q_u8(out + i/2, bytes);
-    }
-
-    if (i < len)
-        hex_decode_scalar(out + i/2, in + i, len - i);
-}
-
-#endif /* NEON */
-
-/* ============================================================
- * dispatch
- * ============================================================ */
-
-static inline void hex_decode_init(void)
-{
-#if defined(__AVX2__)
-    if (cpu_has_avx2()) { hex_decode_impl = hex_decode_avx2; return; }
-#endif
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    if (cpu_has_sse2()) { hex_decode_impl = hex_decode_sse2; return; }
-#endif
-#if defined(__ARM_NEON) || defined(__aarch64__)
-    if (cpu_has_neon()) { hex_decode_impl = hex_decode_neon; return; }
-#endif
-    hex_decode_impl = hex_decode_scalar;
-}
-
-static inline void hex_decode(uint8_t *out, const char *in, size_t len)
-{
-    hex_decode_impl(out, in, len);
-}
-
 
 // ============================================================================
 // Reader
@@ -387,12 +76,6 @@ reader_read8(mrb_state* mrb, Reader* r)
   if (likely(r->p < r->end)) return *r->p++;
   mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
   return 0;
-}
-
-static mrb_bool
-reader_eof(const Reader* r)
-{
-  return (r->p >= r->end);
 }
 
 static size_t
@@ -641,8 +324,11 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
     case 20: return mrb_false_value();
     case 21: return mrb_true_value();
     case 22:
-    case 23:
-    case 24: return mrb_nil_value();
+    case 23: return mrb_nil_value();
+    case 24: {
+      reader_read8(mrb, r);
+      return mrb_nil_value();
+    }
 
     /* ---------------------- Float16 ---------------------- */
     case 25: {
@@ -737,9 +423,11 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
       return mrb_true_value();
 
     case 22:
-    case 23:
-    case 24:
+    case 23: return mrb_nil_value();
+    case 24: {
+      reader_read8(mrb, r);
       return mrb_nil_value();
+    }
     case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
   }
 
@@ -1208,7 +896,7 @@ encode_bignum(CborWriter *w, mrb_value obj)
   }
 
   uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
-  hex_decode(out, p, nibs);
+  hex_decode_scalar(out, p, nibs);
   cbor_writer_write(w, out, (size_t)byte_len);
   mrb_gc_arena_restore(mrb, idx);
 }
@@ -1670,7 +1358,6 @@ MRB_BEGIN_DECL
 void
 mrb_mruby_cbor_gem_init(mrb_state* mrb)
 {
-  hex_decode_init();
   struct RClass* mod = mrb_define_module_id(mrb, MRB_SYM(CBOR));
 
   mrb_define_module_function_id(mrb, mod, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));

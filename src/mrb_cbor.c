@@ -754,6 +754,7 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
                               size_t len,
                               mrb_bool negative)
 {
+  if (len == 0) return mrb_fixnum_value(negative ? -1 : 0);
   mrb_int idx = mrb_gc_arena_save(mrb);
   uint8_t *tmp = mrb_alloca(mrb, len);
   memcpy(tmp, buf, len);

@@ -120,7 +120,7 @@ static inline int cpu_has_avx2(void)
 }
 
 /* ============================================================
- * NEON detection (ohne Linux‑Header)
+ * NEON detection (ohne Linux-Header)
  * ============================================================ */
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
@@ -262,7 +262,7 @@ static inline void hex_decode_avx2(uint8_t *out, const char *in, size_t len)
     for (; i + 32 <= len; i += 32) {
         __m256i ascii = _mm256_loadu_si256((const __m256i*)(in + i));
         __m256i n     = hex_to_nibble_avx2(ascii);
-        __m256i words = _mm256_maddubs_epi16(n, mul); // 16×16‑bit
+        __m256i words = _mm256_maddubs_epi16(n, mul); // 16x16-bit
 
         // Lane 0
         __m128i w0 = _mm256_castsi256_si128(words);
@@ -474,9 +474,10 @@ read_num(mrb_state* mrb, Reader* r, uint8_t info)
       }
       mrb_raise(mrb, E_RUNTIME_ERROR, "invalid uint64");
       return out;
+    case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
   }
 
-  mrb_raise(mrb, E_RUNTIME_ERROR, "invalid integer encoding");
+  mrb_raisef(mrb, E_RUNTIME_ERROR, "invalid integer encoding: %d", info);
   return out;
 }
 
@@ -528,7 +529,7 @@ ensure_slice_bounds(mrb_state* mrb, mrb_value src, size_t off, uint64_t len)
 {
   size_t slen = (size_t)RSTRING_LEN(src);
 
-  /* Fast path: alles im gültigen Bereich, ohne Overflow-Risiko */
+  /* Fast path: alles im gueltigen Bereich, ohne Overflow-Risiko */
   if (likely(off <= slen && len <= slen - off)) {
     return;
   }
@@ -562,7 +563,6 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
       return slice;
 #endif
   } else {
-      // alles andere ist wirklich out-of-bounds oder würde overflowen
       mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
       return mrb_undef_value();
   }
@@ -578,25 +578,28 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
       r->p += blen;
       return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);;
   } else {
-      // alles andere ist wirklich out-of-bounds oder würde overflowen
       mrb_raise(mrb, E_RUNTIME_ERROR, "text string out of bounds");
   }
 
   return mrb_nil_value();
 }
 
-static mrb_value
-decode_value(mrb_state* mrb, Reader* r, mrb_value src);
+static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable);
+/* shareable: mrb_undef_value() = eager mode (no shared refs), mrb_hash = lazy shared-ref table */
 
 static mrb_value
-decode_array(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
+decode_array(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info, mrb_value shareable, mrb_int share_idx)
 {
   uint64_t len = read_len(mrb, r, info);
   mrb_value ary = mrb_ary_new_capa(mrb, (mrb_int)len);
+
+  if (likely(share_idx >= 0))
+    mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), ary);
+
   mrb_int idx = mrb_gc_arena_save(mrb);
 
   for (uint64_t i = 0; i < len; i++) {
-    mrb_value v = decode_value(mrb, r, src);
+    mrb_value v = decode_value(mrb, r, src, shareable);
     mrb_ary_push(mrb, ary, v);
     mrb_gc_arena_restore(mrb, idx);
   }
@@ -605,15 +608,19 @@ decode_array(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 }
 
 static mrb_value
-decode_map(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
+decode_map(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info, mrb_value shareable, mrb_int share_idx)
 {
   uint64_t len = read_len(mrb, r, info);
   mrb_value hash = mrb_hash_new_capa(mrb, (mrb_int)len);
+
+  if (likely(share_idx >= 0))
+    mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), hash);
+
   mrb_int idx = mrb_gc_arena_save(mrb);
 
   for (uint64_t i = 0; i < len; i++) {
-    mrb_value key = decode_value(mrb, r, src);
-    mrb_value val = decode_value(mrb, r, src);
+    mrb_value key = decode_value(mrb, r, src, shareable);
+    mrb_value val = decode_value(mrb, r, src, shareable);
     mrb_hash_set(mrb, hash, key, val);
     mrb_gc_arena_restore(mrb, idx);
   }
@@ -649,27 +656,29 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 
       uint32_t f;
 
-      if (exp != 0) {
-        uint32_t new_exp  = ((exp >> 10) + (127 - 15)) << 23;
-        uint32_t new_frac = ((uint32_t)frac) << 13;
+      if (exp == 0x7C00u) {
+        /* Inf or NaN: exponent all-ones in float32 = 0xFF */
+        f = ((uint32_t)sign << 16) | 0x7F800000u | ((uint32_t)frac << 13);
+      } else if (exp != 0) {
+        /* Normal number */
+        uint32_t new_exp  = (uint32_t)((exp >> 10) + (127 - 15)) << 23;
+        uint32_t new_frac = (uint32_t)frac << 13;
         f = ((uint32_t)sign << 16) | new_exp | new_frac;
-      }
-      else {
-        if (frac == 0) {
-          f = ((uint32_t)sign << 16);
+      } else if (frac == 0) {
+        /* Zero */
+        f = (uint32_t)sign << 16;
+      } else {
+        /* Subnormal: normalize */
+        uint32_t mant = frac;
+        int shift = 0;
+        while ((mant & 0x0400u) == 0) {
+          mant <<= 1;
+          shift++;
         }
-        else {
-          uint32_t mant = frac;
-          int shift = 0;
-          while ((mant & 0x0400u) == 0) {
-            mant <<= 1;
-            shift++;
-          }
-          mant &= 0x03FFu;
-          uint32_t new_exp  = (uint32_t)(127 - 15 - shift) << 23;
-          uint32_t new_frac = mant << 13;
-          f = ((uint32_t)sign << 16) | new_exp | new_frac;
-        }
+        mant &= 0x03FFu;
+        uint32_t new_exp  = (uint32_t)(127 - 14 - shift) << 23;
+        uint32_t new_frac = mant << 13;
+        f = ((uint32_t)sign << 16) | new_exp | new_frac;
       }
 
       float f32;
@@ -750,7 +759,7 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
   memcpy(tmp, buf, len);
 
 #ifndef MRB_ENDIAN_BIG
-  /* 2) Für MRuby in little-endian drehen */
+  /* 2) Fuer MRuby in little-endian drehen */
   for (size_t i = 0, j = len - 1; i < j; i++, j--) {
     uint8_t t = tmp[i];
     tmp[i] = tmp[j];
@@ -758,7 +767,7 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
   }
 #endif
 
-  /* 3) Bytes → positiver BigInt n */
+  /* 3) Bytes -> positiver BigInt n */
   mrb_value n = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
   mrb_gc_arena_restore(mrb, idx);
   mrb_gc_protect(mrb, n);
@@ -785,7 +794,7 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
 // Master decode
 // ============================================================================
 static mrb_value
-decode_value(mrb_state* mrb, Reader* r, mrb_value src)
+decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
 {
   uint8_t b = reader_read8(mrb, r);
   uint8_t major = (uint8_t)(b >> 5);
@@ -802,10 +811,10 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
     case 3: return decode_text(mrb, r, src, info);
 
     case 4:
-      return decode_array(mrb, r, src, info);
+      return decode_array(mrb, r, src, info, shareable, -1);
 
     case 5:
-      return decode_map(mrb, r, src, info);
+      return decode_map(mrb, r, src, info, shareable, -1);
 
     case 6: {
       uint64_t tag = read_len(mrb, r, info);
@@ -831,9 +840,69 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src)
           mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
 
 #else
-      mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without BigInt Support");
+          mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without BigInt Support");
 #endif
         } break;
+
+        /* ---- Tag 28: shareable ---- */
+        case 28: {
+          if (likely(!mrb_undef_p(shareable))) {
+            mrb_int share_idx = mrb_hash_size(mrb, shareable);
+            mrb_value idx_key = mrb_int_value(mrb, share_idx);
+
+            /* Peek: naechstes Byte bestimmt ob Array oder Map -
+               dann koennen wir den Container vor dem Befuellen registrieren */
+            uint8_t nb     = reader_read8(mrb, r);
+            uint8_t major2 = nb >> 5;
+            uint8_t info2  = nb & 0x1F;
+
+            if (likely(major2 == 4))
+              return decode_array(mrb, r, src, info2, shareable, share_idx);
+
+            if (likely(major2 == 5))
+              return decode_map(mrb, r, src, info2, shareable, share_idx);
+
+            /* Skalare: erst dekodieren, dann registrieren */
+            mrb_hash_set(mrb, shareable, idx_key, mrb_undef_value());
+            mrb_value inner;
+            switch (major2) {
+              case 0: inner = decode_unsigned(mrb, r, info2); break;
+              case 1: inner = decode_negative(mrb, r, info2); break;
+              case 2: inner = decode_bytes(mrb, r, src, info2); break;
+              case 3: inner = decode_text(mrb, r, src, info2); break;
+              case 6: { read_len(mrb, r, info2); inner = decode_value(mrb, r, src, shareable); break; }
+              case 7: inner = decode_simple_or_float(mrb, r, info2); break;
+              default:
+                mrb_raise(mrb, E_RUNTIME_ERROR, "unknown major type in shareable");
+                inner = mrb_undef_value();
+            }
+            mrb_hash_set(mrb, shareable, idx_key, inner);
+            return inner;
+          } else {
+            return decode_value(mrb, r, src, shareable);
+          }
+        }
+
+        /* ---- Tag 29: sharedref ---- */
+        case 29: {
+          if (likely(!mrb_undef_p(shareable))) {
+            uint8_t ref_b     = reader_read8(mrb, r);
+            uint8_t ref_major = ref_b >> 5;
+            uint8_t ref_info  = ref_b & 0x1F;
+
+            if (likely(ref_major == 0)) {
+              mrb_value key    = mrb_convert_uint64(mrb, read_len(mrb, r, ref_info));
+              mrb_value found  = mrb_hash_fetch(mrb, shareable, key, mrb_undef_value());
+
+              if (likely(!mrb_undef_p(found))) return found;
+              else mrb_raisef(mrb, E_RUNTIME_ERROR, "sharedref index %v not found", key);
+            } else {
+              mrb_raise(mrb, E_RUNTIME_ERROR, "sharedref payload must be unsigned integer");
+            }
+          } else {
+            mrb_raise(mrb, E_RUNTIME_ERROR, "sharedref (tag 29) outside lazy context");
+          }
+        }
 
       }
       return mrb_undef_value();
@@ -899,7 +968,7 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
   mrb_state *mrb = w->mrb;
   size_t stack_len = w->stack_len;
 
-  /* Fast path: Addition ohne Overflow möglich */
+  /* Fast path: Addition ohne Overflow moeglich */
   if (likely(need <= SIZE_MAX - stack_len)) {
     size_t initial = stack_len + need;
     size_t capa = next_pow2(initial);
@@ -920,7 +989,7 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
     return;
   }
 
-  /* Slow path: Overflow → Fehler */
+  /* Slow path: Overflow -> Fehler */
   mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
 }
 
@@ -935,7 +1004,7 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
     return;
   }
 
-  /* Jetzt müssen wir wachsen; Overflow dabei verhindern, aber wieder mit positivem likely-Guard */
+  /* Jetzt muessen wir wachsen; Overflow dabei verhindern, aber wieder mit positivem likely-Guard */
   if (likely(add <= SIZE_MAX - heap_len)) {
     size_t need = heap_len + add;
     size_t capa = next_pow2(need);
@@ -965,7 +1034,7 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
       w->stack_len = stack_len + len;
 
     } else {
-      /* Slow path: entweder Heap nötig oder Overflow im Stack-Pfad */
+      /* Slow path: entweder Heap noetig oder Overflow im Stack-Pfad */
 
       /* Heap initialisieren, falls noch nicht geschehen */
       if (mrb_undef_p(w->heap_str)) {
@@ -1007,55 +1076,77 @@ cbor_writer_finish(CborWriter *w)
   return w->heap_str;
 }
 
-typedef CborWriter Writer;
+
 
 static void
-encode_len(Writer* w, uint8_t major, uint64_t len)
+encode_len(CborWriter *w, uint8_t major, uint64_t v)
 {
-  uint8_t buf[1 + 8];   /* max: header + 8 bytes */
-  size_t  n = 0;
+  uint8_t buf[1 + 8];
+  size_t  nbytes;
 
-  if (len < 24) {
-    buf[0] = (uint8_t)((major << 5) | (uint8_t)len);
-    n = 1;
-  }
-  else if (len <= 0xFFu) {
+  if (v < 24) {
+    buf[0] = (uint8_t)((major << 5) | (uint8_t)v);
+    nbytes = 1;
+  } else if (v <= 0xFFu) {
     buf[0] = (uint8_t)((major << 5) | 24);
-    buf[1] = (uint8_t)len;
-    n = 2;
-  }
-  else if (len <= 0xFFFFu) {
+    buf[1] = (uint8_t)v;
+    nbytes = 2;
+  } else if (v <= 0xFFFFu) {
     buf[0] = (uint8_t)((major << 5) | 25);
-    buf[1] = (uint8_t)(len >> 8);
-    buf[2] = (uint8_t)(len);
-    n = 3;
-  }
-  else if (len <= 0xFFFFFFFFu) {
+    buf[1] = (uint8_t)(v >> 8);
+    buf[2] = (uint8_t)(v);
+    nbytes = 3;
+  } else if (v <= 0xFFFFFFFFu) {
     buf[0] = (uint8_t)((major << 5) | 26);
-    buf[1] = (uint8_t)(len >> 24);
-    buf[2] = (uint8_t)(len >> 16);
-    buf[3] = (uint8_t)(len >> 8);
-    buf[4] = (uint8_t)(len);
-    n = 5;
-  }
-  else {
+    buf[1] = (uint8_t)(v >> 24);
+    buf[2] = (uint8_t)(v >> 16);
+    buf[3] = (uint8_t)(v >> 8);
+    buf[4] = (uint8_t)(v);
+    nbytes = 5;
+  } else {
     buf[0] = (uint8_t)((major << 5) | 27);
-    buf[1] = (uint8_t)(len >> 56);
-    buf[2] = (uint8_t)(len >> 48);
-    buf[3] = (uint8_t)(len >> 40);
-    buf[4] = (uint8_t)(len >> 32);
-    buf[5] = (uint8_t)(len >> 24);
-    buf[6] = (uint8_t)(len >> 16);
-    buf[7] = (uint8_t)(len >> 8);
-    buf[8] = (uint8_t)(len);
-    n = 9;
+    buf[1] = (uint8_t)(v >> 56);
+    buf[2] = (uint8_t)(v >> 48);
+    buf[3] = (uint8_t)(v >> 40);
+    buf[4] = (uint8_t)(v >> 32);
+    buf[5] = (uint8_t)(v >> 24);
+    buf[6] = (uint8_t)(v >> 16);
+    buf[7] = (uint8_t)(v >> 8);
+    buf[8] = (uint8_t)(v);
+    nbytes = 9;
   }
 
-  cbor_writer_write(w, buf, n);
+  cbor_writer_write(w, buf, nbytes);
+}
+
+static void
+encode_integer(CborWriter *w, mrb_int n)
+{
+  if (n >= 0) {
+    encode_len(w, 0, (uint64_t)n);
+  } else {
+    encode_len(w, 1, (uint64_t)(-1 - n));
+  }
+}
+
+static void
+encode_uint64(CborWriter *w, uint64_t v)
+{
+  encode_len(w, 0, v);
+}
+
+static void
+encode_int64(CborWriter *w, int64_t n)
+{
+  if (n >= 0) {
+    encode_len(w, 0, (uint64_t)n);
+  } else {
+    encode_len(w, 1, (uint64_t)(-1 - n));
+  }
 }
 
 // ============================================================================
-// BigInt encoding (Tag 2/3) – mrb_bint_to_s ist native endian → korrigieren
+// BigInt encoding (Tag 2/3) - mrb_bint_to_s ist native endian -> korrigieren
 // ============================================================================
 #ifdef MRB_USE_BIGINT
 static void
@@ -1064,69 +1155,59 @@ encode_bignum(CborWriter *w, mrb_value obj)
   mrb_state *mrb = w->mrb;
   mrb_int idx = mrb_gc_arena_save(mrb);
 
-  /* Sign bestimmen */
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
-  /* Betrag holen */
+  /* Fast path: fits in 64 bits -> encode as normal integer, no tag/hex needed */
+  if (mrb_bint_size(mrb, obj) <= 8) {
+    if (sign >= 0) {
+      encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
+    } else {
+      encode_int64(w, mrb_bint_as_int64(mrb, obj));
+    }
+    mrb_gc_arena_restore(mrb, idx);
+    return;
+  }
+
+  /* Slow path: truly large bigint -> Tag 2/3 + hex encode */
+
   mrb_value mag = mrb_bint_abs(mrb, obj);
 
-  /* Tag 3: n = |value| - 1 */
   if (sign < 0) {
     mrb_value one = mrb_fixnum_value(1);
     mag = mrb_bint_sub(mrb, mag, one);
   }
 
-  /* Betrag als Hexstring */
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
-  const char *p = RSTRING_PTR(hex);
+  char *p = RSTRING_PTR(hex);
   mrb_int len = RSTRING_LEN(hex);
 
-  /* führende Nullen überspringen */
-  while (len > 0 && *p == '0') {
-    p++;
-    len--;
-  }
+  while (len > 0 && *p == '0') { p++; len--; }
 
-  /* Spezialfall: Wert == 0 */
   if (len == 0) {
     uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
     cbor_writer_write(w, &tag, 1);
     encode_len(w, 2, 1);
     uint8_t zero = 0;
     cbor_writer_write(w, &zero, 1);
+    mrb_gc_arena_restore(mrb, idx);
     return;
   }
 
-  /* ungerade Länge → führende '0' hinzufügen */
   mrb_bool odd = (len & 1);
   mrb_int nibs = odd ? (len + 1) : len;
-
-  /* Byteanzahl */
   mrb_int byte_len = nibs / 2;
 
-  /* CBOR Tag */
   uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
   cbor_writer_write(w, &tag, 1);
-
-  /* Länge */
   encode_len(w, 2, (uint64_t)byte_len);
 
-  /* Hexstring normalisieren (ggf. führende '0') */
-  char *hexbuf = (char*)mrb_alloca(mrb, nibs);
   if (odd) {
-    hexbuf[0] = '0';
-    memcpy(hexbuf + 1, p, len);
-  } else {
-    memcpy(hexbuf, p, len);
+    memmove(p + 1, p, len);
+    p[0] = '0';
   }
 
-  /* Zielpuffer für Bytes */
   uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
-
-  /* SIMD‑Hex‑Decode */
-  hex_decode(out, hexbuf, nibs);
-
-  /* Bulk‑Write */
+  hex_decode(out, p, nibs);
   cbor_writer_write(w, out, (size_t)byte_len);
   mrb_gc_arena_restore(mrb, idx);
 }
@@ -1135,10 +1216,10 @@ encode_bignum(CborWriter *w, mrb_value obj)
 // ============================================================================
 // Array / Map
 // ============================================================================
-static void encode_value(Writer* w, mrb_value obj);
+static void encode_value(CborWriter* w, mrb_value obj);
 
 static void
-encode_array(Writer* w, mrb_value ary)
+encode_array(CborWriter* w, mrb_value ary)
 {
   struct RArray *a = mrb_ary_ptr(ary);
 
@@ -1155,7 +1236,7 @@ encode_array(Writer* w, mrb_value ary)
 static int
 encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
-  Writer *w = (Writer*)data;
+  CborWriter *w = (CborWriter*)data;
 
   encode_value(w, key);
   encode_value(w, val);
@@ -1164,7 +1245,7 @@ encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 }
 
 static void
-encode_map(Writer* w, mrb_value hash)
+encode_map(CborWriter* w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
   struct RHash *h = mrb_hash_ptr(hash);
@@ -1173,7 +1254,7 @@ encode_map(Writer* w, mrb_value hash)
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
 
-  /* direkte Iteration über Hash-Table */
+  /* direkte Iteration ueber Hash-Table */
   mrb_hash_foreach(mrb, h, encode_map_foreach, w);
 }
 
@@ -1182,16 +1263,16 @@ encode_map(Writer* w, mrb_value hash)
 // Text
 // ============================================================================
 static void
-encode_string(Writer* w, mrb_value str)
+encode_string(CborWriter* w, mrb_value str)
 {
   const char* p = RSTRING_PTR(str);
   mrb_int blen  = RSTRING_LEN(str);
 
   if (mrb_str_is_utf8(str)) {
-    /* UTF‑8 → CBOR Text (Major 3) */
+    /* UTF-8 -> CBOR Text (Major 3) */
     encode_len(w, 3, (uint64_t)blen);
   } else {
-    /* Nicht UTF‑8 → CBOR Bytes (Major 2) */
+    /* Nicht UTF-8 -> CBOR Bytes (Major 2) */
     encode_len(w, 2, (uint64_t)blen);
   }
 
@@ -1202,7 +1283,7 @@ encode_string(Writer* w, mrb_value str)
 // Simple
 // ============================================================================
 static void
-encode_simple(Writer* w, mrb_value obj)
+encode_simple(CborWriter* w, mrb_value obj)
 {
   uint8_t b;
 
@@ -1219,66 +1300,9 @@ encode_simple(Writer* w, mrb_value obj)
   cbor_writer_write(w, &b, 1);
 }
 
-static void
-encode_integer(Writer *w, mrb_int n)
-{
-  uint8_t buf[1 + 8];
-  size_t  nbytes = 0;
-  uint8_t major;
-  uint64_t v;
-
-  if (n >= 0) {
-    major = 0;
-    v = (uint64_t)n;
-  }
-  else {
-    major = 1;
-    v = (uint64_t)(-1 - n);
-  }
-
-  if (v < 24) {
-    buf[0] = (uint8_t)((major << 5) | (uint8_t)v);
-    nbytes = 1;
-  }
-  else if (v <= 0xFFu) {
-    buf[0] = (uint8_t)((major << 5) | 24);
-    buf[1] = (uint8_t)v;
-    nbytes = 2;
-  }
-  else if (v <= 0xFFFFu) {
-    buf[0] = (uint8_t)((major << 5) | 25);
-    buf[1] = (uint8_t)(v >> 8);
-    buf[2] = (uint8_t)(v);
-    nbytes = 3;
-  }
-  else if (v <= 0xFFFFFFFFu) {
-    buf[0] = (uint8_t)((major << 5) | 26);
-    buf[1] = (uint8_t)(v >> 24);
-    buf[2] = (uint8_t)(v >> 16);
-    buf[3] = (uint8_t)(v >> 8);
-    buf[4] = (uint8_t)(v);
-    nbytes = 5;
-  }
-  else {
-    buf[0] = (uint8_t)((major << 5) | 27);
-    buf[1] = (uint8_t)(v >> 56);
-    buf[2] = (uint8_t)(v >> 48);
-    buf[3] = (uint8_t)(v >> 40);
-    buf[4] = (uint8_t)(v >> 32);
-    buf[5] = (uint8_t)(v >> 24);
-    buf[6] = (uint8_t)(v >> 16);
-    buf[7] = (uint8_t)(v >> 8);
-    buf[8] = (uint8_t)(v);
-    nbytes = 9;
-  }
-
-  cbor_writer_write(w, buf, nbytes);
-}
-
-
 #ifndef MRB_NO_FLOAT
 static void
-encode_float(Writer *w, mrb_float f)
+encode_float(CborWriter *w, mrb_float f)
 {
 #ifdef MRB_USE_FLOAT32
   uint8_t buf[1 + 4];
@@ -1310,7 +1334,7 @@ encode_float(Writer *w, mrb_float f)
 #endif
 
 static void
-encode_value(Writer* w, mrb_value obj)
+encode_value(CborWriter* w, mrb_value obj)
 {
   mrb_state* mrb = w->mrb;
 
@@ -1387,13 +1411,7 @@ mrb_cbor_decode(mrb_state* mrb, mrb_value self)
 
   reader_init(&r, (const uint8_t*)RSTRING_PTR(src), (size_t)RSTRING_LEN(src));
 
-  mrb_value obj = decode_value(mrb, &r, src);
-
-  if (!reader_eof(&r)) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "extra bytes after CBOR document");
-  }
-
-  return obj;
+  return decode_value(mrb, &r, src, mrb_hash_new(mrb));
 }
 
 // ============================================================================
@@ -1410,7 +1428,7 @@ static const struct mrb_data_type cbor_lazy_type = {
 };
 
 static mrb_value
-cbor_lazy_new(mrb_state *mrb, mrb_value buf, uint32_t offset)
+cbor_lazy_new(mrb_state *mrb, mrb_value buf, uint32_t offset, mrb_value shareable)
 {
   struct RClass *cbor = mrb_module_get_id(mrb, MRB_SYM(CBOR));
   struct RClass *lazy = mrb_class_get_under_id(mrb, cbor, MRB_SYM(Lazy));
@@ -1422,20 +1440,20 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, uint32_t offset)
   p->buf    = buf;
   p->offset = offset;
   mrb_value obj = mrb_obj_value(data);
-  mrb_iv_set(mrb, obj, MRB_SYM(buf), buf);
-  mrb_iv_set(mrb, obj, MRB_SYM(vcache), mrb_undef_value());
-  mrb_iv_set(mrb, obj, MRB_SYM(kcache), mrb_hash_new(mrb));
+  mrb_iv_set(mrb, obj, MRB_SYM(buf),        buf);
+  mrb_iv_set(mrb, obj, MRB_SYM(vcache),     mrb_undef_value());
+  mrb_iv_set(mrb, obj, MRB_SYM(kcache),     mrb_hash_new(mrb));
+  mrb_iv_set(mrb, obj, MRB_SYM(shareable),  shareable);
   return obj;
 }
 
 static void
-skip_cbor(mrb_state *mrb, Reader *r)
+skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
 {
-  if (unlikely(r->p >= r->end)) {
+  if (unlikely(r->p >= r->end))
     mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
-  }
 
-  uint8_t b = reader_read8(mrb, r);
+  uint8_t b     = reader_read8(mrb, r);
   uint8_t major = b >> 5;
   uint8_t info  = b & 0x1F;
 
@@ -1443,64 +1461,63 @@ skip_cbor(mrb_state *mrb, Reader *r)
 
     case 0: /* unsigned integer */
     case 1: /* negative integer */
-      if (info < 24) {
-        return;
-      }
-      /* read_num advances r->p for extended integer encodings */
-      read_num(mrb, r, info);
+      if (info >= 24) read_num(mrb, r, info);
       return;
 
     case 2: /* byte string */
     case 3: { /* text string */
       uint64_t len = read_len(mrb, r, info);
-      if (likely((uint64_t)(r->end - r->p) >= len)) {
-        r->p += len;
-      } else {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR string out of bounds");
-      }
-      return;
+      if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
+      mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR string out of bounds");
     }
 
     case 4: { /* array */
       uint64_t len = read_len(mrb, r, info);
-      for (uint64_t i = 0; i < len; i++) {
-        skip_cbor(mrb, r);
-      }
+      for (uint64_t i = 0; i < len; i++)
+        skip_cbor(mrb, r, buf, shareable);
       return;
     }
 
     case 5: { /* map */
       uint64_t len = read_len(mrb, r, info);
       for (uint64_t i = 0; i < len; i++) {
-        skip_cbor(mrb, r); /* key */
-        skip_cbor(mrb, r); /* value */
+        skip_cbor(mrb, r, buf, shareable); /* key */
+        skip_cbor(mrb, r, buf, shareable); /* value */
       }
       return;
     }
 
-    case 6: { /* tag */
-      /* skip tag number then the tagged item */
-      read_len(mrb, r, info);
-      skip_cbor(mrb, r);
+    case 6: {
+      uint64_t tag = read_len(mrb, r, info);
+
+      if (likely(!mrb_undef_p(shareable))) {
+        if (tag == 28) {
+          /* inner item offset - register as Lazy before skipping */
+          mrb_int share_idx = mrb_hash_size(mrb, shareable);
+          uint32_t inner_offset = (uint32_t)(r->p - r->base);
+          mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, shareable);
+          mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), lazy);
+          skip_cbor(mrb, r, buf, shareable);
+          return;
+        }
+        /* tag 29: just skip the uint index, nothing to register */
+      }
+
+      skip_cbor(mrb, r, buf, shareable);
       return;
     }
 
-    case 7: { /* simple / float / break */
+    case 7: {
       if (info < 24) return;
-
       switch (info) {
-        case 24:
-          if (likely(r->p < r->end)) { r->p++; return; }
-          mrb_raise(mrb, E_RUNTIME_ERROR, "simple value out of bounds");
-        case 25:
-          if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
-          mrb_raise(mrb, E_RUNTIME_ERROR, "float16 out of bounds");
-        case 26:
-          if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
-          mrb_raise(mrb, E_RUNTIME_ERROR, "float32 out of bounds");
-        case 27:
-          if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
-          mrb_raise(mrb, E_RUNTIME_ERROR, "float64 out of bounds");
+        case 24: if (likely(r->p < r->end)) { r->p++; return; }
+                 mrb_raise(mrb, E_RUNTIME_ERROR, "simple value out of bounds");
+        case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
+                 mrb_raise(mrb, E_RUNTIME_ERROR, "float16 out of bounds");
+        case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
+                 mrb_raise(mrb, E_RUNTIME_ERROR, "float32 out of bounds");
+        case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
+                 mrb_raise(mrb, E_RUNTIME_ERROR, "float64 out of bounds");
         case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported in bounded mode");
       }
     }
@@ -1510,7 +1527,7 @@ skip_cbor(mrb_state *mrb, Reader *r)
 }
 
 
-/* Lazy#value: vollständiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
+/* Lazy#value: vollstaendiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
 static mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
 {
@@ -1528,8 +1545,7 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
     r.p    = base + p->offset;
     r.end  = base + total_len;
 
-
-    mrb_value value = decode_value(mrb, &r, p->buf);
+    mrb_value value = decode_value(mrb, &r, p->buf, mrb_iv_get(mrb, self, MRB_SYM(shareable)));
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
@@ -1559,8 +1575,9 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
   }
 
+  mrb_value shareable = mrb_iv_get(mrb, self, MRB_SYM(shareable));
+
   Reader r;
-  /* WICHTIG: wie bei cbor_lazy_value – base ist immer der Anfang des gesamten Buffers */
   r.base = base;
   r.p    = base + p->offset;
   r.end  = base + total_len;
@@ -1582,32 +1599,45 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
       }
 
       for (mrb_int i = 0; i < idx; i++) {
-        skip_cbor(mrb, &r);
+        skip_cbor(mrb, &r, p->buf, shareable);
       }
 
       uint32_t elem_offset = (uint32_t)(r.p - base);
-      mrb_value new_lazy = cbor_lazy_new(mrb, p->buf, elem_offset);
+      mrb_value new_lazy = cbor_lazy_new(mrb, p->buf, elem_offset, shareable);
       mrb_hash_set(mrb, kcache, key, new_lazy);
       return new_lazy;
     }
 
     case 5: { /* Map */
       uint64_t pairs = read_len(mrb, &r, info);
+      mrb_bool key_is_str = mrb_string_p(key);
 
       for (uint64_t i = 0; i < pairs; i++) {
-        mrb_value decoded_key = decode_value(mrb, &r, p->buf);
+        mrb_bool match;
 
-        /* Value beginnt jetzt an r.p */
-        uint32_t value_offset = (uint32_t)(r.p - base);
+        uint8_t kb    = reader_read8(mrb, &r);
+        uint8_t kmaj  = kb >> 5;
+        uint8_t kinfo = kb & 0x1F;
 
-        if (mrb_equal(mrb, decoded_key, key)) {
-          mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset);
+        if (key_is_str && (kmaj == 2 || kmaj == 3)) {
+          uint64_t klen = read_len(mrb, &r, kinfo);
+          match = (klen == (uint64_t)RSTRING_LEN(key) &&
+                   (uint64_t)(r.end - r.p) >= klen &&
+                   memcmp(r.p, RSTRING_PTR(key), klen) == 0);
+          r.p += klen;
+        } else {
+          r.p--;
+          match = mrb_equal(mrb, decode_value(mrb, &r, p->buf, shareable), key);
+        }
+
+        if (match) {
+          uint32_t value_offset = (uint32_t)(r.p - base);
+          mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset, shareable);
           mrb_hash_set(mrb, kcache, key, lazy_new);
           return lazy_new;
         }
 
-        /* Value überspringen, wenn Key nicht passt */
-        skip_cbor(mrb, &r);
+        skip_cbor(mrb, &r, p->buf, shareable);
       }
 
       return mrb_nil_value();
@@ -1626,7 +1656,12 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
 
-  return cbor_lazy_new(mrb, mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf)), 0);
+  mrb_value shareable = mrb_hash_new(mrb);
+
+  return cbor_lazy_new(mrb,
+                       mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf)),
+                       0,
+                       shareable);
 }
 
 MRB_BEGIN_DECL

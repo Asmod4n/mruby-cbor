@@ -9,4 +9,6 @@ MRuby::Gem::Specification.new('mruby-cbor') do |spec|
   spec.add_dependency 'mruby-string-is-utf8'
   spec.add_test_dependency 'mruby-random'
   spec.add_test_dependency 'mruby-io'
+  spec.add_test_dependency 'mruby-b64'
+  spec.add_test_dependency 'mruby-fast-json'
 end

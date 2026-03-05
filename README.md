@@ -10,7 +10,11 @@ A fast, spec-compliant [CBOR](https://cbor.io) (RFC 8949) implementation for [mr
 - Shared references (tags 28/29) including cyclic structures
 - `CBOR::Lazy` for zero-copy, on-demand decoding of nested structures
 - ~30% faster than msgpack on typical workloads
-- `CBOR::Lazy` is ~2x faster than simdjson on-demand parsing on real-world data
+- `CBOR::Lazy` is ~1.4-3.5x faster than simdjson on-demand parsing on real-world data
+
+## Anti Features
+
+- no support for indefinite-length items
 
 ## Usage
 
@@ -55,8 +59,8 @@ Navigating `$.statuses[50].user.id` on `twitter.json` (617 KB), 25,000 iteration
 
 ```
                user     system      total        real
-lazy       1.063623   0.000000   1.063623 (  1.168568)
-json lazy  2.275749   0.000000   2.275749 (  2.502880)
+lazy       1.043505   0.001357   1.044862 (  1.149626)
+json lazy  2.261862   0.000088   2.261950 (  2.388596)
 ```
 
 `CBOR::Lazy` is **2.3x faster** than simdjson on-demand for selective field access. This is possible because CBOR is a binary format — no UTF-8 validation, no string unescaping, no number parsing overhead on the skip path.

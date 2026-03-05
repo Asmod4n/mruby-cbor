@@ -60,7 +60,7 @@ end
 
 assert('CBOR out of bounds raises') do
   broken = "\x63ab"
-  assert_raise(RuntimeError) { CBOR.decode(broken) }
+  assert_raise(RangeError) { CBOR.decode(broken) }
 end
 
 assert('CBOR roundtrip large structure') do
@@ -96,13 +96,13 @@ end
 assert('CBOR::Lazy missing key returns nil') do
   h = { "a" => 1 }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-  assert_nil lazy["missing"]
+  assert_raise(KeyError) { lazy["missing"] }
 end
 
 assert('CBOR::Lazy array out of bounds') do
   ary = [1,2,3]
   lazy = CBOR.decode_lazy(CBOR.encode(ary))
-  assert_nil lazy[99]
+  assert_raise(IndexError) { lazy[99] }
 end
 
 assert('CBOR::Lazy independent caches') do
@@ -227,7 +227,7 @@ assert('CBOR shared ref: invalid index raises') do
   # Standalone Tag29(99) - shareable table is empty, index 99 not found
   # D8 1D 18 63  =  Tag(29), uint8(99)
   buf = "\xD8\x1D\x18\x63"
-  assert_raise(RuntimeError) { CBOR.decode(buf) }
+  assert_raise(IndexError) { CBOR.decode(buf) }
 end
 
 assert('CBOR shared ref: scalar shareable (integer)') do

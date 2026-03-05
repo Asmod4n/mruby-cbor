@@ -7,7 +7,7 @@
 def assert_safe(&block)
   begin
     block.call
-  rescue RuntimeError, NotImplementedError, TypeError, ArgumentError
+  rescue RuntimeError, NotImplementedError, TypeError, ArgumentError, IndexError, KeyError, RangeError
     # expected - decoder rejected invalid input
   end
   assert_true true

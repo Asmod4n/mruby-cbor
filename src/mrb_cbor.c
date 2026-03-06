@@ -1033,10 +1033,6 @@ encode_simple(CborWriter* w, mrb_value obj)
       b = 0xF5;     /* true */
       break;
 
-    case MRB_TT_UNDEF:
-      b = 0xF7;     /* undefined */
-      break;
-
     default: {
       mrb_state *mrb = w->mrb;
       mrb_raise(mrb, E_TYPE_ERROR, "unexpected simple value");
@@ -1087,7 +1083,6 @@ encode_value(CborWriter* w, mrb_value obj)
   switch (mrb_type(obj)) {
     case MRB_TT_FALSE:
     case MRB_TT_TRUE:
-    case MRB_TT_UNDEF:
       encode_simple(w, obj);
       break;
 
@@ -1236,18 +1231,19 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
     case 6: {
       uint64_t tag = read_len(mrb, r, info);
 
-      if (likely(mrb_hash_p(shareable))) {
         if (tag == 28) {
-          /* inner item offset - register as Lazy before skipping */
-          mrb_int share_idx = mrb_hash_size(mrb, shareable);
-          uint32_t inner_offset = (uint32_t)(r->p - r->base);
-          mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, shareable);
-          mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), lazy);
+          if (likely(mrb_hash_p(shareable))) {
+
+            /* inner item offset - register as Lazy before skipping */
+            mrb_int share_idx = mrb_hash_size(mrb, shareable);
+            uint32_t inner_offset = (uint32_t)(r->p - r->base);
+            mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, shareable);
+            mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), lazy);
+          } else {
+            mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
+          }
         }
         /* tag 29: just skip the uint index, nothing to register */
-      } else {
-        mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
-      }
 
       skip_cbor(mrb, r, buf, shareable);
       return;
@@ -1580,6 +1576,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
  * ============================================================ */
 
 typedef struct {
+  mrb_value path;
   const uint8_t *data;
   size_t size;
 
@@ -1619,86 +1616,103 @@ static const struct mrb_data_type cbor_mappedfile_type = {
  * ============================================================ */
 
 #ifndef _WIN32
-static bool
-cbor_map_file(CborMappedFile *m, const char *path)
+static void
+cbor_map_file(mrb_state *mrb, CborMappedFile *m, mrb_value path)
 {
   memset(m, 0, sizeof(*m));
 
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) return false;
+  int fd = open(RSTRING_CSTR(mrb, path), O_RDONLY);
+  if (fd < 0) mrb_sys_fail(mrb, "open");
 
   struct stat st;
   if (fstat(fd, &st) < 0) {
     close(fd);
-    return false;
+    mrb_sys_fail(mrb, "fstat");
   }
 
   void *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (ptr == MAP_FAILED) {
     close(fd);
-    return false;
+    mrb_sys_fail(mrb, "mmap");
   }
 
+  m->path = path;
   m->data = (const uint8_t*)ptr;
   m->size = (size_t)st.st_size;
   m->fd   = fd;
-  return true;
 }
 
 #else
 
-static bool
-cbor_map_file(CborMappedFile *m, const char *path)
+static void
+cbor_map_file(mrb_state *mrb, CborMappedFile *m, mrb_value path)
 {
   memset(m, 0, sizeof(*m));
 
-  HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+  HANDLE hFile = CreateFileA(RSTRING_CSTR(mrb, path), GENERIC_READ, FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (hFile == INVALID_HANDLE_VALUE) return false;
+  if (hFile == INVALID_HANDLE_VALUE) mrb_sys_fail(mrb, "CreateFileA");
 
   LARGE_INTEGER size;
   if (!GetFileSizeEx(hFile, &size)) {
     CloseHandle(hFile);
-    return false;
+    mrb_sys_fail(mrb, "GetFileSizeEx");
   }
 
   HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
   if (!hMap) {
     CloseHandle(hFile);
-    return false;
+    mrb_sys_fail(mrb, "CreateFileMappingA");
   }
 
   void *ptr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
   if (!ptr) {
     CloseHandle(hMap);
     CloseHandle(hFile);
-    return false;
+    mrb_sys_fail(mrb, "MapViewOfFile");
   }
 
+  m->path = path;
   m->data = (const uint8_t*)ptr;
   m->size = (size_t)size.QuadPart;
   m->hFile = hFile;
   m->hMap  = hMap;
-  return true;
 }
 
 #endif
 
+static size_t
+cbor_skip_document(mrb_state *mrb,
+                   const uint8_t *data, size_t size, size_t offset,
+                   mrb_value buf, mrb_value shareable)
+{
+  if (offset >= size) return offset;
 
-/* ============================================================
- * CBOR.decode_lazy_file(path)
- * ============================================================ */
+  Reader r;
+  reader_init(&r, data + offset, size - offset);
+
+  /* skip genau EIN Top-Level-Item */
+  skip_cbor(mrb, &r, buf, shareable);
+
+  /* neuer Offset relativ zur Basis */
+  return offset + reader_offset(&r);
+}
+
 
 static mrb_value
-mrb_cbor_decode_lazy_file(mrb_state *mrb, mrb_value self)
+mrb_cbor_lazy_stream(mrb_state *mrb, mrb_value self)
 {
-  char *path;
-  mrb_get_args(mrb, "z", &path);
+  mrb_value path, block;
+  mrb_get_args(mrb, "S&", &path, &block);
+  path = mrb_str_byte_subseq(mrb, path, 0, RSTRING_LEN(path));
 
-  /* CBOR::MappedFile Klasse holen */
-  struct RClass *cbor = mrb_module_get_id(mrb, MRB_SYM(CBOR));
+  if (!mrb_block_given_p(mrb)) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "block required");
+  }
+
+  /* CBOR::MappedFile holen */
   struct RClass *mappedfile =
-      mrb_class_get_under_id(mrb, cbor, MRB_SYM(MappedFile));
+      mrb_class_get_under_id(mrb, mrb_class_ptr(self), MRB_SYM(MappedFile));
 
   /* Mapping-Objekt erzeugen */
   CborMappedFile *m;
@@ -1706,12 +1720,9 @@ mrb_cbor_decode_lazy_file(mrb_state *mrb, mrb_value self)
   Data_Make_Struct(mrb, mappedfile, CborMappedFile,
                    &cbor_mappedfile_type, m, data);
 
-  if (!cbor_map_file(m, path)) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "failed to mmap file");
-  }
-
-  /* Ruby-Objekt für das Mapping */
-  mrb_value mapped_obj = mrb_obj_value(data);
+  cbor_map_file(mrb, m, path);
+  mrb_value mapped_file = mrb_obj_value(data);
+  mrb_iv_set(mrb, mapped_file, MRB_SYM(path), path);
 
   /* zero-copy String auf mmap */
   mrb_value buf = mrb_str_new_static(
@@ -1720,42 +1731,57 @@ mrb_cbor_decode_lazy_file(mrb_state *mrb, mrb_value self)
       (mrb_int)m->size
   );
 
-  /* shareable-Hash für Tag 28/29 */
+  /* shareable-Hash für Tag 28/29 – einmal pro Stream */
   mrb_value shareable = mrb_hash_new(mrb);
 
-  /* Lazy-Objekt erzeugen */
-  mrb_value lazy = cbor_lazy_new(mrb, buf, 0, shareable);
+  size_t offset = 0;
 
-  /* Mapping direkt im Lazy-Objekt speichern */
-  mrb_iv_set(mrb, lazy, MRB_SYM(mapped_file), mapped_obj);
+  while (offset < m->size) {
+    /* Lazy-Objekt für aktuelles Top-Level-Item */
+    mrb_value lazy = cbor_lazy_new(mrb, buf, (mrb_int)offset, shareable);
 
-  return lazy;
+    /* Mapping an Lazy hängen, damit mmap-Lifetime gesichert ist */
+    mrb_iv_set(mrb, lazy, MRB_SYM(mapped_file), mapped_file);
+
+    /* Block aufrufen */
+    mrb_yield(mrb, block, lazy);
+
+    /* nächstes Dokument finden */
+    size_t next = cbor_skip_document(mrb, m->data, m->size, offset, buf, shareable);
+    if (next <= offset) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid CBOR document boundary");
+    }
+    offset = next;
+  }
+
+  return mrb_nil_value();
 }
+
 
 MRB_BEGIN_DECL
 
 MRB_API void
 mrb_mruby_cbor_gem_init(mrb_state* mrb)
 {
-  struct RClass* mod = mrb_define_module_id(mrb, MRB_SYM(CBOR));
+  struct RClass* cbor = mrb_define_module_id(mrb, MRB_SYM(CBOR));
 
-  mrb_define_module_function_id(mrb, mod, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, mod, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1));
 
-  struct RClass *lazy = mrb_define_class_under_id(mrb, mod, MRB_SYM(Lazy), mrb->object_class);
+  struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);
 
   mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),    cbor_lazy_aref,  MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, lazy, MRB_SYM(value), cbor_lazy_value, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),       cbor_lazy_dig,   MRB_ARGS_ANY());
   struct RClass *mappedfile =
-      mrb_define_class_under_id(mrb, mod, MRB_SYM(MappedFile), mrb->object_class);
+      mrb_define_class_under_id(mrb, cbor, MRB_SYM(MappedFile), mrb->object_class);
 
   MRB_SET_INSTANCE_TT(mappedfile, MRB_TT_CDATA);
-  mrb_define_module_function_id(mrb, mod, MRB_SYM(decode_lazy),
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),
                                 mrb_cbor_decode_lazy, MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, mod, MRB_SYM(decode_lazy_file),
-                                mrb_cbor_decode_lazy_file, MRB_ARGS_REQ(1));
+
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(stream), mrb_cbor_lazy_stream, MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK());
 }
 
 

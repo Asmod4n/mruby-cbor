@@ -474,53 +474,151 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
 
 #ifdef MRB_USE_BIGINT
 static mrb_value
-decode_bignum_from_cbor_bytes(mrb_state* mrb,
-                              const uint8_t* buf,
-                              size_t len,
-                              mrb_bool negative)
+decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
 {
-  if (len == 0) mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
-  uint8_t *tmp = mrb_alloca(mrb, len);
-  memcpy(tmp, buf, len);
+  mrb_int idx = mrb_gc_arena_save(mrb);
+
+  /* Read inner header */
+  uint8_t b2 = reader_read8(mrb, r);
+  uint8_t major2 = (uint8_t)(b2 >> 5);
+  uint8_t info2  = (uint8_t)(b2 & 0x1F);
+
+  if (unlikely(major2 != 2))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
+
+  uint64_t len = read_len(mrb, r, info2);
+  if (len == 0)
+    mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
+
+  size_t off = reader_offset(r);
+  ensure_slice_bounds(mrb, src, off, len);
+  r->p += len;
+
+  const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
+  mrb_bool negative = (tag == 3);
+
+  const uint8_t* bigbuf = buf;   /* pointer we will actually use */
 
 #ifndef MRB_ENDIAN_BIG
-  /* 2) Fuer MRuby in little-endian drehen */
-  for (size_t i = 0, j = len - 1; i < j; i++, j--) {
-    uint8_t t = tmp[i];
-    tmp[i] = tmp[j];
-    tmp[j] = t;
+  /* Only reverse if len > 1 */
+  if (len > 1) {
+    uint8_t *tmp = mrb_alloca(mrb, len);
+    memcpy(tmp, buf, len);
+
+    /* Reverse for little-endian MRuby */
+    for (size_t i = 0, j = len - 1; i < j; i++, j--) {
+      uint8_t t = tmp[i];
+      tmp[i] = tmp[j];
+      tmp[j] = t;
+    }
+    bigbuf = tmp;
   }
 #endif
 
-  /* 3) Bytes -> positiver BigInt n */
-  mrb_value n = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
+  /* Convert bytes → positive BigInt */
+  mrb_value n = mrb_bint_from_bytes(mrb, bigbuf, (mrb_int)len);
+  mrb_gc_arena_restore(mrb, idx);
+  mrb_gc_protect(mrb, n);
 
-  if (!negative) {
-    return n; /* Tag 2 */
-  }
+  if (!negative)
+    return n;
 
-  /* 4) Tag 3: value = -1 - n  */
-  /* n may be a fixnum if the value was small; avoid passing fixnum to mrb_bint_add
-     because mrb_bint_add_n assumes its first argument is a bigint. */
+  /* Tag 3: -(n+1) */
+
   if (mrb_integer_p(n)) {
-    /* compute -1 - v using native integers; result might overflow fixnum but
-       that's extremely unlikely for tiny bignum lengths, and overflow will
-       be normalized by mrb_int_value. */
     mrb_int v = mrb_integer(n);
-    /* note: v may be negative? not here: n is positive from bytes */
     mrb_int result = -1 - v;
-    return mrb_int_value(mrb, result);
+    mrb_value ret = mrb_int_value(mrb, result);
+    mrb_gc_arena_restore(mrb, idx);
+    mrb_gc_protect(mrb, ret);
+    return ret;
   }
 
-  /* n_plus_1 = n + 1 */
   mrb_value one = mrb_fixnum_value(1);
   mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
+  mrb_value ret = mrb_bint_neg(mrb, n_plus_1);
 
-  /* result = -(n+1) */
-  return mrb_bint_neg(mrb, n_plus_1);
+  mrb_gc_arena_restore(mrb, idx);
+  mrb_gc_protect(mrb, ret);
+  return ret;
+}
+#endif
+
+static mrb_value
+decode_tag_shareable(mrb_state* mrb, Reader* r,
+                     mrb_value src, mrb_value shareable)
+{
+  if (likely(mrb_hash_p(shareable))) {
+    mrb_int share_idx = mrb_hash_size(mrb, shareable);
+    mrb_value idx_key = mrb_int_value(mrb, share_idx);
+
+    uint8_t nb     = reader_read8(mrb, r);
+    uint8_t major2 = nb >> 5;
+    uint8_t info2  = nb & 0x1F;
+
+    switch (major2) {
+      case 4: /* array */
+        return decode_array(mrb, r, src, info2, shareable, share_idx);
+      case 5: /* map */
+        return decode_map(mrb, r, src, info2, shareable, share_idx);
+      default:
+        break;
+    }
+
+    /* scalar shareable: register placeholder first */
+    mrb_hash_set(mrb, shareable, idx_key, mrb_undef_value());
+
+    mrb_value inner;
+    switch (major2) {
+      case 0: inner = decode_unsigned(mrb, r, info2); break;
+      case 1: inner = decode_negative(mrb, r, info2); break;
+      case 2: inner = decode_bytes(mrb, r, src, info2); break;
+      case 3: inner = decode_text(mrb, r, src, info2); break;
+      case 6:
+        read_len(mrb, r, info2);
+        inner = decode_value(mrb, r, src, shareable);
+        break;
+      case 7:
+        inner = decode_simple_or_float(mrb, r, info2);
+        break;
+      default:
+        mrb_raise(mrb, E_RUNTIME_ERROR, "unknown major type in shareable");
+        inner = mrb_undef_value(); /* not reached */
+    }
+
+    mrb_hash_set(mrb, shareable, idx_key, inner);
+    return inner;
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
+  }
 }
 
-#endif
+static mrb_value
+decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value shareable)
+{
+  if (likely(mrb_hash_p(shareable))) {
+    uint8_t ref_b     = reader_read8(mrb, r);
+    uint8_t ref_major = ref_b >> 5;
+    uint8_t ref_info  = ref_b & 0x1F;
+
+    if (likely(ref_major == 0)) {
+      mrb_value key   = mrb_convert_uint64(mrb, read_len(mrb, r, ref_info));
+      mrb_value found = mrb_hash_fetch(mrb, shareable, key, mrb_undef_value());
+
+      if (likely(!mrb_undef_p(found))) {
+        return found;
+      } else {
+        mrb_raisef(mrb, E_INDEX_ERROR, "sharedref index %v not found", key);
+      }
+    } else {
+      mrb_raise(mrb, E_TYPE_ERROR, "sharedref payload must be unsigned integer");
+    }
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
+  }
+
+  return mrb_undef_value(); /* not reached */
+}
 
 // ============================================================================
 // Master decode
@@ -555,101 +653,37 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
         case 2:
         case 3: {
 #ifdef MRB_USE_BIGINT
-          uint8_t b2 = reader_read8(mrb, r);
-          uint8_t major2 = (uint8_t)(b2 >> 5);
-          uint8_t info2  = (uint8_t)(b2 & 0x1F);
-
-          if (likely(major2 == 2)) {
-            uint64_t len = read_len(mrb, r, info2);
-            size_t off   = reader_offset(r);
-            ensure_slice_bounds(mrb, src, off, len);
-            r->p        += len;
-
-            const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
-            mrb_bool negative  = (tag == 3);
-            return decode_bignum_from_cbor_bytes(mrb, buf, (size_t)len, negative);
-          }
-          mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
-
+          return decode_tagged_bignum(mrb, r, src, tag);
 #else
-          mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without BigInt Support");
+          goto unknown_tag;
 #endif
+
         } break;
 
-        /* ---- Tag 28: shareable ---- */
-        case 28: {
-          if (likely(mrb_hash_p(shareable))) {
-            mrb_int share_idx = mrb_hash_size(mrb, shareable);
-            mrb_value idx_key = mrb_int_value(mrb, share_idx);
+        case 28:
+          return decode_tag_shareable(mrb, r, src, shareable);
 
-            /* Peek: naechstes Byte bestimmt ob Array oder Map -
-               dann koennen wir den Container vor dem Befuellen registrieren */
-            uint8_t nb     = reader_read8(mrb, r);
-            uint8_t major2 = nb >> 5;
-            uint8_t info2  = nb & 0x1F;
 
-            if (major2 == 4)
-              return decode_array(mrb, r, src, info2, shareable, share_idx);
-
-            if (major2 == 5)
-              return decode_map(mrb, r, src, info2, shareable, share_idx);
-
-            /* Skalare: erst dekodieren, dann registrieren */
-            mrb_hash_set(mrb, shareable, idx_key, mrb_undef_value());
-            mrb_value inner;
-            switch (major2) {
-              case 0: inner = decode_unsigned(mrb, r, info2); break;
-              case 1: inner = decode_negative(mrb, r, info2); break;
-              case 2: inner = decode_bytes(mrb, r, src, info2); break;
-              case 3: inner = decode_text(mrb, r, src, info2); break;
-              case 6: { read_len(mrb, r, info2); inner = decode_value(mrb, r, src, shareable); break; }
-              case 7: inner = decode_simple_or_float(mrb, r, info2); break;
-              default:
-                mrb_raise(mrb, E_RUNTIME_ERROR, "unknown major type in shareable");
-                inner = mrb_undef_value();
-            }
-            mrb_hash_set(mrb, shareable, idx_key, inner);
-            return inner;
-          } else {
-            return decode_value(mrb, r, src, shareable);
-          }
-        }
-
-        /* ---- Tag 29: sharedref ---- */
-        case 29: {
-          if (likely(mrb_hash_p(shareable))) {
-            uint8_t ref_b     = reader_read8(mrb, r);
-            uint8_t ref_major = ref_b >> 5;
-            uint8_t ref_info  = ref_b & 0x1F;
-
-            if (likely(ref_major == 0)) {
-              mrb_value key    = mrb_convert_uint64(mrb, read_len(mrb, r, ref_info));
-              mrb_value found  = mrb_hash_fetch(mrb, shareable, key, mrb_undef_value());
-
-              if (likely(!mrb_undef_p(found))) return found;
-              else mrb_raisef(mrb, E_INDEX_ERROR, "sharedref index %v not found", key);
-            } else {
-              mrb_raise(mrb, E_TYPE_ERROR, "sharedref payload must be unsigned integer");
-            }
-          } else {
-            mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
-          }
-        }
+        case 29:
+          return decode_tag_sharedref(mrb, r, shareable);
 
       }
-      mrb_value tagged_value = decode_value(mrb, r, src, shareable);
-      mrb_value result = mrb_hash_new(mrb);
-      mrb_hash_set(mrb, result, mrb_str_new_cstr(mrb, "tag"), mrb_int_value(mrb, tag));
-      mrb_hash_set(mrb, result, mrb_str_new_cstr(mrb, "value"), tagged_value);
-      return result;
+#ifndef MRB_USE_BIGINT
+unknown_tag:;
+#endif
 
+      mrb_value tagged_value = decode_value(mrb, r, src, shareable);
+      mrb_value result = mrb_hash_new_capa(mrb, 2);
+      mrb_hash_set(mrb, result, mrb_symbol_value(MRB_SYM(tag)), mrb_convert_uint64(mrb, tag));
+      mrb_hash_set(mrb, result, mrb_symbol_value(MRB_SYM(value)), tagged_value);
+      return result;
     }
 
     case 7:
       return decode_simple_or_float(mrb, r, info);
   }
 
-  mrb_raise(mrb, E_TYPE_ERROR, "unknown major type");
+  mrb_raisef(mrb, E_TYPE_ERROR, "unknown major type %d", major);
   return mrb_undef_value();
 }
 

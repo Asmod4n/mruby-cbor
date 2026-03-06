@@ -212,7 +212,23 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
     case 1: return mrb_convert_int8(mrb,  (int8_t)(-1 - (uint8_t)n.v));
     case 2: return mrb_convert_int16(mrb, (int16_t)(-1 - (uint16_t)n.v));
     case 4: return mrb_convert_int32(mrb, (int32_t)(-1 - (uint32_t)n.v));
-    case 8: return mrb_convert_int64(mrb, (int64_t)(-1 - (uint64_t)n.v));
+    case 8: {
+      uint64_t uv = (uint64_t)n.v;
+      /* if the result fits in signed 64-bit, return as int */
+      if (uv <= (uint64_t)INT64_MAX) {
+        return mrb_convert_int64(mrb, (int64_t)(-1 - uv));
+      }
+#if defined(MRB_USE_BIGINT)
+      /* otherwise we need a BigInt: value = -1 - uv */
+      mrb_value b = mrb_bint_new_uint64(mrb, uv);
+      mrb_value one = mrb_int_value(mrb, 1);
+      mrb_value b_plus1 = mrb_bint_add(mrb, b, one);
+      return mrb_bint_neg(mrb, b_plus1);
+#else
+      /* too large for native integer and no BigInt support */
+      mrb_raise(mrb, E_RANGE_ERROR, "negative integer too large");
+#endif
+    }
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid integer size");
@@ -295,7 +311,7 @@ static mrb_value
 decode_array(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info, mrb_value shareable, mrb_int share_idx)
 {
   uint64_t len = read_len(mrb, r, info);
-  mrb_value ary = mrb_ary_new_capa(mrb, (mrb_int)len);
+  mrb_value ary = mrb_ary_new(mrb);
   mrb_int idx = mrb_gc_arena_save(mrb);
 
   if (share_idx >= 0)
@@ -315,7 +331,7 @@ static mrb_value
 decode_map(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info, mrb_value shareable, mrb_int share_idx)
 {
   uint64_t len = read_len(mrb, r, info);
-  mrb_value hash = mrb_hash_new_capa(mrb, (mrb_int)len);
+  mrb_value hash = mrb_hash_new(mrb);
   mrb_int idx = mrb_gc_arena_save(mrb);
 
   if (share_idx >= 0)
@@ -463,8 +479,7 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
                               size_t len,
                               mrb_bool negative)
 {
-  if (len == 0) return mrb_fixnum_value(negative ? -1 : 0);
-  mrb_int idx = mrb_gc_arena_save(mrb);
+  if (len == 0) mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
   uint8_t *tmp = mrb_alloca(mrb, len);
   memcpy(tmp, buf, len);
 
@@ -479,23 +494,30 @@ decode_bignum_from_cbor_bytes(mrb_state* mrb,
 
   /* 3) Bytes -> positiver BigInt n */
   mrb_value n = mrb_bint_from_bytes(mrb, tmp, (mrb_int)len);
-  mrb_gc_arena_restore(mrb, idx);
-  mrb_gc_protect(mrb, n);
+
   if (!negative) {
     return n; /* Tag 2 */
   }
 
   /* 4) Tag 3: value = -1 - n  */
+  /* n may be a fixnum if the value was small; avoid passing fixnum to mrb_bint_add
+     because mrb_bint_add_n assumes its first argument is a bigint. */
+  if (mrb_integer_p(n)) {
+    /* compute -1 - v using native integers; result might overflow fixnum but
+       that's extremely unlikely for tiny bignum lengths, and overflow will
+       be normalized by mrb_int_value. */
+    mrb_int v = mrb_integer(n);
+    /* note: v may be negative? not here: n is positive from bytes */
+    mrb_int result = -1 - v;
+    return mrb_int_value(mrb, result);
+  }
 
   /* n_plus_1 = n + 1 */
   mrb_value one = mrb_fixnum_value(1);
   mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
 
   /* result = -(n+1) */
-  mrb_value result = mrb_bint_neg(mrb, n_plus_1);
-  mrb_gc_arena_restore(mrb, idx);
-  mrb_gc_protect(mrb, result);
-  return result;
+  return mrb_bint_neg(mrb, n_plus_1);
 }
 
 #endif
@@ -615,7 +637,11 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
         }
 
       }
-      return mrb_undef_value();
+      mrb_value tagged_value = decode_value(mrb, r, src, shareable);
+      mrb_value result = mrb_hash_new(mrb);
+      mrb_hash_set(mrb, result, mrb_str_new_cstr(mrb, "tag"), mrb_int_value(mrb, tag));
+      mrb_hash_set(mrb, result, mrb_str_new_cstr(mrb, "value"), tagged_value);
+      return result;
 
     }
 

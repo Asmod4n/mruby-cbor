@@ -33,31 +33,22 @@ MRB_END_DECL
  * scalar fallback
  * ============================================================ */
 
-static const uint8_t hex_lut[256] = {
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x00-0x0F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x10-0x1F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x20-0x2F */
-    0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0, /* 0x30-0x3F  '0'-'9' */
-    0,10,11,12,13,14,15,0,0,0,0,0,0,0,0,0, /* 0x40-0x4F  'A'-'F' */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x50-0x5F */
-    0,10,11,12,13,14,15,0,0,0,0,0,0,0,0,0, /* 0x60-0x6F  'a'-'f' */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0x70-0x7F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
-
-static void hex_decode_scalar(uint8_t *out, const char *in, size_t len)
+static inline uint8_t hex_nibble(uint8_t c)
 {
-    for (size_t i = 0; i < len; i += 2) {
-        out[i / 2] = (uint8_t)(
-            (hex_lut[(uint8_t)in[i]]     << 4) |
-             hex_lut[(uint8_t)in[i + 1]]
+    /* '0'-'9': bit6 = 0  ->  (c & 0xF) + 0
+       'a'-'f': bit6 = 1  ->  (c & 0xF) + 9
+       'A'-'F': bit6 = 1  ->  (c & 0xF) + 9   */
+    return (uint8_t)((c & 0xF) + ((c >> 6) & 1) * 9);
+}
+
+static void
+hex_decode_scalar(uint8_t * restrict out, const char * restrict in, size_t n)
+{
+    /* n = Anzahl Output-Bytes (= len/2) */
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (uint8_t)(
+            (hex_nibble((uint8_t)in[2*i    ]) << 4) |
+             hex_nibble((uint8_t)in[2*i + 1])
         );
     }
 }
@@ -199,7 +190,7 @@ decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
     case 8: return mrb_convert_uint64(mrb, n.v);
   }
 
-  mrb_raise(mrb, E_RUNTIME_ERROR, "invalid integer size");
+  mrb_raise(mrb, E_RANGE_ERROR, "invalid integer size");
   return mrb_nil_value();
 }
 
@@ -212,26 +203,10 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
     case 1: return mrb_convert_int8(mrb,  (int8_t)(-1 - (uint8_t)n.v));
     case 2: return mrb_convert_int16(mrb, (int16_t)(-1 - (uint16_t)n.v));
     case 4: return mrb_convert_int32(mrb, (int32_t)(-1 - (uint32_t)n.v));
-    case 8: {
-      uint64_t uv = (uint64_t)n.v;
-      /* if the result fits in signed 64-bit, return as int */
-      if (uv <= (uint64_t)INT64_MAX) {
-        return mrb_convert_int64(mrb, (int64_t)(-1 - uv));
-      }
-#if defined(MRB_USE_BIGINT)
-      /* otherwise we need a BigInt: value = -1 - uv */
-      mrb_value b = mrb_bint_new_uint64(mrb, uv);
-      mrb_value one = mrb_int_value(mrb, 1);
-      mrb_value b_plus1 = mrb_bint_add(mrb, b, one);
-      return mrb_bint_neg(mrb, b_plus1);
-#else
-      /* too large for native integer and no BigInt support */
-      mrb_raise(mrb, E_RANGE_ERROR, "negative integer too large");
-#endif
-    }
+    case 8: return mrb_convert_int64(mrb, (int64_t)(-1 - (uint64_t)n.v));
   }
 
-  mrb_raise(mrb, E_RUNTIME_ERROR, "invalid integer size");
+  mrb_raise(mrb, E_RANGE_ERROR, "invalid integer size");
   return mrb_undef_value();
 }
 
@@ -299,7 +274,7 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
       r->p += blen;
       return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);;
   } else {
-      mrb_raise(mrb, E_RANGE_ERROR, "text string out of bounds");
+      mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
   }
 
   return mrb_undef_value();
@@ -582,7 +557,7 @@ decode_tag_shareable(mrb_state* mrb, Reader* r,
         inner = decode_simple_or_float(mrb, r, info2);
         break;
       default:
-        mrb_raise(mrb, E_RUNTIME_ERROR, "unknown major type in shareable");
+        mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type '%d' in shareable", major2);
         inner = mrb_undef_value(); /* not reached */
     }
 
@@ -631,21 +606,12 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
   uint8_t info = (uint8_t)(b & 0x1F);
 
   switch (major) {
-    case 0:
-      return decode_unsigned(mrb, r, info);
-
-    case 1:
-      return decode_negative(mrb, r, info);
-
+    case 0: return decode_unsigned(mrb, r, info);
+    case 1: return decode_negative(mrb, r, info);
     case 2: return decode_bytes(mrb, r, src, info);
     case 3: return decode_text(mrb, r, src, info);
-
-    case 4:
-      return decode_array(mrb, r, src, info, shareable, -1);
-
-    case 5:
-      return decode_map(mrb, r, src, info, shareable, -1);
-
+    case 4: return decode_array(mrb, r, src, info, shareable, -1);
+    case 5: return decode_map(mrb, r, src, info, shareable, -1);
     case 6: {
       uint64_t tag = read_len(mrb, r, info);
 
@@ -660,12 +626,8 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value shareable)
 
         } break;
 
-        case 28:
-          return decode_tag_shareable(mrb, r, src, shareable);
-
-
-        case 29:
-          return decode_tag_sharedref(mrb, r, shareable);
+        case 28: return decode_tag_shareable(mrb, r, src, shareable);
+        case 29: return decode_tag_sharedref(mrb, r, shareable);
 
       }
 #ifndef MRB_USE_BIGINT
@@ -673,17 +635,17 @@ unknown_tag:;
 #endif
 
       mrb_value tagged_value = decode_value(mrb, r, src, shareable);
-      mrb_value result = mrb_hash_new_capa(mrb, 2);
-      mrb_hash_set(mrb, result, mrb_symbol_value(MRB_SYM(tag)), mrb_convert_uint64(mrb, tag));
-      mrb_hash_set(mrb, result, mrb_symbol_value(MRB_SYM(value)), tagged_value);
+      struct RClass *unhandled_tag = mrb_class_get_under_id(mrb, mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
+      mrb_value result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
+      mrb_iv_set(mrb, result, MRB_IVSYM(tag), mrb_convert_uint64(mrb, tag));
+      mrb_iv_set(mrb, result, MRB_IVSYM(value), tagged_value);
       return result;
     }
 
-    case 7:
-      return decode_simple_or_float(mrb, r, info);
+    case 7: return decode_simple_or_float(mrb, r, info);
   }
 
-  mrb_raisef(mrb, E_TYPE_ERROR, "unknown major type %d", major);
+  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type %d", major);
   return mrb_undef_value();
 }
 
@@ -760,7 +722,7 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
   }
 
   /* Slow path: Overflow -> Fehler */
-  mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
+  mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
 }
 
 static void
@@ -786,7 +748,7 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
     w->heap_capa = (size_t)RSTR_CAPA(s);
   } else {
     mrb_state *mrb = w->mrb;
-    mrb_raise(mrb, E_RUNTIME_ERROR, "heap size overflow");
+    mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
   }
 }
 
@@ -813,7 +775,7 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
           cbor_writer_init_heap(w, len);
         } else {
           mrb_state *mrb = w->mrb;
-          mrb_raise(mrb, E_RUNTIME_ERROR, "stack size overflow");
+          mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
         }
       }
 
@@ -977,7 +939,7 @@ encode_bignum(CborWriter *w, mrb_value obj)
   }
 
   uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
-  hex_decode_scalar(out, p, nibs);
+  hex_decode_scalar(out, p, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
   mrb_gc_arena_restore(mrb, idx);
 }
@@ -1065,7 +1027,7 @@ encode_simple(CborWriter* w, mrb_value obj)
       } else {
         b = 0xF4;   /* false */
       }
-    }  break;
+    } break;
 
     case MRB_TT_TRUE:
       b = 0xF5;     /* true */
@@ -1252,7 +1214,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
     case 3: { /* text string */
       uint64_t len = read_len(mrb, r, info);
       if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
-      mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR string out of bounds");
+      mrb_raise(mrb, E_RANGE_ERROR, "CBOR string out of bounds");
     }
 
     case 4: { /* array */
@@ -1283,6 +1245,8 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
           mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), lazy);
         }
         /* tag 29: just skip the uint index, nothing to register */
+      } else {
+        mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
       }
 
       skip_cbor(mrb, r, buf, shareable);
@@ -1293,13 +1257,13 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
       if (info < 24) return;
       switch (info) {
         case 24: if (likely(r->p < r->end)) { r->p++; return; }
-                 mrb_raise(mrb, E_RUNTIME_ERROR, "simple value out of bounds");
+                 mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
         case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
-                 mrb_raise(mrb, E_RUNTIME_ERROR, "float16 out of bounds");
+                 mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
         case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
-                 mrb_raise(mrb, E_RUNTIME_ERROR, "float32 out of bounds");
+                 mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
         case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
-                 mrb_raise(mrb, E_RUNTIME_ERROR, "float64 out of bounds");
+                 mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
         case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       }
     }
@@ -1307,7 +1271,6 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
 
   mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
 }
-
 
 /* Lazy#value: vollstaendiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
 MRB_API mrb_value
@@ -1332,8 +1295,9 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
     return value;
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
-    return mrb_undef_value();
   }
+
+  return mrb_undef_value();
 }
 
 /* ============================================================
@@ -1363,7 +1327,7 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
     r->p    = base + p->offset;
     r->end  = base + total_len;
   } else {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
+    mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
   }
 }
 
@@ -1372,27 +1336,34 @@ static mrb_value
 lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
                 mrb_value self, cbor_lazy_t *p, mrb_value shareable)
 {
-  mrb_value normalized_key = mrb_ensure_int_type(mrb, key);
-  mrb_int idx = mrb_integer(normalized_key);
+  mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
+  if (likely(mrb_hash_p(kcache))) {
+    mrb_value normalized_key = mrb_ensure_int_type(mrb, key);
+    mrb_int idx = mrb_integer(normalized_key);
 
-  uint64_t len = read_len(mrb, r, r->info);
+    uint64_t len = read_len(mrb, r, r->info);
 
-  if (idx < 0) idx += (mrb_int)len;
-  if ((uint64_t)idx >= len || idx < 0) {
-    mrb_raisef(mrb, E_INDEX_ERROR,
-      "index %d outside of array bounds: -%d...%d",
-      idx, (mrb_int)len, (mrb_int)len);
+    if (idx < 0) idx += (mrb_int)len;
+    if (unlikely((uint64_t)idx >= len || idx < 0)) {
+      mrb_raisef(mrb, E_INDEX_ERROR,
+        "index %d outside of array bounds: -%d...%d",
+        idx, (mrb_int)len, (mrb_int)len);
+    }
+
+    for (mrb_int i = 0; i < idx; i++) {
+      skip_cbor(mrb, r, p->buf, shareable);
+    }
+
+    uint32_t elem_offset = (uint32_t)(r->p - r->base);
+    mrb_value new_lazy = cbor_lazy_new(mrb, p->buf, elem_offset, shareable);
+
+    mrb_hash_set(mrb, kcache, key, new_lazy);
+    return new_lazy;
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
   }
 
-  for (mrb_int i = 0; i < idx; i++) {
-    skip_cbor(mrb, r, p->buf, shareable);
-  }
-
-  uint32_t elem_offset = (uint32_t)(r->p - r->base);
-  mrb_value new_lazy = cbor_lazy_new(mrb, p->buf, elem_offset, shareable);
-
-  mrb_hash_set(mrb, mrb_iv_get(mrb, self, MRB_SYM(kcache)), key, new_lazy);
-  return new_lazy;
+  return mrb_undef_value(); /* unreachable */
 }
 
 /* Map-Zugriff */
@@ -1400,38 +1371,44 @@ static mrb_value
 lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
               mrb_value self, cbor_lazy_t *p, mrb_value shareable)
 {
-  uint64_t pairs = read_len(mrb, r, r->info);
-  mrb_bool key_is_str = mrb_string_p(key);
+  mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
+  if (likely(mrb_hash_p(kcache))) {
+    uint64_t pairs = read_len(mrb, r, r->info);
+    mrb_bool key_is_str = mrb_string_p(key);
 
-  for (uint64_t i = 0; i < pairs; i++) {
-    mrb_bool match;
+    for (uint64_t i = 0; i < pairs; i++) {
+      mrb_bool match;
 
-    uint8_t kb    = reader_read8(mrb, r);
-    uint8_t kmaj  = (uint8_t)(kb >> 5);
-    uint8_t kinfo = (uint8_t)(kb & 0x1F);
+      uint8_t kb    = reader_read8(mrb, r);
+      uint8_t kmaj  = (uint8_t)(kb >> 5);
+      uint8_t kinfo = (uint8_t)(kb & 0x1F);
 
-    if (key_is_str && (kmaj == 2 || kmaj == 3)) {
-      uint64_t klen = read_len(mrb, r, kinfo);
-      match = (klen == (uint64_t)RSTRING_LEN(key) &&
-               (uint64_t)(r->end - r->p) >= klen &&
-               memcmp(r->p, RSTRING_PTR(key), klen) == 0);
-      r->p += klen;
-    } else {
-      r->p--;
-      match = mrb_equal(mrb, decode_value(mrb, r, p->buf, shareable), key);
+      if (key_is_str && (kmaj == 2 || kmaj == 3)) {
+        uint64_t klen = read_len(mrb, r, kinfo);
+        match = (klen == (uint64_t)RSTRING_LEN(key) &&
+                (uint64_t)(r->end - r->p) >= klen &&
+                memcmp(r->p, RSTRING_PTR(key), klen) == 0);
+        r->p += klen;
+      } else {
+        r->p--;
+        match = mrb_equal(mrb, decode_value(mrb, r, p->buf, shareable), key);
+      }
+
+      if (match) {
+        uint32_t value_offset = (uint32_t)(r->p - r->base);
+        mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset, shareable);
+        mrb_hash_set(mrb, kcache, key, lazy_new);
+        return lazy_new;
+      }
+
+      skip_cbor(mrb, r, p->buf, shareable);
     }
 
-    if (match) {
-      uint32_t value_offset = (uint32_t)(r->p - r->base);
-      mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset, shareable);
-      mrb_hash_set(mrb, mrb_iv_get(mrb, self, MRB_SYM(kcache)), key, lazy_new);
-      return lazy_new;
-    }
-
-    skip_cbor(mrb, r, p->buf, shareable);
+    mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
   }
 
-  mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
   return mrb_undef_value(); /* unreachable */
 }
 
@@ -1451,14 +1428,17 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
   reader_read_header(mrb, &r);
 
   mrb_value shareable = mrb_iv_get(mrb, self, MRB_SYM(shareable));
-
-  switch (r.major) {
-    case 4:
-      return lazy_aref_array(mrb, &r, key, self, p, shareable);
-    case 5:
-      return lazy_aref_map(mrb, &r, key, self, p, shareable);
-    default:
-      mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
+  if (likely(mrb_hash_p(shareable))) {
+    switch (r.major) {
+      case 4:
+        return lazy_aref_array(mrb, &r, key, self, p, shareable);
+      case 5:
+        return lazy_aref_map(mrb, &r, key, self, p, shareable);
+      default:
+        mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
+    }
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
   }
 
   return mrb_undef_value();

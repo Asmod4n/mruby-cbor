@@ -7,6 +7,7 @@ MRuby::Gem::Specification.new('mruby-cbor') do |spec|
   spec.add_dependency 'mruby-c-ext-helpers'
   spec.add_dependency 'mruby-time'
   spec.add_dependency 'mruby-string-is-utf8'
+  spec.add_dependency 'mruby-native-ext-deserialize', github: 'Asmod4n/mruby-native-ext-deserialize', branch: 'main'
   spec.add_test_dependency 'mruby-random'
   spec.add_test_dependency 'mruby-io'
   spec.add_test_dependency 'mruby-b64'

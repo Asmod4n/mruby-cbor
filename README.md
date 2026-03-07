@@ -59,7 +59,7 @@ Shared references are supported in both the eager decoder and `CBOR::Lazy`, incl
 ```ruby
 # Encode with shared references (deduplicates identical objects by identity)
 a = [1, 2, 3]
-buf = CBOR.encode({ "x" => a, "y" => a })
+buf = CBOR.encode({ "x" => a, "y" => a }, sharedrefs: true)
 
 # Eager decode preserves identity
 h = CBOR.decode(buf)
@@ -72,7 +72,7 @@ h["x"].equal?(h["y"])  # => true
 # Cyclic structures
 a = []
 a << a
-buf = CBOR.encode(a)
+buf = CBOR.encode(a, sharedrefs: true)
 result = CBOR.decode(buf)
 result.equal?(result[0])  # => true
 ```
@@ -87,6 +87,39 @@ CBOR.stream("data.cbor") do |lazy|
   puts lazy["id"].value
 end
 ```
+
+### Registering Tags
+
+CBOR allows you to tagged your encoded values, we expose a smart API to let you handle registering of your own classes
+
+```ruby
+class Foo
+  attr_accessor :foo, :symbiote
+  native_ext_deserialize :@foo, CBOR::Type::String
+  native_ext_deserialize :@symbiote, CBOR::Type::Tagged
+
+  def from_allocate
+    puts "@foo is #{@foo} and done!"
+    self
+  end
+end
+
+foo = Foo.new
+foo.foo = "hallo"
+foo.symbiote = :main
+CBOR.register_tag(5000, Foo)
+bla = CBOR.encode(foo)
+
+foo2 = CBOR.decode bla
+puts foo2.inspect
+```
+
+We allocate your class without calling initialize, when you define a from_allocate instance method we call that so you can do your own thing here.
+
+### Ruby Symbol handling
+
+You can either build your own class which accepts a `CBOR::Type::ByteString` (or `Type::String`) or you can call CBOR.symbols_as_uint32 to encode symbols are uint32 values.
+Encoding Symbols as uint32 values is only safe when sending it to the same mruby executable or libmruby.a
 
 ## Installation
 

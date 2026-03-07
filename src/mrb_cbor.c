@@ -618,9 +618,8 @@ decode_symbol(mrb_state *mrb, Reader* r)
   }
 
   Num n = read_num(mrb, r, info2);
-
   /* Symbol-IDs sind exakt 32-bit */
-  if (n.size != 4) {
+  if (n.size > 4) {
     mrb_raise(mrb, E_RANGE_ERROR, "invalid symbol ID size for tag 39");
   }
 
@@ -2221,7 +2220,11 @@ cbor_symbols_as_strings(mrb_state *mrb, mrb_value self)
 static mrb_value
 cbor_symbols_as_uint32(mrb_state *mrb, mrb_value self)
 {
+#ifdef MRB_NO_PRESYM
+  mrb_raise(mrb, E_NOTIMP_ERROR, "mruby was compiled without presym, symbols_as_uint32 is not available.");
+#else
   cbor_set_sym_strategy(mrb, 2);
+#endif
   return self;
 }
 
@@ -2312,7 +2315,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Simple),       mrb_fixnum_value(1 << 7));
   /* Convenience combinations */
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Integer),      mrb_fixnum_value((1 << 0) | (1 << 1)));
-  mrb_define_const_id(mrb, type_mod, MRB_SYM(BinaryString), mrb_fixnum_value((1 << 2) | (1 << 3)));
+  mrb_define_const_id(mrb, type_mod, MRB_SYM(BytesOrString), mrb_fixnum_value((1 << 2) | (1 << 3)));
 
 }
 

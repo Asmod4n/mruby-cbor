@@ -236,3 +236,68 @@ assert('CBOR shared ref: scalar shareable (integer)') do
   result = CBOR.decode(buf)
   assert_equal [42, 42], result
 end
+
+assert('CBOR shared ref: two refs to same array (eager)') do
+  a = [1, 2]
+  obj = [a, a]
+
+  buf = CBOR.encode(obj, sharedrefs: true)
+  result = CBOR.decode(buf)
+
+  assert_equal [[1, 2], [1, 2]], result
+  assert_same result[0], result[1]
+end
+
+assert('CBOR shared ref: map with shared value (eager)') do
+  v = [1, 2, 3]
+  obj = { "a" => v, "b" => v }
+
+  buf = CBOR.encode(obj, sharedrefs: true)
+  result = CBOR.decode(buf)
+
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR shared ref: cyclic array (eager)') do
+  a = []
+  a << a
+
+  buf = CBOR.encode(a, sharedrefs: true)
+  result = CBOR.decode(buf)
+
+  assert_same result, result[0]
+end
+
+assert('CBOR shared ref: two refs to same array (lazy)') do
+  a = [1, 2]
+  obj = [a, a]
+
+  buf = CBOR.encode(obj, sharedrefs: true)
+  result = CBOR.decode_lazy(buf).value
+
+  assert_equal [[1, 2], [1, 2]], result
+  assert_same result[0], result[1]
+end
+
+assert('CBOR shared ref: map with shared value (lazy)') do
+  v = [1, 2, 3]
+  obj = { "a" => v, "b" => v }
+
+  buf = CBOR.encode(obj, sharedrefs: true)
+  result = CBOR.decode_lazy(buf).value
+
+  assert_equal [1, 2, 3], result["a"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR shared ref: cyclic array (lazy)') do
+  a = []
+  a << a
+
+  buf = CBOR.encode(a, sharedrefs: true)
+  result = CBOR.decode_lazy(buf).value
+
+  assert_same result, result[0]
+end

@@ -443,7 +443,7 @@ decode_simple_or_float(mrb_state* mrb, Reader* r, uint8_t info)
     case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
   }
 
-  mrb_raise(mrb, E_NOTIMP_ERROR, "can't unpack floats or doubles since its disabled for this mruby runtime").
+  mrb_raise(mrb, E_NOTIMP_ERROR, "can't unpack floats or doubles since its disabled for this mruby runtime");
 }
 #endif
 
@@ -490,7 +490,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
   }
 #endif
 
-  /* Convert bytes → positive BigInt */
+  /* Convert bytes -> positive BigInt */
   mrb_value n = mrb_bint_from_bytes(mrb, bigbuf, (mrb_int)len);
   mrb_gc_arena_restore(mrb, idx);
   mrb_gc_protect(mrb, n);
@@ -663,13 +663,19 @@ typedef struct {
   char    *heap_ptr;
   size_t   heap_len;
   size_t   heap_capa;
-  mrb_int arena_index;
+  mrb_int  arena_index;
+
+  /* Shared references (Tag 28/29):
+     mrb_undef_value() = disabled
+     mrb_hash         = obj -> share_idx mapping */
+  mrb_value seen;
+  mrb_int   seen_start; /* first index assigned to the first shareable object */
 } CborWriter;
 
 static void
 cbor_writer_init(CborWriter *w, mrb_state *mrb)
 {
-  w->mrb      = mrb;
+  w->mrb       = mrb;
   w->stack_len = 0;
 
   w->heap_str  = mrb_undef_value();
@@ -677,6 +683,9 @@ cbor_writer_init(CborWriter *w, mrb_state *mrb)
   w->heap_len  = 0;
   w->heap_capa = 0;
   w->arena_index = mrb_gc_arena_save(mrb);
+
+  w->seen       = mrb_hash_new(mrb);
+  w->seen_start = 0;
 }
 
 static size_t next_pow2(size_t x)
@@ -808,8 +817,6 @@ cbor_writer_finish(CborWriter *w)
   return w->heap_str;
 }
 
-
-
 static void
 encode_len(CborWriter *w, uint8_t major, uint64_t v)
 {
@@ -875,6 +882,40 @@ encode_int64(CborWriter *w, int64_t n)
   } else {
     encode_len(w, 1, (uint64_t)(-1 - n));
   }
+}
+
+// ============================================================================
+// Shared reference tracking
+// ============================================================================
+
+/*
+ * Returns TRUE  -> Tag 29 (sharedref) emitted, caller must NOT encode obj.
+ * Returns FALSE -> Tag 28 (shareable) emitted, caller MUST encode obj normally.
+ * When w->seen is undef (sharedrefs disabled) this is a no-op returning FALSE.
+ */
+static mrb_bool
+encode_check_shared(CborWriter *w, mrb_value obj)
+{
+  if (mrb_undef_p(w->seen)) return FALSE;
+
+  mrb_state *mrb = w->mrb;
+  mrb_value found = mrb_hash_fetch(mrb, w->seen, mrb_int_value(mrb, mrb_obj_id(obj)), mrb_undef_value());
+
+  if (mrb_integer_p(found)) {
+    /* Already seen: emit Tag 29 + absolute index */
+    uint8_t tag29[2] = { 0xD8, 0x1D };
+    cbor_writer_write(w, tag29, 2);
+    encode_len(w, 0, (uint64_t)mrb_integer(found));
+    return TRUE;
+  }
+
+  /* First time: compute absolute index, register, emit Tag 28 */
+  mrb_int idx = w->seen_start + mrb_hash_size(mrb, w->seen);
+  mrb_hash_set(mrb, w->seen, mrb_int_value(mrb, mrb_obj_id(obj)), mrb_int_value(mrb, idx));
+
+  uint8_t tag28[2] = { 0xD8, 0x1C };
+  cbor_writer_write(w, tag28, 2);
+  return FALSE;
 }
 
 // ============================================================================
@@ -1096,16 +1137,16 @@ encode_value(CborWriter* w, mrb_value obj)
       encode_integer(w, mrb_integer(obj));
       break;
 
-    case MRB_TT_HASH:
-      encode_map(w, obj);
+    case MRB_TT_STRING:
+      if (!encode_check_shared(w, obj)) encode_string(w, obj);
       break;
 
     case MRB_TT_ARRAY:
-      encode_array(w, obj);
+      if (!encode_check_shared(w, obj)) encode_array(w, obj);
       break;
 
-    case MRB_TT_STRING:
-      encode_string(w, obj);
+    case MRB_TT_HASH:
+      if (!encode_check_shared(w, obj)) encode_map(w, obj);
       break;
 
 #ifdef MRB_USE_BIGINT
@@ -1116,7 +1157,7 @@ encode_value(CborWriter* w, mrb_value obj)
 
     default: {
       mrb_value s = mrb_obj_as_string(mrb, obj);
-      encode_string(w, s);
+      if (!encode_check_shared(w, s)) encode_string(w, s);
     } break;
   }
 }
@@ -1131,10 +1172,29 @@ mrb_cbor_encode(mrb_state* mrb, mrb_value self)
   mrb_value obj;
   (void)self;
 
-  mrb_get_args(mrb, "o", &obj);
+  mrb_kwargs kwargs;
+  mrb_sym    kw_keys[1]   = { MRB_SYM(sharedrefs) };
+  mrb_value  kw_values[1];
+  kwargs.num      = 1;
+  kwargs.required = 0;
+  kwargs.table    = kw_keys;
+  kwargs.values   = kw_values;
+  kwargs.rest     = NULL;
+
+  mrb_get_args(mrb, "o:", &obj, &kwargs);
 
   CborWriter w;
   cbor_writer_init(&w, mrb);
+
+
+  if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
+    /* sharedrefs: true  -> indices start at 0
+       sharedrefs: n     -> indices start at n */
+    if (mrb_integer_p(kw_values[0])) {
+      w.seen_start = mrb_integer(kw_values[0]);
+    }
+  }
+
   encode_value(&w, obj);
   return cbor_writer_finish(&w);
 }
@@ -1243,9 +1303,10 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
             mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
           }
         }
+        skip_cbor(mrb, r, buf, shareable);
         /* tag 29: just skip the uint index, nothing to register */
 
-      skip_cbor(mrb, r, buf, shareable);
+
       return;
     }
 
@@ -1408,6 +1469,42 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
   return mrb_undef_value(); /* unreachable */
 }
 
+static uint8_t
+lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
+{
+  while (r->major == 6) {
+    uint64_t tag = read_len(mrb, r, r->info);
+
+    switch (tag) {
+      case 29: {
+        /* sharedref → eager auflösen */
+        (void)decode_tag_sharedref(mrb, r, shareable);
+        return 0xFF; /* Lazy kann hier nicht weiter */
+      }
+
+      case 28: {
+        /* shareable → Index registrieren */
+        mrb_int share_idx = mrb_hash_size(mrb, shareable);
+        mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), mrb_undef_value());
+
+        /* nächsten Header lesen */
+        reader_read_header(mrb, r);
+
+        /* weiter in der Schleife, falls wieder Tag */
+        continue;
+      }
+
+      default:
+        /* generischer Tag → Lazy kann nicht korrekt arbeiten */
+        return 0xFF;
+    }
+  }
+
+  return r->major;
+}
+
+
+
 /* Lazy#[] */
 static mrb_value
 cbor_lazy_aref(mrb_state *mrb, mrb_value self)
@@ -1425,7 +1522,8 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
 
   mrb_value shareable = mrb_iv_get(mrb, self, MRB_SYM(shareable));
   if (likely(mrb_hash_p(shareable))) {
-    switch (r.major) {
+    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable);
+    switch (major) {
       case 4:
         return lazy_aref_array(mrb, &r, key, self, p, shareable);
       case 5:
@@ -1497,9 +1595,8 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     r.p    = base + p->offset;
     r.end  = base + total;
 
-    uint8_t b     = reader_read8(mrb, &r);
-    uint8_t major = (uint8_t)(b >> 5);
-    uint8_t info  = (uint8_t)(b & 0x1F);
+    reader_read_header(mrb, &r);
+    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable);
 
     mrb_value result;
 
@@ -1507,7 +1604,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
       case 4: { /* Array */
         mrb_value nkey = mrb_ensure_int_type(mrb, key);
         mrb_int   idx  = mrb_integer(nkey);
-        uint64_t  len  = read_len(mrb, &r, info);
+        uint64_t  len  = read_len(mrb, &r, r.info);
 
         if (idx < 0) idx += (mrb_int)len;
         if (idx < 0 || (uint64_t)idx >= len) { current = mrb_nil_value(); continue; }
@@ -1522,7 +1619,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
       }break;
 
       case 5: { /* Map */
-        uint64_t pairs     = read_len(mrb, &r, info);
+        uint64_t pairs     = read_len(mrb, &r, r.info);
         mrb_bool key_is_str = mrb_string_p(key);
         mrb_bool found      = FALSE;
 
@@ -1731,7 +1828,7 @@ mrb_cbor_lazy_stream(mrb_state *mrb, mrb_value self)
       (mrb_int)m->size
   );
 
-  /* shareable-Hash für Tag 28/29 – einmal pro Stream */
+  /* shareable-Hash für Tag 28/29 - einmal pro Stream */
   mrb_value shareable = mrb_hash_new(mrb);
 
   size_t offset = 0;
@@ -1766,22 +1863,23 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   struct RClass* cbor = mrb_define_module_id(mrb, MRB_SYM(CBOR));
 
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0, 1));
 
   struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);
 
-  mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),    cbor_lazy_aref,  MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, lazy, MRB_SYM(value), cbor_lazy_value, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, lazy, MRB_SYM(dig),       cbor_lazy_dig,   MRB_ARGS_ANY());
+  mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),  cbor_lazy_aref,  MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, lazy, MRB_SYM(value),   cbor_lazy_value, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, lazy, MRB_SYM(dig),     cbor_lazy_dig,   MRB_ARGS_ANY());
+
   struct RClass *mappedfile =
       mrb_define_class_under_id(mrb, cbor, MRB_SYM(MappedFile), mrb->object_class);
-
   MRB_SET_INSTANCE_TT(mappedfile, MRB_TT_CDATA);
+
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),
                                 mrb_cbor_decode_lazy, MRB_ARGS_REQ(1));
-
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(stream), mrb_cbor_lazy_stream, MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK());
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(stream),
+                                mrb_cbor_lazy_stream, MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK());
 }
 
 

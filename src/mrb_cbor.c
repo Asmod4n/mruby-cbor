@@ -1285,7 +1285,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
     case 2: /* byte string */
     case 3: { /* text string */
       uint64_t len = read_len(mrb, r, info);
-      if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
+      if (likely((ptrdiff_t)(r->end - r->p) >= len)) { r->p += len; return; }
       mrb_raise(mrb, E_RANGE_ERROR, "CBOR string out of bounds");
     }
 
@@ -1536,7 +1536,7 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
       if (key_is_str && (kmaj == 2 || kmaj == 3)) {
         uint64_t klen = read_len(mrb, r, kinfo);
         match = (klen == (uint64_t)RSTRING_LEN(key) &&
-                (uint64_t)(r->end - r->p) >= klen &&
+                (ptrdiff_t)(r->end - r->p) >= klen &&
                 memcmp(r->p, RSTRING_PTR(key), klen) == 0);
         r->p += klen;
       } else {

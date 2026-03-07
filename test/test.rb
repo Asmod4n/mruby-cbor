@@ -301,3 +301,17 @@ assert('CBOR shared ref: cyclic array (lazy)') do
 
   assert_same result, result[0]
 end
+
+assert('CBOR lazy sharedref: tag28 inside lazy path without prior registration') do
+
+  buf = "\xA2" \
+        "\x65outer" \
+        "\xD8\x1C\x82\x01\x02" \
+        "\x63ref" \
+        "\xD8\x1D\x00"
+
+  lazy = CBOR.decode_lazy(buf)
+
+
+  assert_equal [1,2], lazy["ref"].value
+end

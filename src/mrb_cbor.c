@@ -600,31 +600,49 @@ cbor_set_sym_strategy(mrb_state *mrb, uint8_t mode)
 }
 
 static mrb_value
-decode_symbol(mrb_state *mrb, Reader* r)
+decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value shareable)
 {
-  /* User hat Symbol-IDs NICHT aktiviert → sofort raisen */
-  if (cbor_sym_strategy(mrb) == 0) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "tag 39 encountered but symbol IDs not enabled");
+  uint8_t strategy = cbor_sym_strategy(mrb);
+
+  if (strategy == 0) {
+    mrb_raise(mrb, E_RUNTIME_ERROR,
+      "tag 39 encountered but symbol decoding disabled");
   }
 
-  /* Read inner header */
-  uint8_t b2    = reader_read8(mrb, r);
-  uint8_t major2 = (uint8_t)(b2 >> 5);
-  uint8_t info2  = (uint8_t)(b2 & 0x1F);
+  /* decode inner CBOR item */
+  mrb_value v = decode_value(mrb, r, src, shareable);
 
-  /* Symbol-IDs sind uint32_t → major type 0 */
-  if (major2 != 0) {
-    mrb_raise(mrb, E_TYPE_ERROR, "invalid payload for tag 39 (expected uint32)");
+  /* strategy 1: string → symbol */
+  if (strategy == 1) {
+    if (!mrb_string_p(v)) {
+      mrb_raise(mrb, E_TYPE_ERROR,
+        "invalid payload for tag 39 (expected text string)");
+    }
+
+    return mrb_symbol_value(
+      mrb_intern_str(mrb, v)
+    );
   }
 
-  Num n = read_num(mrb, r, info2);
-  /* Symbol-IDs sind exakt 32-bit */
-  if (n.size > 4) {
-    mrb_raise(mrb, E_RANGE_ERROR, "invalid symbol ID size for tag 39");
+  /* strategy 2: uint32 → symbol id */
+  if (strategy == 2) {
+    if (!mrb_integer_p(v)) {
+      mrb_raise(mrb, E_TYPE_ERROR,
+        "invalid payload for tag 39 (expected uint32)");
+    }
+
+    mrb_int n = mrb_integer(v);
+
+    if (n < 0 || n > UINT32_MAX) {
+      mrb_raise(mrb, E_RANGE_ERROR,
+        "invalid symbol ID size for tag 39");
+    }
+
+    return mrb_symbol_value((mrb_sym)n);
   }
 
-  mrb_sym id = (mrb_sym)n.v;
-  return mrb_symbol_value(id);
+  mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy");
+  return mrb_nil_value(); /* unreachable */
 }
 
 // ============================================================================
@@ -678,7 +696,7 @@ unknown_tag:;
 
       /* Tag 39: Symbol-ID */
       if (tag == 39) {
-        return decode_symbol(mrb, r);
+        return decode_symbol(mrb, r, src, shareable);
       }
 
       mrb_value tagged_value = decode_value(mrb, r, src, shareable);
@@ -1180,19 +1198,9 @@ encode_sym(CborWriter *w, mrb_value obj)
    *          sonst → fallback: Symbol als String
    * --------------------------------------------------------- */
   if (mode == 1) {
-    mrb_value rev     = cbor_tag_rev_registry(mrb);
-    mrb_value klass   = mrb_obj_value(mrb_class(mrb, obj));
-    mrb_value tag_val = mrb_hash_fetch(mrb, rev, klass, mrb_undef_value());
-
-    if (mrb_integer_p(tag_val)) {
-      /* User hat Tag 39 registriert → wir benutzen seinen Encoder */
-      encode_registered_tag(w, obj, mrb_integer(tag_val));
-      return;
-    }
-
-    /* kein Tag registriert → Symbol als String */
     mrb_sym s = mrb_symbol(obj);
     mrb_value str = mrb_sym2str(mrb, s);
+    encode_len(w, 6, 39);
     encode_string(w, str);
     return;
   }
@@ -1207,7 +1215,7 @@ encode_sym(CborWriter *w, mrb_value obj)
     encode_len(w, 6, 39);          /* major 6 = tag */
 
     /* Payload: uint32 Symbol-ID */
-    encode_len(w, 0, (uint32_t)s); /* major 0 = unsigned int */
+    encode_len(w, 0, s); /* major 0 = unsigned int */
 
     return;
   }
@@ -1413,7 +1421,8 @@ mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
 
   /* Reject tags we handle internally */
   if (tag_num == 2  || tag_num == 3  ||   /* bignum */
-      tag_num == 28 || tag_num == 29)      /* shared refs */
+      tag_num == 28 || tag_num == 29 || /* shared refs */
+      tag_num == 39) /* symbols */
     mrb_raisef(mrb, E_ARGUMENT_ERROR,
       "tag %d is reserved for internal CBOR use", tag_num);
 
@@ -1538,24 +1547,10 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
       case MRB_TT_SYMBOL: {
         uint8_t mode = cbor_sym_strategy(mrb);
 
-        if (mode == 0) {
+        if (mode == 0 || mode == 1) {
           /* Symbol → String/Bytes */
           mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
           actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-        }
-        else if (mode == 1) {
-          /* registered tag? */
-          mrb_value rev     = cbor_tag_rev_registry(mrb);
-          mrb_value klass   = mrb_obj_value(mrb_class(mrb, val));
-          mrb_value tag_val = mrb_hash_fetch(mrb, rev, klass, mrb_undef_value());
-
-          if (mrb_integer_p(tag_val)) {
-            actual_major = 6; /* encode_registered_tag */
-          } else {
-            /* fallback: Symbol → String/Bytes */
-            mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
-            actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-          }
         }
         else if (mode == 2) {
           /* Symbol-ID → Tag 39 */
@@ -1582,7 +1577,6 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   encode_value(w, val);
   return 0;
 }
-
 
 static void
 encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
@@ -1691,24 +1685,10 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
       case MRB_TT_SYMBOL: {
         uint8_t mode = cbor_sym_strategy(mrb);
 
-        if (mode == 0) {
+        if (mode == 0 || mode == 1) {
           /* Symbol → String/Bytes */
           mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
           actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-        }
-        else if (mode == 1) {
-          /* registered tag? */
-          mrb_value rev     = cbor_tag_rev_registry(mrb);
-          mrb_value klass   = mrb_obj_value(mrb_class(mrb, val));
-          mrb_value tag_val = mrb_hash_fetch(mrb, rev, klass, mrb_undef_value());
-
-          if (mrb_integer_p(tag_val)) {
-            actual_major = 6; /* decode_registered_tag */
-          } else {
-            /* fallback: Symbol → String/Bytes */
-            mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
-            actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-          }
         }
         else if (mode == 2) {
           /* Symbol-ID → Tag 39 */
@@ -2211,9 +2191,9 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 }
 
 static mrb_value
-cbor_symbols_as_strings(mrb_state *mrb, mrb_value self)
+cbor_symbols_as_string(mrb_state *mrb, mrb_value self)
 {
-  cbor_set_sym_strategy(mrb, 0);
+  cbor_set_sym_strategy(mrb, 1);
   return self;
 }
 
@@ -2284,7 +2264,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
 {
   struct RClass* cbor = mrb_define_module_id(mrb, MRB_SYM(CBOR));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32), cbor_symbols_as_uint32, MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_strings), cbor_symbols_as_strings, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string), cbor_symbols_as_string, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag), mrb_cbor_register_tag, MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0, 1));

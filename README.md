@@ -77,16 +77,6 @@ result = CBOR.decode(buf)
 result.equal?(result[0])  # => true
 ```
 
-### Streaming
-
-`CBOR.stream` reads a file containing a sequence of CBOR documents using mmap and yields each
-as a `CBOR::Lazy` object. No copying occurs — the buffer is a zero-copy view of the mapped memory.
-
-```ruby
-CBOR.stream("data.cbor") do |lazy|
-  puts lazy["id"].value
-end
-```
 
 ### Registering Tags
 

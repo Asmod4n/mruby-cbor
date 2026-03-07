@@ -1848,65 +1848,6 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
   mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
 }
 
-/* Like skip_cbor but does NOT register Tag28 items in the shareable table.
-   Used during lazy element traversal where the table has already been fully
-   pre-populated by the initial scan in mrb_cbor_decode_lazy. */
-static void
-skip_cbor_noregister(mrb_state *mrb, Reader *r)
-{
-  if (unlikely(r->p >= r->end))
-    mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
-
-  uint8_t b     = reader_read8(mrb, r);
-  uint8_t major = b >> 5;
-  uint8_t info  = b & 0x1F;
-
-  switch (major) {
-    case 0:
-    case 1:
-      if (info >= 24) read_num(mrb, r, info);
-      return;
-    case 2:
-    case 3: {
-      uint64_t len = read_len(mrb, r, info);
-      if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
-      mrb_raise(mrb, E_RANGE_ERROR, "CBOR string out of bounds");
-    }
-    case 4: {
-      uint64_t len = read_len(mrb, r, info);
-      for (uint64_t i = 0; i < len; i++) skip_cbor_noregister(mrb, r);
-      return;
-    }
-    case 5: {
-      uint64_t len = read_len(mrb, r, info);
-      for (uint64_t i = 0; i < len; i++) {
-        skip_cbor_noregister(mrb, r);
-        skip_cbor_noregister(mrb, r);
-      }
-      return;
-    }
-    case 6:
-      read_len(mrb, r, info); /* consume tag number – no registration */
-      skip_cbor_noregister(mrb, r);
-      return;
-    case 7: {
-      if (info < 24) return;
-      switch (info) {
-        case 24: if (likely(r->p < r->end)) { r->p++; return; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
-        case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
-        case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
-        case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
-        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
-      }
-    }
-  }
-  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d' in skip_cbor_noregister", major);
-}
-
 /* Lazy#value: vollstaendiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
 MRB_API mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
@@ -1994,7 +1935,7 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
     }
 
     for (mrb_int i = 0; i < idx; i++) {
-      skip_cbor_noregister(mrb, r);
+      skip_cbor(mrb, r, p->buf, shareable);
     }
 
     mrb_int elem_offset = cbor_pdiff(mrb, r->p, r->base);
@@ -2044,7 +1985,7 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
         return lazy_new;
       }
 
-      skip_cbor_noregister(mrb, r);
+      skip_cbor(mrb, r, p->buf, shareable);
     }
 
     mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
@@ -2213,7 +2154,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
         if (idx < 0 || (uint64_t)idx >= len) { current = mrb_nil_value(); continue; }
 
         for (mrb_int i = 0; i < idx; i++)
-          skip_cbor_noregister(mrb, &r);
+          skip_cbor(mrb, &r, current, shareable);
 
         mrb_int  elem_off = cbor_pdiff(mrb, r.p, base);
         result = cbor_lazy_new(mrb, p->buf, elem_off, shareable);
@@ -2252,7 +2193,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
             break;
           }
 
-          skip_cbor_noregister(mrb, &r);
+          skip_cbor(mrb, &r, current, shareable);
         }
 
         if (!found) { current = mrb_nil_value(); continue; }
@@ -2270,239 +2211,6 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
   return current;
 }
 
-
-/* ============================================================
- * CborMappedFile struct + Finalizer
- * ============================================================ */
-
-typedef struct {
-  mrb_value path;
-  const uint8_t *data;
-  size_t size;
-
-#ifndef _WIN32
-  int fd;
-#else
-  HANDLE hFile;
-  HANDLE hMap;
-#endif
-} CborMappedFile;
-
-static void
-cbor_mappedfile_free(mrb_state *mrb, void *ptr)
-{
-  CborMappedFile *m = (CborMappedFile*)ptr;
-  if (!m) return;
-
-#ifndef _WIN32
-  if (m->data) munmap((void*)m->data, m->size);
-  if (m->fd >= 0) close(m->fd);
-#else
-  if (m->data) UnmapViewOfFile(m->data);
-  if (m->hMap) CloseHandle(m->hMap);
-  if (m->hFile) CloseHandle(m->hFile);
-#endif
-
-  mrb_free(mrb, m);
-}
-
-static const struct mrb_data_type cbor_mappedfile_type = {
-  "CborMappedFile", cbor_mappedfile_free
-};
-
-
-/* ============================================================
- * mmap / CreateFileMapping
- * ============================================================ */
-
-#ifndef _WIN32
-static void
-cbor_map_file(mrb_state *mrb, CborMappedFile *m, mrb_value path)
-{
-  memset(m, 0, sizeof(*m));
-
-  int fd = open(RSTRING_CSTR(mrb, path), O_RDONLY);
-  if (fd < 0) mrb_sys_fail(mrb, "open");
-
-  struct stat st;
-  if (fstat(fd, &st) < 0) {
-    close(fd);
-    mrb_sys_fail(mrb, "fstat");
-  }
-
-  void *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (ptr == MAP_FAILED) {
-    close(fd);
-    mrb_sys_fail(mrb, "mmap");
-  }
-
-  m->path = path;
-  m->data = (const uint8_t*)ptr;
-  m->size = (size_t)st.st_size;
-  m->fd   = fd;
-}
-
-#else
-
-static void
-cbor_map_file(mrb_state *mrb, CborMappedFile *m, mrb_value path)
-{
-  memset(m, 0, sizeof(*m));
-
-  HANDLE hFile = CreateFileA(RSTRING_CSTR(mrb, path), GENERIC_READ, FILE_SHARE_READ,
-                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (hFile == INVALID_HANDLE_VALUE) mrb_sys_fail(mrb, "CreateFileA");
-
-  LARGE_INTEGER size;
-  if (!GetFileSizeEx(hFile, &size)) {
-    CloseHandle(hFile);
-    mrb_sys_fail(mrb, "GetFileSizeEx");
-  }
-
-  HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-  if (!hMap) {
-    CloseHandle(hFile);
-    mrb_sys_fail(mrb, "CreateFileMappingA");
-  }
-
-  void *ptr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-  if (!ptr) {
-    CloseHandle(hMap);
-    CloseHandle(hFile);
-    mrb_sys_fail(mrb, "MapViewOfFile");
-  }
-
-  m->path = path;
-  m->data = (const uint8_t*)ptr;
-  m->size = (size_t)size.QuadPart;
-  m->hFile = hFile;
-  m->hMap  = hMap;
-}
-
-#endif
-
-static size_t
-cbor_skip_document(mrb_state *mrb,
-                   const uint8_t *data, size_t size, size_t offset,
-                   mrb_value buf, mrb_value shareable)
-{
-  if (offset >= size) return offset;
-
-  Reader r;
-  reader_init(&r, data + offset, size - offset);
-
-  /* skip genau EIN Top-Level-Item */
-  skip_cbor(mrb, &r, buf, shareable);
-
-  /* neuer Offset relativ zur Basis */
-  ptrdiff_t d = r.p - r.base;
-  if (unlikely(d < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
-  return offset + (size_t)d;
-}
-
-
-static mrb_value
-mrb_cbor_lazy_stream(mrb_state *mrb, mrb_value self)
-{
-  mrb_value path, block;
-  mrb_kwargs kwargs;
-  mrb_sym    kw_keys[3]   = { MRB_SYM(offset), MRB_SYM(limit), MRB_SYM(length) };
-  mrb_value  kw_values[3];
-  kwargs.num      = 3;
-  kwargs.required = 0;
-  kwargs.table    = kw_keys;
-  kwargs.values   = kw_values;
-  kwargs.rest     = NULL;
-
-  mrb_get_args(mrb, "S:&", &path, &kwargs, &block);
-  path = mrb_str_byte_subseq(mrb, path, 0, RSTRING_LEN(path));
-
-  if (!mrb_block_given_p(mrb)) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "block required");
-  }
-
-  /* CBOR::MappedFile holen */
-  struct RClass *mappedfile =
-      mrb_class_get_under_id(mrb, mrb_class_ptr(self), MRB_SYM(MappedFile));
-
-  /* Mapping-Objekt erzeugen */
-  CborMappedFile *m;
-  struct RData *data;
-  Data_Make_Struct(mrb, mappedfile, CborMappedFile,
-                   &cbor_mappedfile_type, m, data);
-
-  cbor_map_file(mrb, m, path);
-  mrb_value mapped_file = mrb_obj_value(data);
-  mrb_iv_set(mrb, mapped_file, MRB_SYM(path), path);
-
-  /* zero-copy String auf mmap */
-  mrb_value buf = mrb_str_new_static(
-      mrb,
-      (const char*)m->data,
-      (mrb_int)m->size
-  );
-
-  /* shareable-Hash für Tag 28/29 - einmal pro Stream */
-  /* limit and length are mutually exclusive */
-  if (!mrb_undef_p(kw_values[1]) && !mrb_undef_p(kw_values[2]))
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "limit and length are mutually exclusive");
-
-  /* kwargs: offset */
-  size_t offset = 0;
-  if (!mrb_undef_p(kw_values[0])) {
-    mrb_int kw_offset = mrb_integer(mrb_ensure_int_type(mrb, kw_values[0]));
-    if (unlikely(kw_offset < 0))
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "offset must be non-negative");
-    offset = (size_t)kw_offset;
-    if (unlikely(offset > m->size))
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "offset beyond end of file");
-  }
-
-  /* kwargs: limit (0 = unlimited) */
-  mrb_int limit = 0;
-  if (!mrb_undef_p(kw_values[1])) {
-    limit = mrb_integer(mrb_ensure_int_type(mrb, kw_values[1]));
-    if (unlikely(limit < 0))
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "limit must be non-negative");
-  }
-
-  /* kwargs: length — clamp end of region */
-  size_t end_offset = m->size;
-  if (!mrb_undef_p(kw_values[2])) {
-    mrb_int kw_length = mrb_integer(mrb_ensure_int_type(mrb, kw_values[2]));
-    if (unlikely(kw_length < 0))
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "length must be non-negative");
-    size_t region_end = offset + (size_t)kw_length;
-    if (region_end < m->size) end_offset = region_end;
-  }
-
-  mrb_int count = 0;
-
-  while (offset < end_offset) {
-    if (limit > 0 && count >= limit) break;
-    mrb_value shareable = mrb_ary_new(mrb);
-
-    /* Lazy-Objekt für aktuelles Top-Level-Item */
-    mrb_value lazy = cbor_lazy_new(mrb, buf, (mrb_int)offset, shareable);
-
-    /* Mapping an Lazy hängen, damit mmap-Lifetime gesichert ist */
-    mrb_iv_set(mrb, lazy, MRB_SYM(mapped_file), mapped_file);
-
-    /* Block aufrufen */
-    mrb_yield(mrb, block, lazy);
-    count++;
-
-    /* nächstes Dokument finden */
-    size_t next = cbor_skip_document(mrb, m->data, end_offset, offset, buf, shareable);
-    if (next <= offset) {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid CBOR document boundary");
-    }
-    offset = next;
-  }
-
-  return mrb_nil_value();
-}
-
 static mrb_value
 cbor_symbols_as_strings(mrb_state *mrb, mrb_value self)
 {
@@ -2516,6 +2224,55 @@ cbor_symbols_as_uint32(mrb_state *mrb, mrb_value self)
   cbor_set_sym_strategy(mrb, 2);
   return self;
 }
+
+static mrb_value
+lazy_end_offset(mrb_state *mrb, mrb_value self)
+{
+  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
+
+  const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
+  const uint8_t *ptr  = base + p->offset;
+
+  uint8_t info = ptr[0] & 0x1F;
+
+  size_t header_len = 1;
+  size_t payload_len = 0;
+
+  switch (info) {
+    case 24:
+      payload_len = ptr[1];
+      header_len = 2;
+      break;
+    case 25:
+      payload_len = ((size_t)ptr[1] << 8) | ptr[2];
+      header_len = 3;
+      break;
+    case 26:
+      payload_len = ((size_t)ptr[1] << 24) |
+                    ((size_t)ptr[2] << 16) |
+                    ((size_t)ptr[3] << 8)  |
+                    ptr[4];
+      header_len = 5;
+      break;
+    case 27:
+      payload_len = ((uint64_t)ptr[1] << 56) |
+                    ((uint64_t)ptr[2] << 48) |
+                    ((uint64_t)ptr[3] << 40) |
+                    ((uint64_t)ptr[4] << 32) |
+                    ((uint64_t)ptr[5] << 24) |
+                    ((uint64_t)ptr[6] << 16) |
+                    ((uint64_t)ptr[7] << 8)  |
+                    ptr[8];
+      header_len = 9;
+      break;
+    default:
+      payload_len = info; // info < 24
+  }
+
+  size_t end_offset = p->offset + header_len + payload_len;
+  return mrb_convert_size_t(mrb, end_offset);
+}
+
 
 MRB_BEGIN_DECL
 
@@ -2534,16 +2291,12 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
 
   mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),  cbor_lazy_aref_m,  MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, lazy, MRB_SYM(value),   cbor_lazy_value, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, lazy, MRB_SYM(end_offset),   lazy_end_offset, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),     cbor_lazy_dig,   MRB_ARGS_ANY());
 
-  struct RClass *mappedfile =
-      mrb_define_class_under_id(mrb, cbor, MRB_SYM(MappedFile), mrb->object_class);
-  MRB_SET_INSTANCE_TT(mappedfile, MRB_TT_CDATA);
 
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),
                                 mrb_cbor_decode_lazy, MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(stream),
-                                mrb_cbor_lazy_stream, MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0, 3)|MRB_ARGS_BLOCK());
 
   /* CBOR::Type — bitmask constants for use with native_ext_deserialize.
      Each primitive is 1<<major_type so multiple types can be OR-ed together.

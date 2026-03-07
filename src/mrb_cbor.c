@@ -20,6 +20,17 @@ MRB_END_DECL
 #include <string.h>
 #include <stdbool.h>
 
+/* Safe pointer-diff -> mrb_int. Raises if negative or > MRB_INT_MAX. */
+static inline mrb_int
+cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
+{
+  ptrdiff_t d = p - base;
+  if (unlikely(d < 0 || d > (ptrdiff_t)MRB_INT_MAX))
+    mrb_raise(mrb, E_RANGE_ERROR, "CBOR offset out of range");
+  return (mrb_int)d;
+}
+
+
 #ifndef _WIN32
 # include <sys/types.h>
 # include <sys/stat.h>
@@ -90,12 +101,6 @@ reader_init(Reader* r, const uint8_t* buf, size_t len)
   r->end    = buf + len;
   r->major  = 0;
   r->info   = 0;
-}
-
-static size_t
-reader_offset(const Reader* r)
-{
-  return (size_t)(r->p - r->base);
 }
 
 typedef struct {
@@ -242,9 +247,10 @@ static mrb_value
 decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   uint64_t blen = read_len(mrb, r, info);
-  size_t off    = reader_offset(r);
+  ptrdiff_t off = r->p - r->base;
+  if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
-  if (likely(blen <= SIZE_MAX - off && off + blen <= (size_t)RSTRING_LEN(src))) {
+  if (likely(off <= (ptrdiff_t)RSTRING_LEN(src) && blen <= (uint64_t)(RSTRING_LEN(src) - off))) {
       mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
 
 #ifdef MRB_UTF8_STRING
@@ -268,9 +274,10 @@ static mrb_value
 decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   uint64_t blen = read_len(mrb, r, info);
-  size_t off    = reader_offset(r);
+  ptrdiff_t off = r->p - r->base;
+  if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
-  if (likely(blen <= SIZE_MAX - off && off + blen <= (size_t)RSTRING_LEN(src))) {
+  if (likely(off <= (ptrdiff_t)RSTRING_LEN(src) && blen <= (uint64_t)(RSTRING_LEN(src) - off))) {
       r->p += blen;
       return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);;
   } else {
@@ -465,8 +472,9 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
   if (len == 0)
     mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
 
-  size_t off = reader_offset(r);
-  ensure_slice_bounds(mrb, src, off, len);
+  ptrdiff_t off = r->p - r->base;
+  if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
+  ensure_slice_bounds(mrb, src, (size_t)off, len);
   r->p += len;
 
   const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
@@ -524,7 +532,25 @@ decode_tag_shareable(mrb_state* mrb, Reader* r,
                      mrb_value src, mrb_value shareable)
 {
   if (likely(mrb_hash_p(shareable))) {
-    mrb_int share_idx = mrb_hash_size(mrb, shareable);
+    /* If the shareable table was pre-populated by skip_cbor (lazy decode path),
+       it contains a reverse-map entry  -(inner_offset+2) → correct_index.
+       Use that to recover the encoder-assigned index instead of mrb_hash_size,
+       which would be wrong once the table has reverse-map entries in it. */
+    mrb_int inner_pos = cbor_pdiff(mrb, r->p, r->base);
+    mrb_value rev_key = mrb_int_value(mrb, -(inner_pos + 2));
+    mrb_value rev_idx = mrb_hash_fetch(mrb, shareable, rev_key, mrb_undef_value());
+
+    mrb_int share_idx;
+    if (!mrb_undef_p(rev_idx)) {
+      share_idx = mrb_integer(rev_idx);          /* lazy path: pre-computed index */
+    } else {
+      /* Eager path: no reverse map present.  Use a sequential counter stored
+         at key=false so reverse-map entries can never skew the count. */
+      mrb_value cnt_key = mrb_false_value();
+      mrb_value cnt_val = mrb_hash_fetch(mrb, shareable, cnt_key, mrb_int_value(mrb, 0));
+      share_idx = mrb_integer(cnt_val);
+      mrb_hash_set(mrb, shareable, cnt_key, mrb_int_value(mrb, share_idx + 1));
+    }
     mrb_value idx_key = mrb_int_value(mrb, share_idx);
 
     uint8_t nb     = reader_read8(mrb, r);
@@ -540,27 +566,12 @@ decode_tag_shareable(mrb_state* mrb, Reader* r,
         break;
     }
 
-    /* scalar shareable: register placeholder first */
+    /* scalar shareable: register placeholder first, then decode.
+       We back up 1 byte so that decode_value re-reads the inner type byte
+       and can handle any CBOR type, including nested tags like Tag2/3 (bignum). */
     mrb_hash_set(mrb, shareable, idx_key, mrb_undef_value());
-
-    mrb_value inner;
-    switch (major2) {
-      case 0: inner = decode_unsigned(mrb, r, info2); break;
-      case 1: inner = decode_negative(mrb, r, info2); break;
-      case 2: inner = decode_bytes(mrb, r, src, info2); break;
-      case 3: inner = decode_text(mrb, r, src, info2); break;
-      case 6:
-        read_len(mrb, r, info2);
-        inner = decode_value(mrb, r, src, shareable);
-        break;
-      case 7:
-        inner = decode_simple_or_float(mrb, r, info2);
-        break;
-      default:
-        mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type '%d' in shareable", major2);
-        inner = mrb_undef_value(); /* not reached */
-    }
-
+    r->p--;  /* unread nb */
+    mrb_value inner = decode_value(mrb, r, src, shareable);
     mrb_hash_set(mrb, shareable, idx_key, inner);
     return inner;
   } else {
@@ -899,7 +910,12 @@ encode_check_shared(CborWriter *w, mrb_value obj)
   if (mrb_undef_p(w->seen)) return FALSE;
 
   mrb_state *mrb = w->mrb;
-  mrb_value found = mrb_hash_fetch(mrb, w->seen, mrb_int_value(mrb, mrb_obj_id(obj)), mrb_undef_value());
+
+  /* Use raw object pointer as key so we get identity comparison, not value
+     equality.  Two distinct [1,2] arrays with equal content must not be
+     treated as the same shareable object. */
+  mrb_value id_key = mrb_int_value(mrb, mrb_obj_id(obj));
+  mrb_value found  = mrb_hash_fetch(mrb, w->seen, id_key, mrb_undef_value());
 
   if (mrb_integer_p(found)) {
     /* Already seen: emit Tag 29 + absolute index */
@@ -910,8 +926,11 @@ encode_check_shared(CborWriter *w, mrb_value obj)
   }
 
   /* First time: compute absolute index, register, emit Tag 28 */
-  mrb_int idx = w->seen_start + mrb_hash_size(mrb, w->seen);
-  mrb_hash_set(mrb, w->seen, mrb_int_value(mrb, mrb_obj_id(obj)), mrb_int_value(mrb, idx));
+  mrb_int idx;
+  if (unlikely(mrb_int_add_overflow(w->seen_start, mrb_hash_size(mrb, w->seen), &idx))) {
+    mrb_raise(mrb, E_RANGE_ERROR, "sharedrefs index overflow");
+  }
+  mrb_hash_set(mrb, w->seen, id_key, mrb_int_value(mrb, idx));
 
   uint8_t tag28[2] = { 0xD8, 0x1C };
   cbor_writer_write(w, tag28, 2);
@@ -1120,6 +1139,9 @@ static void
 encode_value(CborWriter* w, mrb_value obj)
 {
   mrb_state* mrb = w->mrb;
+  if (!mrb_immediate_p(obj) && encode_check_shared(w, obj)) {
+    return;
+  }
 
   switch (mrb_type(obj)) {
     case MRB_TT_FALSE:
@@ -1138,15 +1160,15 @@ encode_value(CborWriter* w, mrb_value obj)
       break;
 
     case MRB_TT_STRING:
-      if (!encode_check_shared(w, obj)) encode_string(w, obj);
+      encode_string(w, obj);
       break;
 
     case MRB_TT_ARRAY:
-      if (!encode_check_shared(w, obj)) encode_array(w, obj);
+      encode_array(w, obj);
       break;
 
     case MRB_TT_HASH:
-      if (!encode_check_shared(w, obj)) encode_map(w, obj);
+      encode_map(w, obj);
       break;
 
 #ifdef MRB_USE_BIGINT
@@ -1157,7 +1179,7 @@ encode_value(CborWriter* w, mrb_value obj)
 
     default: {
       mrb_value s = mrb_obj_as_string(mrb, obj);
-      if (!encode_check_shared(w, s)) encode_string(w, s);
+      encode_string(w, s);
     } break;
   }
 }
@@ -1186,13 +1208,8 @@ mrb_cbor_encode(mrb_state* mrb, mrb_value self)
   CborWriter w;
   cbor_writer_init(&w, mrb);
 
-
-  if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
-    /* sharedrefs: true  -> indices start at 0
-       sharedrefs: n     -> indices start at n */
-    if (mrb_integer_p(kw_values[0])) {
-      w.seen_start = mrb_integer(kw_values[0]);
-    }
+  if (!mrb_undef_p(kw_values[0]) && mrb_integer_p(kw_values[0])) {
+    w.seen_start = mrb_integer(kw_values[0]);
   }
 
   encode_value(&w, obj);
@@ -1221,7 +1238,7 @@ mrb_cbor_decode(mrb_state* mrb, mrb_value self)
 
 typedef struct {
   mrb_value buf;    /* kompletter CBOR-String */
-  uint32_t  offset; /* Start dieses Elements im buf (Byte-Index relativ zu base) */
+  mrb_int   offset; /* Start dieses Elements im buf (Byte-Index relativ zu base) */
 } cbor_lazy_t;
 
 static const struct mrb_data_type cbor_lazy_type = {
@@ -1229,7 +1246,7 @@ static const struct mrb_data_type cbor_lazy_type = {
 };
 
 static mrb_value
-cbor_lazy_new(mrb_state *mrb, mrb_value buf, uint32_t offset, mrb_value shareable)
+cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value shareable)
 {
   struct RClass *cbor = mrb_module_get_id(mrb, MRB_SYM(CBOR));
   struct RClass *lazy = mrb_class_get_under_id(mrb, cbor, MRB_SYM(Lazy));
@@ -1293,20 +1310,29 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
 
         if (tag == 28) {
           if (likely(mrb_hash_p(shareable))) {
+            /* Sequential counter stored at key=false (never a valid index key).
+               This avoids mrb_hash_size() being skewed by reverse-map entries. */
+            mrb_value cnt_key = mrb_false_value();
+            mrb_value cnt_val = mrb_hash_fetch(mrb, shareable, cnt_key, mrb_fixnum_value(0));
+            mrb_int share_idx = mrb_integer(cnt_val);
 
-            /* inner item offset - register as Lazy before skipping */
-            mrb_int share_idx = mrb_hash_size(mrb, shareable);
-            uint32_t inner_offset = (uint32_t)(r->p - r->base);
+            mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
             mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, shareable);
+
+            /* forward:  index → Lazy  (for Tag29 lookups) */
             mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), lazy);
+            /* reverse:  -(inner_offset+2) → index  (for decode_tag_shareable) */
+            mrb_hash_set(mrb, shareable, mrb_int_value(mrb, -(mrb_int)inner_offset - 2),
+                         mrb_int_value(mrb, share_idx));
+            /* bump counter */
+            mrb_hash_set(mrb, shareable, cnt_key, mrb_int_value(mrb, share_idx + 1));
           } else {
             mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
           }
         }
-        skip_cbor(mrb, r, buf, shareable);
         /* tag 29: just skip the uint index, nothing to register */
 
-
+      skip_cbor(mrb, r, buf, shareable);
       return;
     }
 
@@ -1329,6 +1355,65 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
   mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
 }
 
+/* Like skip_cbor but does NOT register Tag28 items in the shareable table.
+   Used during lazy element traversal where the table has already been fully
+   pre-populated by the initial scan in mrb_cbor_decode_lazy. */
+static void
+skip_cbor_noregister(mrb_state *mrb, Reader *r)
+{
+  if (unlikely(r->p >= r->end))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
+
+  uint8_t b     = reader_read8(mrb, r);
+  uint8_t major = b >> 5;
+  uint8_t info  = b & 0x1F;
+
+  switch (major) {
+    case 0:
+    case 1:
+      if (info >= 24) read_num(mrb, r, info);
+      return;
+    case 2:
+    case 3: {
+      uint64_t len = read_len(mrb, r, info);
+      if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
+      mrb_raise(mrb, E_RANGE_ERROR, "CBOR string out of bounds");
+    }
+    case 4: {
+      uint64_t len = read_len(mrb, r, info);
+      for (uint64_t i = 0; i < len; i++) skip_cbor_noregister(mrb, r);
+      return;
+    }
+    case 5: {
+      uint64_t len = read_len(mrb, r, info);
+      for (uint64_t i = 0; i < len; i++) {
+        skip_cbor_noregister(mrb, r);
+        skip_cbor_noregister(mrb, r);
+      }
+      return;
+    }
+    case 6:
+      read_len(mrb, r, info); /* consume tag number – no registration */
+      skip_cbor_noregister(mrb, r);
+      return;
+    case 7: {
+      if (info < 24) return;
+      switch (info) {
+        case 24: if (likely(r->p < r->end)) { r->p++; return; }
+                 mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
+        case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
+                 mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
+        case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
+                 mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
+        case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
+                 mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
+        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+      }
+    }
+  }
+  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d' in skip_cbor_noregister", major);
+}
+
 /* Lazy#value: vollstaendiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
 MRB_API mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
@@ -1340,14 +1425,22 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
 
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len    = (size_t)RSTRING_LEN(p->buf);
+  mrb_value shareable = mrb_iv_get(mrb, self, MRB_SYM(shareable));
 
-  if (likely(p->offset < total_len)) {
+  if (likely((size_t)p->offset < total_len)) {
     Reader r;
     r.base = base;
     r.p    = base + p->offset;
     r.end  = base + total_len;
 
-    mrb_value value = decode_value(mrb, &r, p->buf, mrb_iv_get(mrb, self, MRB_SYM(shareable)));
+    /* decode_value handles all tag types correctly:
+       - Tag28 -> decode_tag_shareable (reverse-map gives correct index)
+       - Tag29 -> decode_tag_sharedref (returns Lazy from table)
+       - Tag2/3 -> decode_tagged_bignum
+       - others -> UnhandledTag wrapper
+       If it returns a Lazy (from a Tag29 sharedref), materialise it. */
+    mrb_value value = decode_value(mrb, &r, p->buf, shareable);
+    if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) value = cbor_lazy_value(mrb, value);
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
@@ -1379,7 +1472,7 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len    = (size_t)RSTRING_LEN(p->buf);
 
-  if (likely(p->offset < total_len)) {
+  if (likely((size_t)p->offset < total_len)) {
     r->base = base;
     r->p    = base + p->offset;
     r->end  = base + total_len;
@@ -1408,10 +1501,10 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
     }
 
     for (mrb_int i = 0; i < idx; i++) {
-      skip_cbor(mrb, r, p->buf, shareable);
+      skip_cbor_noregister(mrb, r);
     }
 
-    uint32_t elem_offset = (uint32_t)(r->p - r->base);
+    mrb_int elem_offset = cbor_pdiff(mrb, r->p, r->base);
     mrb_value new_lazy = cbor_lazy_new(mrb, p->buf, elem_offset, shareable);
 
     mrb_hash_set(mrb, kcache, key, new_lazy);
@@ -1452,13 +1545,13 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
       }
 
       if (match) {
-        uint32_t value_offset = (uint32_t)(r->p - r->base);
+        mrb_int value_offset = cbor_pdiff(mrb, r->p, r->base);
         mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset, shareable);
         mrb_hash_set(mrb, kcache, key, lazy_new);
         return lazy_new;
       }
 
-      skip_cbor(mrb, r, p->buf, shareable);
+      skip_cbor_noregister(mrb, r);
     }
 
     mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
@@ -1469,49 +1562,40 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
   return mrb_undef_value(); /* unreachable */
 }
 
+/*
+ * Advance reader past any wrapping tags (major=6) until we reach
+ * a non-tag item. Handles Tag 28 (shareable) and Tag 29 (sharedref)
+ * so that lazy access works on sharedrefs-encoded data.
+ * Returns the resolved major type, or 0xFF if Tag 29 was encountered.
+ * When 0xFF is returned, *resolved_out contains the Lazy from the
+ * shareable table that the caller should delegate to.
+ */
 static uint8_t
-lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable)
+lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value shareable,
+                  mrb_value *resolved_out)
 {
+  (void)buf;
+  *resolved_out = mrb_undef_value();
   while (r->major == 6) {
     uint64_t tag = read_len(mrb, r, r->info);
 
-    switch (tag) {
-      case 29: {
-        /* sharedref → eager auflösen */
-        (void)decode_tag_sharedref(mrb, r, shareable);
-        return 0xFF; /* Lazy kann hier nicht weiter */
-      }
-
-      case 28: {
-        /* shareable → Index registrieren */
-        mrb_int share_idx = mrb_hash_size(mrb, shareable);
-        mrb_hash_set(mrb, shareable, mrb_int_value(mrb, share_idx), mrb_undef_value());
-
-        /* nächsten Header lesen */
-        reader_read_header(mrb, r);
-
-        /* weiter in der Schleife, falls wieder Tag */
-        continue;
-      }
-
-      default:
-        /* generischer Tag → Lazy kann nicht korrekt arbeiten */
-        return 0xFF;
+    if (tag == 29) {
+      /* Sharedref: look up pre-registered Lazy and signal caller. */
+      *resolved_out = decode_tag_sharedref(mrb, r, shareable);
+      return 0xFF;
     }
+    /* Tag 28 (shareable) or any other tag: just consume, read next header.
+       The shareable table was pre-populated; no registration needed here. */
+    reader_read_header(mrb, r);
   }
-
   return r->major;
 }
 
-
-
-/* Lazy#[] */
+/* Lazy#[] – internal: key passed directly, no VM dispatch */
 static mrb_value
-cbor_lazy_aref(mrb_state *mrb, mrb_value self)
+cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
 {
   cbor_lazy_t *p = DATA_PTR(self);
-  mrb_value key;
-  mrb_get_args(mrb, "o", &key);
 
   mrb_value cached = lazy_fetch_from_cache(mrb, self, key);
   if (!mrb_undef_p(cached)) return cached;
@@ -1522,7 +1606,15 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
 
   mrb_value shareable = mrb_iv_get(mrb, self, MRB_SYM(shareable));
   if (likely(mrb_hash_p(shareable))) {
-    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable);
+    mrb_value resolved;
+    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable, &resolved);
+    if (major == 0xFF) {
+      /* Tag29: delegate to the referenced Lazy */
+      if (mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type)) {
+        return cbor_lazy_aref(mrb, resolved, key);
+      }
+      mrb_raise(mrb, E_TYPE_ERROR, "sharedref target is not indexable");
+    }
     switch (major) {
       case 4:
         return lazy_aref_array(mrb, &r, key, self, p, shareable);
@@ -1535,7 +1627,17 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_TYPE_ERROR, "shareable is not a hash");
   }
 
+
   return mrb_undef_value();
+}
+
+/* Lazy#[] – mruby method binding */
+static mrb_value
+cbor_lazy_aref_m(mrb_state *mrb, mrb_value self)
+{
+  mrb_value key;
+  mrb_get_args(mrb, "o", &key);
+  return cbor_lazy_aref(mrb, self, key);
 }
 
 
@@ -1545,12 +1647,24 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
 
+  mrb_value owned_buf = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
   mrb_value shareable = mrb_hash_new(mrb);
 
-  return cbor_lazy_new(mrb,
-                       mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf)),
-                       0,
-                       shareable);
+  /* Pre-populate the shareable table by scanning the entire document once.
+     This ensures every Tag28 item is registered at the index the encoder
+     assigned (sequential, depth-first), so Tag29 lookups always succeed
+     and lazy traversal never sees wrong indices. */
+  {
+    const uint8_t *base = (const uint8_t*)RSTRING_PTR(owned_buf);
+    size_t len = (size_t)RSTRING_LEN(owned_buf);
+    Reader r;
+    r.base = base;
+    r.p    = base;
+    r.end  = base + len;
+    skip_cbor(mrb, &r, owned_buf, shareable);
+  }
+
+  return cbor_lazy_new(mrb, owned_buf, 0, shareable);
 }
 
 static mrb_value
@@ -1587,7 +1701,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     size_t         total   = (size_t)RSTRING_LEN(p->buf);
     mrb_value      shareable = mrb_iv_get(mrb, current, MRB_SYM(shareable));
 
-    if (unlikely(p->offset >= total))
+    if (unlikely((size_t)p->offset >= total))
       mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
 
     Reader r;
@@ -1596,7 +1710,17 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     r.end  = base + total;
 
     reader_read_header(mrb, &r);
-    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable);
+    mrb_value dig_resolved;
+    uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, shareable, &dig_resolved);
+
+    if (major == 0xFF) {
+      /* Tag29: delegate this key to the referenced Lazy, then continue dig */
+      if (mrb_data_check_get_ptr(mrb, dig_resolved, &cbor_lazy_type)) {
+        current = cbor_lazy_aref(mrb, dig_resolved, key);
+        continue;
+      }
+      mrb_raise(mrb, E_TYPE_ERROR, "CBOR::Lazy#dig: sharedref target is not indexable");
+    }
 
     mrb_value result;
 
@@ -1610,9 +1734,9 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
         if (idx < 0 || (uint64_t)idx >= len) { current = mrb_nil_value(); continue; }
 
         for (mrb_int i = 0; i < idx; i++)
-          skip_cbor(mrb, &r, p->buf, shareable);
+          skip_cbor_noregister(mrb, &r);
 
-        uint32_t  elem_off = (uint32_t)(r.p - base);
+        mrb_int  elem_off = cbor_pdiff(mrb, r.p, base);
         result = cbor_lazy_new(mrb, p->buf, elem_off, shareable);
         mrb_hash_set(mrb, kcache, key, result);
 
@@ -1642,14 +1766,14 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
           }
 
           if (match) {
-            uint32_t val_off = (uint32_t)(r.p - base);
+            mrb_int val_off = cbor_pdiff(mrb, r.p, base);
             result = cbor_lazy_new(mrb, p->buf, val_off, shareable);
             mrb_hash_set(mrb, kcache, key, result);
             found = TRUE;
             break;
           }
 
-          skip_cbor(mrb, &r, p->buf, shareable);
+          skip_cbor_noregister(mrb, &r);
         }
 
         if (!found) { current = mrb_nil_value(); continue; }
@@ -1792,7 +1916,9 @@ cbor_skip_document(mrb_state *mrb,
   skip_cbor(mrb, &r, buf, shareable);
 
   /* neuer Offset relativ zur Basis */
-  return offset + reader_offset(&r);
+  ptrdiff_t d = r.p - r.base;
+  if (unlikely(d < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
+  return offset + (size_t)d;
 }
 
 
@@ -1868,7 +1994,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);
 
-  mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),  cbor_lazy_aref,  MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),  cbor_lazy_aref_m,  MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, lazy, MRB_SYM(value),   cbor_lazy_value, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),     cbor_lazy_dig,   MRB_ARGS_ANY());
 

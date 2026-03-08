@@ -279,15 +279,15 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
   if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
   if (likely((uint64_t)off + blen <= (size_t)RSTRING_LEN(src))) {
-      mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
+    mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
 
 #ifdef MRB_UTF8_STRING
-      if (likely(mrb_str_is_utf8(slice))) {
-        r->p += blen;
-        return slice;
-      } else {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
-      }
+    if (likely(mrb_str_is_utf8(slice))) {
+      r->p += blen;
+      return slice;
+    } else {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
+    }
 #else
       r->p += blen;
       return slice;
@@ -306,10 +306,10 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
   if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
   if (likely((uint64_t)off + blen <= (size_t)RSTRING_LEN(src))) {
-      r->p += blen;
-      return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);;
+    r->p += blen;
+    return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
   } else {
-      mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
+    mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
   }
 
   return mrb_undef_value();
@@ -477,7 +477,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
 
   #ifndef MRB_ENDIAN_BIG
         /* Only reverse if len > 1 */
-        if (len > 1) {
+        if (likely(len > 1)) {
           uint8_t *tmp = mrb_alloca(mrb, len);
           memcpy(tmp, buf, len);
 
@@ -614,31 +614,29 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 
   /* strategy 1: string → symbol */
   if (strategy == 1) {
-    if (!mrb_string_p(v)) {
+    if (likely(mrb_string_p(v))) {
+      return mrb_symbol_value(mrb_intern_str(mrb, v));
+    } else {
       mrb_raise(mrb, E_TYPE_ERROR,
         "invalid payload for tag 39 (expected text string)");
     }
-
-    return mrb_symbol_value(
-      mrb_intern_str(mrb, v)
-    );
   }
 
   /* strategy 2: uint32 → symbol id */
   if (strategy == 2) {
-    if (!mrb_integer_p(v)) {
+    if (likely(mrb_integer_p(v))) {
+      mrb_int n = mrb_integer(v);
+
+      if (likely(n >= 0 && n <= UINT32_MAX)) {
+        return mrb_symbol_value((mrb_sym)n);
+      } else {
+        mrb_raise(mrb, E_RANGE_ERROR,
+                "invalid symbol ID size for tag 39");
+      }
+    } else {
       mrb_raise(mrb, E_TYPE_ERROR,
         "invalid payload for tag 39 (expected uint32)");
     }
-
-    mrb_int n = mrb_integer(v);
-
-    if (n < 0 || n > UINT32_MAX) {
-      mrb_raise(mrb, E_RANGE_ERROR,
-        "invalid symbol ID size for tag 39");
-    }
-
-    return mrb_symbol_value((mrb_sym)n);
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy");
@@ -1181,7 +1179,7 @@ static void
 encode_sym(CborWriter *w, mrb_value obj)
 {
   mrb_state *mrb = w->mrb;
-  int mode = cbor_sym_strategy(mrb);
+  uint8_t mode = cbor_sym_strategy(mrb);
 
   /* ---------------------------------------------------------
    * MODE 0: Symbol → UTF‑8‑String
@@ -1194,8 +1192,7 @@ encode_sym(CborWriter *w, mrb_value obj)
   }
 
   /* ---------------------------------------------------------
-   * MODE 1: Symbol → falls Tag 39 registriert ist → encode_registered_tag
-   *          sonst → fallback: Symbol als String
+   * MODE 1: Symbol als String
    * --------------------------------------------------------- */
   if (mode == 1) {
     mrb_sym s = mrb_symbol(obj);
@@ -1377,10 +1374,10 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedref
  * @__cbor_tag_rev_registry__ Class   → Integer (encode path)
  *
  * Encode: for unknown object types, check reverse registry.
- *   Emit tag number, then encode ned-schema ivars as a CBOR map.
+ *   Emit tag number, then encode net-schema ivars as a CBOR map.
  * Decode unknown tag: check forward registry.
  *   Allocate bare instance, populate ivars from CBOR map payload
- *   using ned schema as the field list.
+ *   using net schema as the field list.
  * ============================================================ */
 
 static mrb_value
@@ -1453,10 +1450,7 @@ mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
-/* Encode an object whose class is registered in the tag registry.
-   Emits: Tag(n) + CBOR map of ivar_name(string) → ivar_value
-   for every ivar declared in the ned schema.
-   Falls back to to_s if no ned schema is found. */
+
 static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 
 typedef struct {
@@ -1464,6 +1458,9 @@ typedef struct {
   mrb_value   obj;
 } TagEncodeCtx;
 
+/* Encode an object whose class is registered in the tag registry.
+   Emits: Tag(n) + CBOR map of ivar_name(string) → ivar_value
+   for every ivar declared in the net schema. */
 static int
 encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, void *data)
 {
@@ -1600,7 +1597,7 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
 }
 
 /* Decode a registered tag: allocate bare instance, populate ivars
-   from CBOR map payload using ned schema as the field list. */
+   from CBOR map payload using net schema as the field list. */
 typedef struct {
   mrb_value obj;
   mrb_value payload;
@@ -1726,23 +1723,26 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
   mrb_value obj     = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
 
   mrb_value payload = decode_value(mrb, r, src, sharedrefs);
-  if (!mrb_hash_p(payload)) {
+  if (likely(mrb_hash_p(payload))) {
+    if (likely(mrb_hash_p(schema))) {
+      decode_ctx ctx = { obj, payload };
+
+      mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
+                      decode_registered_tag_foreach, &ctx);
+
+      if (mrb_respond_to(mrb, obj, MRB_SYM(from_allocate))) {
+        return mrb_funcall_argv(mrb, obj, MRB_SYM(from_allocate), 0, NULL);
+      } else {
+        return obj;
+      }
+    } else {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "no schema found for registered class");
+    }
+  } else {
     mrb_raise(mrb, E_TYPE_ERROR, "registered tag payload must be a map");
   }
-  if (!mrb_hash_p(schema)) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "no schema found for registered class");
-  }
 
-  decode_ctx ctx = { obj, payload };
-
-  mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
-                   decode_registered_tag_foreach, &ctx);
-
-  if (mrb_respond_to(mrb, obj, MRB_SYM(from_allocate))) {
-    return mrb_funcall_argv(mrb, obj, MRB_SYM(from_allocate), 0, NULL);
-  } else {
-    return obj;
-  }
+  return mrb_undef_value(); // not reachable
 }
 
 static void
@@ -2006,11 +2006,10 @@ lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value sharedrefs,
 static mrb_value
 cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
 {
-  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
-
   mrb_value cached = lazy_fetch_from_cache(mrb, self, key);
   if (!mrb_undef_p(cached)) return cached;
 
+  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
   Reader r;
   lazy_reader_init(mrb, &r, p);
   reader_read_header(mrb, &r);
@@ -2189,6 +2188,13 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 }
 
 static mrb_value
+cbor_no_symbols(mrb_state *mrb, mrb_value self)
+{
+  cbor_set_sym_strategy(mrb, 0);
+  return self;
+}
+
+static mrb_value
 cbor_symbols_as_string(mrb_state *mrb, mrb_value self)
 {
   cbor_set_sym_strategy(mrb, 1);
@@ -2261,6 +2267,7 @@ MRB_API void
 mrb_mruby_cbor_gem_init(mrb_state* mrb)
 {
   struct RClass* cbor = mrb_define_module_id(mrb, MRB_SYM(CBOR));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(no_symbols), cbor_no_symbols, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32), cbor_symbols_as_uint32, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string), cbor_symbols_as_string, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));

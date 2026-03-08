@@ -9,8 +9,7 @@ assert('passes the official test vectors') do
       if test["decoded"]
         assert_equal test["decoded"], cbor
       end
-    rescue NotImplementedError => e
-      $stderr.puts e.message
+    rescue NotImplementedError
     end
   end
 end

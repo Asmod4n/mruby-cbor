@@ -118,8 +118,8 @@ class Person
   attr_accessor :name, :age
 
   # Declare which fields to encode/decode and their expected CBOR types
-  native_ext_deserialize :@name, CBOR::Type::String
-  native_ext_deserialize :@age, CBOR::Type::Integer
+  native_ext_type :@name, CBOR::Type::String
+  native_ext_type :@age, CBOR::Type::Integer
 
   # Called after allocation during decode
   def from_allocate

@@ -16,8 +16,9 @@ module CBOR
 
       # 4) Body nachladen (Header behalten!)
       io.seek(offset + doc.bytesize)
-      doc << io.read(len - doc.bytesize)
-
+      buf =  io.read(len - doc.bytesize)
+      break unless buf
+      doc << buf
       # 5) Jetzt hat Lazy das komplette Dokument
 
       yield CBOR.decode_lazy(doc)

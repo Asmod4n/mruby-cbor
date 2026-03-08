@@ -254,6 +254,24 @@ read_len(mrb_state* mrb, Reader* r, uint8_t info)
   return n.v;
 }
 
+/*
+ * Validate `len` fits in mrb_int, that there are enough bytes remaining,
+ * and advance r->p by len.  Single chokepoint for all "skip N raw bytes" sites.
+ */
+static void
+reader_advance_checked(mrb_state *mrb, Reader *r, uint64_t len)
+{
+  if (likely(len <= (uint64_t)MRB_INT_MAX &&
+             r->p <= r->end &&
+             (uint64_t)(r->end - r->p) >= len)) {
+    r->p += len;
+    return;
+  }
+  if (len > (uint64_t)MRB_INT_MAX)
+    mrb_raise(mrb, E_RANGE_ERROR, "CBOR length too large");
+  mrb_raise(mrb, E_RANGE_ERROR, "CBOR data out of bounds");
+}
+
 static void
 ensure_slice_bounds(mrb_state* mrb, mrb_value src, size_t off, uint64_t len)
 {
@@ -275,10 +293,13 @@ static mrb_value
 decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   uint64_t blen = read_len(mrb, r, info);
+  if (unlikely(blen > (uint64_t)MRB_INT_MAX))
+    mrb_raise(mrb, E_RANGE_ERROR, "CBOR text string length too large");
+
   ptrdiff_t off = r->p - r->base;
   if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
-  if (likely((uint64_t)off + blen <= (size_t)RSTRING_LEN(src))) {
+  if (likely((mrb_int)blen <= RSTRING_LEN(src) - (mrb_int)off)) {
     mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
 
 #ifdef MRB_UTF8_STRING
@@ -302,10 +323,13 @@ static mrb_value
 decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   uint64_t blen = read_len(mrb, r, info);
+  if (unlikely(blen > (uint64_t)MRB_INT_MAX))
+    mrb_raise(mrb, E_RANGE_ERROR, "CBOR byte string length too large");
+
   ptrdiff_t off = r->p - r->base;
   if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
 
-  if (likely((uint64_t)off + blen <= (size_t)RSTRING_LEN(src))) {
+  if (likely((mrb_int)blen <= RSTRING_LEN(src) - (mrb_int)off)) {
     r->p += blen;
     return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
   } else {
@@ -314,7 +338,6 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 
   return mrb_undef_value();
 }
-
 static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs);
 
 static mrb_value
@@ -464,6 +487,8 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
 
   if (likely(major2 == 2)) {
     uint64_t len = read_len(mrb, r, info2);
+    if (unlikely(len > (uint64_t)MRB_INT_MAX))
+      mrb_raise(mrb, E_RANGE_ERROR, "CBOR bignum length too large");
     if (likely(len > 0)) {
       ptrdiff_t off = r->p - r->base;
       if (likely(off >= 0)) {
@@ -1765,8 +1790,8 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     case 2: /* byte string */
     case 3: { /* text string */
       uint64_t len = read_len(mrb, r, info);
-      if (likely((uint64_t)(r->end - r->p) >= len)) { r->p += len; return; }
-      mrb_raise(mrb, E_RANGE_ERROR, "CBOR string out of bounds");
+      reader_advance_checked(mrb, r, len);
+      return;
     }
 
     case 4: { /* array */
@@ -1893,6 +1918,24 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
   }
 }
 
+/*
+ * Normalize a (possibly negative) Ruby array index against a CBOR array
+ * of `len` elements.  Returns the normalized index in [0, len) or -1 if
+ * out of bounds.  Handles MRB_INT_MIN safely without signed overflow.
+ */
+static mrb_int
+cbor_normalize_index(mrb_int idx, uint64_t len)
+{
+  if (idx >= 0) {
+    if ((uint64_t)idx >= len) return -1;
+    return idx;
+  }
+  /* idx < 0: safe negation via -(idx+1)+1 avoids MRB_INT_MIN overflow */
+  uint64_t abs_idx = (uint64_t)(-(idx + 1)) + 1;
+  if (abs_idx > len) return -1;
+  return (mrb_int)(len - abs_idx);
+}
+
 /* Array-Zugriff */
 static mrb_value
 lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
@@ -1947,10 +1990,9 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
 
       if (key_is_str && (kmaj == 2 || kmaj == 3)) {
         uint64_t klen = read_len(mrb, r, kinfo);
+        reader_advance_checked(mrb, r, klen);
         match = (klen == (uint64_t)RSTRING_LEN(key) &&
-                (uint64_t)(r->end - r->p) >= klen &&
-                memcmp(r->p, RSTRING_PTR(key), klen) == 0);
-        r->p += klen;
+                memcmp(r->p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
       } else {
         r->p--;
         match = mrb_equal(mrb, decode_value(mrb, r, p->buf, sharedrefs), key);
@@ -2018,18 +2060,16 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
   if (likely(mrb_array_p(sharedrefs))) {
     mrb_value resolved;
     uint8_t major = lazy_resolve_tags(mrb, &r, sharedrefs, &resolved);
-    if (major == 0xFF) {
-      /* Tag29: delegate to the referenced Lazy */
-      if (mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type)) {
-        return cbor_lazy_aref(mrb, resolved, key);
-      }
-      mrb_raise(mrb, E_TYPE_ERROR, "sharedref target is not indexable");
-    }
     switch (major) {
       case 4:
         return lazy_aref_array(mrb, &r, key, self, p, sharedrefs);
       case 5:
         return lazy_aref_map(mrb, &r, key, self, p, sharedrefs);
+      case 0xFF: {
+        if (mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type)) {
+          return cbor_lazy_aref(mrb, resolved, key);
+        }
+      }
       default:
         mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
     }
@@ -2152,10 +2192,9 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 
           if (key_is_str && (kmaj == 2 || kmaj == 3)) {
             uint64_t klen = read_len(mrb, &r, kinfo);
+            reader_advance_checked(mrb, &r, klen);
             match = (klen == (uint64_t)RSTRING_LEN(key) &&
-                     (uint64_t)(r.end - r.p) >= klen &&
-                     memcmp(r.p, RSTRING_PTR(key), klen) == 0);
-            r.p += klen;
+                     memcmp(r.p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
           } else {
             r.p--;
             match = mrb_equal(mrb, decode_value(mrb, &r, p->buf, sharedrefs), key);
@@ -2219,6 +2258,10 @@ lazy_end_offset(mrb_state *mrb, mrb_value self)
 
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   const uint8_t *ptr  = base + p->offset;
+  const uint8_t *end  = base + (size_t)RSTRING_LEN(p->buf);
+
+  if (unlikely(ptr >= end))
+    mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
 
   uint8_t info = ptr[0] & 0x1F;
 
@@ -2227,14 +2270,20 @@ lazy_end_offset(mrb_state *mrb, mrb_value self)
 
   switch (info) {
     case 24:
+      if (unlikely(ptr + 2 > end))
+        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
       payload_len = ptr[1];
       header_len = 2;
       break;
     case 25:
+      if (unlikely(ptr + 3 > end))
+        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
       payload_len = ((size_t)ptr[1] << 8) | ptr[2];
       header_len = 3;
       break;
     case 26:
+      if (unlikely(ptr + 5 > end))
+        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
       payload_len = ((size_t)ptr[1] << 24) |
                     ((size_t)ptr[2] << 16) |
                     ((size_t)ptr[3] << 8)  |
@@ -2242,6 +2291,8 @@ lazy_end_offset(mrb_state *mrb, mrb_value self)
       header_len = 5;
       break;
     case 27:
+      if (unlikely(ptr + 9 > end))
+        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
       payload_len = ((uint64_t)ptr[1] << 56) |
                     ((uint64_t)ptr[2] << 48) |
                     ((uint64_t)ptr[3] << 40) |
@@ -2253,7 +2304,7 @@ lazy_end_offset(mrb_state *mrb, mrb_value self)
       header_len = 9;
       break;
     default:
-      payload_len = info; // info < 24
+      payload_len = info; /* info < 24 */
   }
 
   size_t end_offset = p->offset + header_len + payload_len;

@@ -78,22 +78,22 @@ typedef struct {
   mrb_value seen;
 } CborWriter;
 
-/* Forward declarations — Reader and CborWriter must be defined first */
+/* Forward declarations */
 static mrb_value cbor_tag_registry(mrb_state *mrb);
 static mrb_value cbor_tag_rev_registry(mrb_state *mrb);
 static void      encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num);
 static mrb_value decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value klass);
 
 /* Safe pointer-diff -> mrb_int. Raises if negative or > MRB_INT_MAX. */
-static inline mrb_int
+static mrb_int
 cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
 {
   ptrdiff_t d = p - base;
-  if (unlikely(d < 0 || d > (ptrdiff_t)MRB_INT_MAX))
-    mrb_raise(mrb, E_RANGE_ERROR, "CBOR offset out of range");
-  return (mrb_int)d;
+  if (likely(d >= 0 && d <= (ptrdiff_t)MRB_INT_MAX))
+    return (mrb_int)d;
+  mrb_raise(mrb, E_RANGE_ERROR, "CBOR offset out of range");
+  return 0;
 }
-
 
 #ifndef _WIN32
 # include <sys/types.h>
@@ -104,92 +104,76 @@ cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
 #else
 # include <windows.h>
 #endif
-/* ============================================================
- * scalar fallback
- * ============================================================ */
 
-static inline uint8_t hex_nibble(uint8_t c)
+static uint8_t hex_nibble(uint8_t c)
 {
-    /* '0'-'9': bit6 = 0  ->  (c & 0xF) + 0
-       'a'-'f': bit6 = 1  ->  (c & 0xF) + 9
-       'A'-'F': bit6 = 1  ->  (c & 0xF) + 9   */
-    return (uint8_t)((c & 0xF) + ((c >> 6) & 1) * 9);
+  return (uint8_t)((c & 0xF) + ((c >> 6) & 1) * 9);
 }
 
 static void
 hex_decode_scalar(uint8_t * restrict out, const char * restrict in, size_t n)
 {
-    /* n = Anzahl Output-Bytes (= len/2) */
-    for (size_t i = 0; i < n; i++) {
-        out[i] = (uint8_t)(
-            (hex_nibble((uint8_t)in[2*i    ]) << 4) |
-             hex_nibble((uint8_t)in[2*i + 1])
-        );
-    }
+  for (size_t i = 0; i < n; i++) {
+    out[i] = (uint8_t)(
+      (hex_nibble((uint8_t)in[2*i    ]) << 4) |
+       hex_nibble((uint8_t)in[2*i + 1])
+    );
+  }
 }
 
 // ============================================================================
-// Reader
+// Reader: CBOR unsigned integer → mrb_value
 // ============================================================================
-typedef struct {
-  uint64_t v;
-  uint8_t size;
-} Num;
 
-static Num
-read_num(mrb_state* mrb, Reader* r, uint8_t info)
+/*
+ * Read a CBOR unsigned integer (additional info already consumed as `info`)
+ * and return it as mrb_value.  Handles info < 24; reads extra bytes
+ * for info 24..27.  Raises on indefinite-length (31) or bogus info.
+ *
+ * Replaces the old Num struct + read_num + read_len pair.
+ */
+static mrb_value
+read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
 {
-  Num out;
-  out.v    = 0;
-  out.size = 0;
+  if (info < 24) return mrb_fixnum_value(info);
 
   const uint8_t* p   = r->p;
   const uint8_t* end = r->end;
 
-  if (info < 24) {
-    out.v = info;
-    out.size = 1;
-    return out;
-  }
-
   switch (info) {
     case 24:
-      if (likely(end - p >= 1)) {
-        out.v    = p[0];
-        out.size = 1;
-        r->p     = p + 1;
-        return out;
+      if (likely(p < end)) {
+        r->p++;
+        return mrb_convert_uint8(mrb, p[0]);
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint8");
-      return out;
+      break;
 
     case 25:
       if (likely(end - p >= 2)) {
-        out.v    = ((uint16_t)p[0] << 8) | p[1];
-        out.size = 2;
-        r->p     = p + 2;
-        return out;
+        r->p += 2;
+        return mrb_convert_uint16(mrb,
+          ((uint16_t)p[0] << 8) | p[1]);
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint16");
-      return out;
+      break;
 
     case 26:
       if (likely(end - p >= 4)) {
-        out.v =
+        r->p += 4;
+        return mrb_convert_uint32(mrb,
           ((uint32_t)p[0] << 24) |
           ((uint32_t)p[1] << 16) |
           ((uint32_t)p[2] << 8)  |
-          ((uint32_t)p[3]);
-        out.size = 4;
-        r->p     = p + 4;
-        return out;
+          ((uint32_t)p[3]));
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint32");
-      return out;
+      break;
 
     case 27:
       if (likely(end - p >= 8)) {
-        out.v =
+        r->p += 8;
+        return mrb_convert_uint64(mrb,
           ((uint64_t)p[0] << 56) |
           ((uint64_t)p[1] << 48) |
           ((uint64_t)p[2] << 40) |
@@ -197,161 +181,156 @@ read_num(mrb_state* mrb, Reader* r, uint8_t info)
           ((uint64_t)p[4] << 24) |
           ((uint64_t)p[5] << 16) |
           ((uint64_t)p[6] << 8)  |
-          ((uint64_t)p[7]);
-        out.size = 8;
-        r->p     = p + 8;
-        return out;
+          ((uint64_t)p[7]));
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint64");
-      return out;
-    case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+      break;
+
+    case 31:
+      mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+      break;
   }
 
   mrb_raisef(mrb, E_RUNTIME_ERROR, "invalid integer encoding: %d", info);
-  return out;
-}
-
-static mrb_value
-decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
-{
-  Num n = read_num(mrb, r, info);
-
-  switch (n.size) {
-    case 1: return mrb_convert_uint8(mrb, n.v);
-    case 2: return mrb_convert_uint16(mrb, n.v);
-    case 4: return mrb_convert_uint32(mrb, n.v);
-    case 8: return mrb_convert_uint64(mrb, n.v);
-  }
-
-  mrb_raise(mrb, E_RANGE_ERROR, "invalid integer size");
   return mrb_undef_value();
 }
 
-static mrb_value
-decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
+/*
+ * Extract mrb_int from a CBOR length/count mrb_value for use as a C loop
+ * bound, offset, or byte count.  Raises RangeError if the value is not a
+ * fixnum (e.g. a Bigint that would never fit in an allocation) or negative.
+ */
+static mrb_int
+cbor_value_to_len(mrb_state *mrb, mrb_value v)
 {
-  Num n = read_num(mrb, r, info);
-
-  switch (n.size) {
-    case 1: return mrb_convert_int8(mrb,  (int8_t)(-1 - (uint8_t)n.v));
-    case 2: return mrb_convert_int16(mrb, (int16_t)(-1 - (uint16_t)n.v));
-    case 4: return mrb_convert_int32(mrb, (int32_t)(-1 - (uint32_t)n.v));
-    case 8: return mrb_convert_int64(mrb, (int64_t)(-1 - (uint64_t)n.v));
+  if (likely(mrb_integer_p(v))) {
+    mrb_int n = mrb_integer(v);
+    if (likely(n >= 0)) return n;
   }
-
-  mrb_raise(mrb, E_RANGE_ERROR, "invalid integer size");
-  return mrb_undef_value();
+  mrb_raise(mrb, E_RANGE_ERROR, "CBOR length out of range");
+  return 0; /* unreachable */
 }
 
 // ============================================================================
 // Length / bounds helpers
 // ============================================================================
-static uint64_t
-read_len(mrb_state* mrb, Reader* r, uint8_t info)
-{
-  if (info < 24) return info;
-  Num n = read_num(mrb, r, info);
-  return n.v;
-}
 
 /*
- * Validate `len` fits in mrb_int, that there are enough bytes remaining,
- * and advance r->p by len.  Single chokepoint for all "skip N raw bytes" sites.
+ * Validate that `len` bytes are available starting at r->p and advance r->p.
+ * Single chokepoint for all "skip N raw bytes" sites.
  */
 static void
-reader_advance_checked(mrb_state *mrb, Reader *r, uint64_t len)
+reader_advance_checked(mrb_state *mrb, Reader *r, mrb_int len)
 {
-  if (likely(len <= (uint64_t)MRB_INT_MAX &&
+  if (likely(len >= 0 &&
              r->p <= r->end &&
-             (uint64_t)(r->end - r->p) >= len)) {
+             (mrb_int)(r->end - r->p) >= len)) {
     r->p += len;
     return;
   }
-  if (len > (uint64_t)MRB_INT_MAX)
-    mrb_raise(mrb, E_RANGE_ERROR, "CBOR length too large");
   mrb_raise(mrb, E_RANGE_ERROR, "CBOR data out of bounds");
 }
 
 static void
-ensure_slice_bounds(mrb_state* mrb, mrb_value src, size_t off, uint64_t len)
+ensure_slice_bounds(mrb_state* mrb, mrb_value src, mrb_int off, mrb_int blen)
 {
-  size_t slen = (size_t)RSTRING_LEN(src);
-
-  /* Fast path: alles im gueltigen Bereich, ohne Overflow-Risiko */
-  if (likely(off <= slen && len <= slen - off)) {
+  mrb_int slen = RSTRING_LEN(src);
+  if (likely(off >= 0 && blen >= 0 && off <= slen && blen <= slen - off))
     return;
+  mrb_raise(mrb, E_RANGE_ERROR, "slice out of bounds");
+}
+
+// ============================================================================
+// Integers
+// ============================================================================
+static mrb_value
+decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
+{
+  return read_cbor_uint(mrb, r, info);
+}
+
+static mrb_value
+decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
+{
+  mrb_value n = read_cbor_uint(mrb, r, info);
+
+  if (likely(mrb_integer_p(n))) {
+    /* n in [0, MRB_INT_MAX]; -1 - n in [MRB_INT_MIN, -1] — always representable */
+    return mrb_int_value(mrb, -1 - mrb_integer(n));
   }
 
-  /* Slow path: irgendwas ist out of bounds */
-  mrb_raise(mrb, E_RANGE_ERROR, "slice out of bounds");
+#ifdef MRB_USE_BIGINT
+  else if (mrb_bigint_p(n)) {
+    /* n is a Bigint: result = -(n + 1) */
+    mrb_value np1 = mrb_bint_add(mrb, n, mrb_fixnum_value(1));
+    return mrb_bint_neg(mrb, np1);
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "paylod is not a number");
+  }
+#else
+  mrb_raise(mrb, E_RANGE_ERROR, "negative integer out of range");
+  return mrb_undef_value();
+#endif
 }
 
 // ============================================================================
 // Bytes / Text
 // ============================================================================
+static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs);
+
 static mrb_value
 decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
-  uint64_t blen = read_len(mrb, r, info);
-  if (unlikely(blen > (uint64_t)MRB_INT_MAX))
-    mrb_raise(mrb, E_RANGE_ERROR, "CBOR text string length too large");
+  mrb_value blen_v = read_cbor_uint(mrb, r, info);
+  mrb_int blen = cbor_value_to_len(mrb, blen_v);
+  mrb_int off = cbor_pdiff(mrb, r->p, r->base);
 
-  ptrdiff_t off = r->p - r->base;
-  if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
-
-  if (likely((mrb_int)blen <= RSTRING_LEN(src) - (mrb_int)off)) {
-    mrb_value slice = mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
+  if (likely(blen <= RSTRING_LEN(src) - off)) {
+    mrb_value slice = mrb_str_byte_subseq(mrb, src, off, blen);
 
 #ifdef MRB_UTF8_STRING
     if (likely(mrb_str_is_utf8(slice))) {
       r->p += blen;
       return slice;
-    } else {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
     }
+    mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
 #else
-      r->p += blen;
-      return slice;
+    r->p += blen;
+    return slice;
 #endif
-  } else {
-      mrb_raise(mrb, E_RANGE_ERROR, "text string out of bounds");
-      return mrb_undef_value();
   }
+  mrb_raise(mrb, E_RANGE_ERROR, "text string out of bounds");
+  return mrb_undef_value();
 }
 
 static mrb_value
 decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
-  uint64_t blen = read_len(mrb, r, info);
-  if (unlikely(blen > (uint64_t)MRB_INT_MAX))
-    mrb_raise(mrb, E_RANGE_ERROR, "CBOR byte string length too large");
+  mrb_value blen_v = read_cbor_uint(mrb, r, info);
+  mrb_int blen = cbor_value_to_len(mrb, blen_v);
+  mrb_int off = cbor_pdiff(mrb, r->p, r->base);
 
-  ptrdiff_t off = r->p - r->base;
-  if (unlikely(off < 0)) mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
-
-  if (likely((mrb_int)blen <= RSTRING_LEN(src) - (mrb_int)off)) {
+  if (likely(blen <= RSTRING_LEN(src) - off)) {
     r->p += blen;
-    return mrb_str_byte_subseq(mrb, src, (mrb_int)off, (mrb_int)blen);
-  } else {
-    mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
+    return mrb_str_byte_subseq(mrb, src, off, blen);
   }
-
+  mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
   return mrb_undef_value();
 }
-static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs);
 
 static mrb_value
 decode_array(mrb_state* mrb, Reader* r, mrb_value src,
              uint8_t info, mrb_value shared, bool reg)
 {
-  uint64_t len = read_len(mrb, r, info);
+  mrb_value len_v = read_cbor_uint(mrb, r, info);
+  mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value ary = mrb_ary_new(mrb);
 
   if (reg) {
     mrb_ary_push(mrb, shared, ary);
   }
 
-  for (uint64_t i = 0; i < len; i++) {
+  for (mrb_int i = 0; i < len; i++) {
     mrb_value v = decode_value(mrb, r, src, shared);
     mrb_ary_push(mrb, ary, v);
   }
@@ -363,14 +342,15 @@ static mrb_value
 decode_map(mrb_state* mrb, Reader* r, mrb_value src,
            uint8_t info, mrb_value shared, bool reg)
 {
-  uint64_t len = read_len(mrb, r, info);
+  mrb_value len_v = read_cbor_uint(mrb, r, info);
+  mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value hash = mrb_hash_new(mrb);
 
   if (reg) {
     mrb_ary_push(mrb, shared, hash);
   }
 
-  for (uint64_t i = 0; i < len; i++) {
+  for (mrb_int i = 0; i < len; i++) {
     mrb_value key = decode_value(mrb, r, src, shared);
     mrb_value val = decode_value(mrb, r, src, shared);
     mrb_hash_set(mrb, hash, key, val);
@@ -468,6 +448,7 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 
     default:
       mrb_raise(mrb, E_RUNTIME_ERROR, "invalid float encoding");
+      f = 0;
   }
 
   return mrb_float_value(mrb, f);
@@ -476,7 +457,7 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 
 #ifdef MRB_USE_BIGINT
 static mrb_value
-decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
+decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 {
   mrb_int idx = mrb_gc_arena_save(mrb);
 
@@ -486,67 +467,64 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, uint64_t tag)
   uint8_t info2  = (uint8_t)(b2 & 0x1F);
 
   if (likely(major2 == 2)) {
-    uint64_t len = read_len(mrb, r, info2);
-    if (unlikely(len > (uint64_t)MRB_INT_MAX))
-      mrb_raise(mrb, E_RANGE_ERROR, "CBOR bignum length too large");
+    mrb_value len_v = read_cbor_uint(mrb, r, info2);
+    mrb_int len = cbor_value_to_len(mrb, len_v);
+
     if (likely(len > 0)) {
       ptrdiff_t off = r->p - r->base;
       if (likely(off >= 0)) {
-        ensure_slice_bounds(mrb, src, (size_t)off, len);
+        ensure_slice_bounds(mrb, src, (mrb_int)off, len);
         r->p += len;
 
         const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
-        mrb_bool negative = (tag == 3);
+        mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
 
-        const uint8_t* bigbuf = buf;   /* pointer we will actually use */
+        const uint8_t* bigbuf = buf;
 
-  #ifndef MRB_ENDIAN_BIG
-        /* Only reverse if len > 1 */
+#ifndef MRB_ENDIAN_BIG
         if (likely(len > 1)) {
           uint8_t *tmp = mrb_alloca(mrb, len);
           memcpy(tmp, buf, len);
-
-          /* Reverse for little-endian MRuby */
-          for (size_t i = 0, j = len - 1; i < j; i++, j--) {
+          for (mrb_int i = 0, j = len - 1; i < j; i++, j--) {
             uint8_t t = tmp[i];
             tmp[i] = tmp[j];
             tmp[j] = t;
           }
           bigbuf = tmp;
         }
-  #endif
+#endif
 
-        /* Convert bytes -> positive BigInt */
-        mrb_value n = mrb_bint_from_bytes(mrb, bigbuf, (mrb_int)len);
+        mrb_value n = mrb_bint_from_bytes(mrb, bigbuf, len);
         mrb_gc_arena_restore(mrb, idx);
         mrb_gc_protect(mrb, n);
 
         if (!negative)
           return n;
 
-        /* Tag 3: -(n+1) */
-
         if (mrb_integer_p(n)) {
           mrb_int v = mrb_integer(n);
-          mrb_int result = -1 - v;
-          mrb_value ret = mrb_int_value(mrb, result);
+          mrb_value ret = mrb_convert_int64(mrb, -1 - v);
           mrb_gc_arena_restore(mrb, idx);
           mrb_gc_protect(mrb, ret);
           return ret;
+        } else if (mrb_bigint_p(n)) {
+          mrb_value one = mrb_fixnum_value(1);
+          mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
+          mrb_value ret = mrb_bint_neg(mrb, n_plus_1);
+
+          mrb_gc_arena_restore(mrb, idx);
+          mrb_gc_protect(mrb, ret);
+          return ret;
+        } else {
+          mrb_bug(mrb, "mrb_bint_from_bytes didnt return a int or bigint");
         }
 
-        mrb_value one = mrb_fixnum_value(1);
-        mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
-        mrb_value ret = mrb_bint_neg(mrb, n_plus_1);
 
-        mrb_gc_arena_restore(mrb, idx);
-        mrb_gc_protect(mrb, ret);
-        return ret;
       } else {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
+        mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
       }
     } else {
-      mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
+      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
     }
   } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
@@ -560,7 +538,6 @@ static mrb_value
 decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
                      mrb_value src, mrb_value sharedrefs_array)
 {
-  // peek next byte
   uint8_t nb = reader_read8(mrb, r);
   uint8_t major = nb >> 5;
   uint8_t info  = nb & 0x1F;
@@ -570,13 +547,11 @@ decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
     case 5: return decode_map(mrb, r, src, info, sharedrefs_array, true);
   }
 
-  // scalar
   r->p--;
   mrb_value v = decode_value(mrb, r, src, sharedrefs_array);
   mrb_ary_push(mrb, sharedrefs_array, v);
   return v;
 }
-
 
 static mrb_value
 decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
@@ -587,7 +562,9 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
     uint8_t ref_info  = ref_b & 0x1F;
 
     if (likely(ref_major == 0)) {
-      mrb_value found = mrb_ary_ref(mrb, sharedrefs, read_len(mrb, r, ref_info));
+      mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
+      mrb_int idx = cbor_value_to_len(mrb, idx_v);
+      mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
 
       if (likely(!mrb_nil_p(found))) {
         return found;
@@ -601,20 +578,22 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
     mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
   }
 
-  return mrb_undef_value(); /* not reached */
+  return mrb_undef_value();
 }
 
-static uint8_t
+/*
+ * Symbol encoding strategy, stored and returned as mrb_value.
+ * 0 = symbols as strings (default)
+ * 1 = tag 39 + string
+ * 2 = tag 39 + uint32 symbol ID
+ */
+static mrb_value
 cbor_sym_strategy(mrb_state *mrb)
 {
   struct RClass *mod = mrb_module_get_id(mrb, MRB_SYM(CBOR));
   mrb_value v = mrb_iv_get(mrb, mrb_obj_value(mod), MRB_SYM(__sym_strat__));
-
-  if (mrb_nil_p(v)) {
-    return 0; /* default: Symbol-IDs verboten */
-  }
-
-  return mrb_fixnum(v);
+  if (mrb_nil_p(v)) return mrb_fixnum_value(0);
+  return v;
 }
 
 static void
@@ -627,18 +606,16 @@ cbor_set_sym_strategy(mrb_state *mrb, uint8_t mode)
 static mrb_value
 decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 {
-  uint8_t strategy = cbor_sym_strategy(mrb);
+  mrb_value strategy = cbor_sym_strategy(mrb);
 
-  if (strategy == 0) {
+  if (unlikely(mrb_cmp(mrb, strategy, mrb_fixnum_value(0)) == 0)) {
     mrb_raise(mrb, E_RUNTIME_ERROR,
       "tag 39 encountered but symbol decoding disabled");
   }
 
-  /* decode inner CBOR item */
   mrb_value v = decode_value(mrb, r, src, sharedrefs);
 
-  /* strategy 1: string → symbol */
-  if (strategy == 1) {
+  if (mrb_cmp(mrb, strategy, mrb_fixnum_value(1)) == 0) {
     if (likely(mrb_string_p(v))) {
       return mrb_symbol_value(mrb_intern_str(mrb, v));
     } else {
@@ -647,16 +624,13 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
     }
   }
 
-  /* strategy 2: uint32 → symbol id */
-  if (strategy == 2) {
+  if (mrb_cmp(mrb, strategy, mrb_fixnum_value(2)) == 0) {
     if (likely(mrb_integer_p(v))) {
       mrb_int n = mrb_integer(v);
-
       if (likely(n >= 0 && n <= UINT32_MAX)) {
         return mrb_symbol_value((mrb_sym)n);
       } else {
-        mrb_raise(mrb, E_RANGE_ERROR,
-                "invalid symbol ID size for tag 39");
+        mrb_raise(mrb, E_RANGE_ERROR, "invalid symbol ID size for tag 39");
       }
     } else {
       mrb_raise(mrb, E_TYPE_ERROR,
@@ -665,7 +639,7 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy");
-  return mrb_nil_value(); /* unreachable */
+  return mrb_nil_value();
 }
 
 // ============================================================================
@@ -686,46 +660,41 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
     case 4: return decode_array(mrb, r, src, info, sharedrefs, false);
     case 5: return decode_map(mrb, r, src, info, sharedrefs, false);
     case 6: {
-      uint64_t tag = read_len(mrb, r, info);
+      /* tag is already an mrb_value — no conversion needed for hash lookup or
+         ivar storage, and mrb_cmp handles all comparisons without C numerics */
+      mrb_value tag = read_cbor_uint(mrb, r, info);
 
-      switch (tag) {
-        case 2:
-        case 3: {
 #ifdef MRB_USE_BIGINT
-          return decode_tagged_bignum(mrb, r, src, tag);
-#else
-          goto unknown_tag;
-#endif
-
-        } break;
-
-        case 28: return decode_tag_sharedrefs(mrb, r, src, sharedrefs);
-        case 29: return decode_tag_sharedref(mrb, r, sharedrefs);
-
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(2)) == 0 ||
+          mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0) {
+        return decode_tagged_bignum(mrb, r, src, tag);
       }
-#ifndef MRB_USE_BIGINT
-unknown_tag:;
 #endif
+
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0)
+        return decode_tag_sharedrefs(mrb, r, src, sharedrefs);
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0)
+        return decode_tag_sharedref(mrb, r, sharedrefs);
 
       /* Check tag registry before falling back to UnhandledTag */
       {
-        mrb_value reg     = cbor_tag_registry(mrb);
-        mrb_value tag_key = mrb_convert_uint64(mrb, tag);
-        mrb_value klass   = mrb_hash_fetch(mrb, reg, tag_key, mrb_undef_value());
+        mrb_value reg   = cbor_tag_registry(mrb);
+        mrb_value klass = mrb_hash_fetch(mrb, reg, tag, mrb_undef_value());
         if (mrb_class_p(klass)) {
           return decode_registered_tag(mrb, r, src, sharedrefs, klass);
         }
       }
 
-      /* Tag 39: Symbol-ID */
-      if (tag == 39) {
+      /* Tag 39: Symbol */
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0)
         return decode_symbol(mrb, r, src, sharedrefs);
-      }
 
+      /* Unknown tag: wrap in UnhandledTag */
       mrb_value tagged_value = decode_value(mrb, r, src, sharedrefs);
-      struct RClass *unhandled_tag = mrb_class_get_under_id(mrb, mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
+      struct RClass *unhandled_tag = mrb_class_get_under_id(mrb,
+        mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
       mrb_value result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
-      mrb_iv_set(mrb, result, MRB_IVSYM(tag), mrb_convert_uint64(mrb, tag));
+      mrb_iv_set(mrb, result, MRB_IVSYM(tag),   tag);   /* already mrb_value */
       mrb_iv_set(mrb, result, MRB_IVSYM(value), tagged_value);
       return result;
     }
@@ -788,7 +757,6 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
   mrb_state *mrb = w->mrb;
   size_t stack_len = w->stack_len;
 
-  /* Fast path: Addition ohne Overflow moeglich */
   if (likely(need <= SIZE_MAX - stack_len)) {
     size_t initial = stack_len + need;
     size_t capa = next_pow2(initial);
@@ -809,7 +777,6 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
     return;
   }
 
-  /* Slow path: Overflow -> Fehler */
   mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
 }
 
@@ -819,12 +786,10 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
   size_t heap_len  = w->heap_len;
   size_t heap_capa = w->heap_capa;
 
-  /* Fast path: genug Platz, keine Arbeit */
   if (likely(add <= heap_capa - heap_len)) {
     return;
   }
 
-  /* Jetzt muessen wir wachsen; Overflow dabei verhindern, aber wieder mit positivem likely-Guard */
   if (likely(add <= SIZE_MAX - heap_len)) {
     size_t need = heap_len + add;
     size_t capa = next_pow2(need);
@@ -846,7 +811,6 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
   if (likely(len > 0)) {
     size_t stack_len = w->stack_len;
 
-    /* Fast path: nur Stack, kein Overflow */
     if (likely(mrb_undef_p(w->heap_str) &&
               len <= CBOR_SBO_STACK_CAP - stack_len)) {
 
@@ -854,11 +818,8 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
       w->stack_len = stack_len + len;
 
     } else {
-      /* Slow path: entweder Heap noetig oder Overflow im Stack-Pfad */
 
-      /* Heap initialisieren, falls noch nicht geschehen */
       if (mrb_undef_p(w->heap_str)) {
-        /* positiver Overflow-Guard */
         if (likely(len <= SIZE_MAX - stack_len)) {
           cbor_writer_init_heap(w, len);
         } else {
@@ -867,7 +828,6 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
         }
       }
 
-      /* Heap erweitern */
       cbor_writer_ensure_heap(w, len);
 
       memcpy(w->heap_ptr + w->heap_len, buf, len);
@@ -883,7 +843,6 @@ cbor_writer_finish(CborWriter *w)
   mrb_state *mrb = w->mrb;
 
   if (likely(mrb_undef_p(w->heap_str))) {
-    /* alles im Stack geblieben */
     return mrb_str_new(mrb,
                        (const char*)w->stack_buf,
                        (mrb_int)w->stack_len);
@@ -891,7 +850,6 @@ cbor_writer_finish(CborWriter *w)
     struct RString *s = RSTRING(w->heap_str);
     RSTR_SET_LEN(s, (mrb_int)w->heap_len);
     w->heap_ptr[w->heap_len] = '\0';
-
     return w->heap_str;
   } else {
     mrb_raise(mrb, E_TYPE_ERROR,"heap string is not a string");
@@ -970,30 +928,21 @@ encode_int64(CborWriter *w, int64_t n)
 // Shared reference tracking
 // ============================================================================
 
-/*
- * Returns TRUE  -> Tag 29 (sharedref) emitted, caller must NOT encode obj.
- * Returns FALSE -> Tag 28 (sharedrefs) emitted, caller MUST encode obj normally.
- */
 static mrb_bool
 encode_check_shared(CborWriter *w, mrb_value obj)
 {
   if (mrb_undef_p(w->seen)) return FALSE;
   mrb_state *mrb = w->mrb;
 
-  /* Use raw object pointer as key so we get identity comparison, not value
-     equality.  Two distinct [1,2] arrays with equal content must not be
-     treated as the same sharedrefs object. */
   mrb_value id_key = mrb_int_value(mrb, mrb_obj_id(obj));
   mrb_value found  = mrb_hash_get(mrb, w->seen, id_key);
 
   if (mrb_integer_p(found)) {
-    /* Already seen: emit Tag 29 + absolute index */
     uint8_t tag29[2] = { 0xD8, 0x1D };
     cbor_writer_write(w, tag29, 2);
     encode_len(w, 0, (uint64_t)mrb_integer(found));
     return TRUE;
   }
-
 
   mrb_hash_set(mrb, w->seen, id_key, mrb_int_value(mrb, mrb_hash_size(mrb, w->seen)));
 
@@ -1003,7 +952,7 @@ encode_check_shared(CborWriter *w, mrb_value obj)
 }
 
 // ============================================================================
-// BigInt encoding (Tag 2/3) - mrb_bint_to_s ist native endian -> korrigieren
+// BigInt encoding (Tag 2/3)
 // ============================================================================
 #ifdef MRB_USE_BIGINT
 static void
@@ -1014,7 +963,6 @@ encode_bignum(CborWriter *w, mrb_value obj)
 
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
-  /* Fast path: fits in 64 bits -> encode as normal integer, no tag/hex needed */
   if (mrb_bint_size(mrb, obj) <= 8) {
     if (sign >= 0) {
       encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
@@ -1024,8 +972,6 @@ encode_bignum(CborWriter *w, mrb_value obj)
     mrb_gc_arena_restore(mrb, idx);
     return;
   }
-
-  /* Slow path: truly large bigint -> Tag 2/3 + hex encode */
 
   mrb_value mag = mrb_bint_abs(mrb, obj);
 
@@ -1078,6 +1024,8 @@ static void encode_value(CborWriter* w, mrb_value obj);
 static void
 encode_array(CborWriter* w, mrb_value ary)
 {
+  unsigned int was_frozen = mrb_basic_ptr(ary)->frozen;
+  mrb_basic_ptr(ary)->frozen = TRUE;
   struct RArray *a = mrb_ary_ptr(ary);
 
   mrb_int len = ARY_LEN(a);
@@ -1088,6 +1036,7 @@ encode_array(CborWriter* w, mrb_value ary)
   for (mrb_int i = 0; i < len; i++) {
     encode_value(w, ptr[i]);
   }
+  mrb_basic_ptr(ary)->frozen = was_frozen;
 }
 
 static int
@@ -1098,23 +1047,23 @@ encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
   encode_value(w, key);
   encode_value(w, val);
 
-  return 0; /* continue */
+  return 0;
 }
 
 static void
 encode_map(CborWriter* w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
+  unsigned int was_frozen = mrb_basic_ptr(hash)->frozen;
+  mrb_basic_ptr(hash)->frozen = TRUE;
   struct RHash *h = mrb_hash_ptr(hash);
 
-  /* Anzahl der Paare */
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
 
-  /* direkte Iteration ueber Hash-Table */
   mrb_hash_foreach(mrb, h, encode_map_foreach, w);
+  mrb_basic_ptr(hash)->frozen = was_frozen;
 }
-
 
 // ============================================================================
 // Text
@@ -1126,10 +1075,8 @@ encode_string(CborWriter* w, mrb_value str)
   mrb_int blen  = RSTRING_LEN(str);
 
   if (mrb_str_is_utf8(str)) {
-    /* UTF-8 -> CBOR Text (Major 3) */
     encode_len(w, 3, (uint64_t)blen);
   } else {
-    /* Nicht UTF-8 -> CBOR Bytes (Major 2) */
     encode_len(w, 2, (uint64_t)blen);
   }
 
@@ -1148,19 +1095,20 @@ encode_simple(CborWriter* w, mrb_value obj)
 
     case MRB_TT_FALSE: {
       if (mrb_nil_p(obj)) {
-        b = 0xF6;   /* null */
+        b = 0xF6;
       } else {
-        b = 0xF4;   /* false */
+        b = 0xF4;
       }
     } break;
 
     case MRB_TT_TRUE:
-      b = 0xF5;     /* true */
+      b = 0xF5;
       break;
 
     default: {
       mrb_state *mrb = w->mrb;
       mrb_raise(mrb, E_TYPE_ERROR, "unexpected simple value");
+      b = 0;
     } break;
   }
   cbor_writer_write(w, &b, 1);
@@ -1204,22 +1152,16 @@ static void
 encode_sym(CborWriter *w, mrb_value obj)
 {
   mrb_state *mrb = w->mrb;
-  uint8_t mode = cbor_sym_strategy(mrb);
+  mrb_value mode = cbor_sym_strategy(mrb);
 
-  /* ---------------------------------------------------------
-   * MODE 0: Symbol → UTF‑8‑String
-   * --------------------------------------------------------- */
-  if (mode == 0) {
+  if (mrb_cmp(mrb, mode, mrb_fixnum_value(0)) == 0) {
     mrb_sym s = mrb_symbol(obj);
     mrb_value str = mrb_sym2str(mrb, s);
     encode_string(w, str);
     return;
   }
 
-  /* ---------------------------------------------------------
-   * MODE 1: Symbol als String
-   * --------------------------------------------------------- */
-  if (mode == 1) {
+  if (mrb_cmp(mrb, mode, mrb_fixnum_value(1)) == 0) {
     mrb_sym s = mrb_symbol(obj);
     mrb_value str = mrb_sym2str(mrb, s);
     encode_len(w, 6, 39);
@@ -1227,22 +1169,13 @@ encode_sym(CborWriter *w, mrb_value obj)
     return;
   }
 
-  /* ---------------------------------------------------------
-   * MODE 2: Symbol‑IDs erzwingen → Tag 39 + uint32
-   * --------------------------------------------------------- */
-  if (mode == 2) {
+  if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
     mrb_sym s = mrb_symbol(obj);
-
-    /* Tag 39 */
-    encode_len(w, 6, 39);          /* major 6 = tag */
-
-    /* Payload: uint32 Symbol-ID */
-    encode_len(w, 0, s); /* major 0 = unsigned int */
-
+    encode_len(w, 6, 39);
+    encode_len(w, 0, s);
     return;
   }
 
-  /* sollte nie passieren */
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy mode");
 }
 
@@ -1296,7 +1229,6 @@ encode_value(CborWriter* w, mrb_value obj)
 #endif
 
     default: {
-      /* Check reverse registry: class → tag number */
       mrb_value rev     = cbor_tag_rev_registry(mrb);
       mrb_value klass   = mrb_obj_value(mrb_class(mrb, obj));
       mrb_value tag_val = mrb_hash_fetch(mrb, rev, klass, mrb_undef_value());
@@ -1363,8 +1295,8 @@ mrb_cbor_decode(mrb_state* mrb, mrb_value self)
 // ============================================================================
 
 typedef struct {
-  mrb_value buf;    /* kompletter CBOR-String */
-  mrb_int   offset; /* Start dieses Elements im buf (Byte-Index relativ zu base) */
+  mrb_value buf;
+  mrb_int   offset;
 } cbor_lazy_t;
 
 static const struct mrb_data_type cbor_lazy_type = {
@@ -1394,15 +1326,6 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedref
 
 /* ============================================================
  * Tag registry
- * ============================================================
- * @__cbor_tag_registry__     Integer → Class   (decode path)
- * @__cbor_tag_rev_registry__ Class   → Integer (encode path)
- *
- * Encode: for unknown object types, check reverse registry.
- *   Emit tag number, then encode net-schema ivars as a CBOR map.
- * Decode unknown tag: check forward registry.
- *   Allocate bare instance, populate ivars from CBOR map payload
- *   using net schema as the field list.
  * ============================================================ */
 
 static mrb_value
@@ -1426,7 +1349,6 @@ cbor_tag_rev_registry(mrb_state *mrb)
   mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_tag_rev_registry__));
   if (likely(mrb_hash_p(reg))) {
     return reg;
-
   } else {
     reg = mrb_hash_new(mrb);
     mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_tag_rev_registry__), reg);
@@ -1437,26 +1359,29 @@ cbor_tag_rev_registry(mrb_state *mrb)
 static mrb_value
 mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
 {
-  mrb_int   tag_num;
+  mrb_value tag_v;
   mrb_value klass;
-  mrb_get_args(mrb, "iC", &tag_num, &klass);
+  mrb_get_args(mrb, "oC", &tag_v, &klass);
 
-  /* Reject tags we handle internally */
-  if (tag_num == 2  || tag_num == 3  ||   /* bignum */
-      tag_num == 28 || tag_num == 29 || /* shared refs */
-      tag_num == 39) /* symbols */
-    mrb_raisef(mrb, E_ARGUMENT_ERROR,
-      "tag %d is reserved for internal CBOR use", tag_num);
+  if (!mrb_integer_p(tag_v))
+    mrb_raise(mrb, E_TYPE_ERROR, "tag must be an integer");
+
+  /* Reject tags reserved for internal use */
+  static const int reserved[] = { 2, 3, 28, 29, 39 };
+  for (uint8_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    if (unlikely(mrb_cmp(mrb, tag_v, mrb_fixnum_value(reserved[i])) == 0))
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "tag %v is reserved for internal CBOR use", tag_v);
+  }
 
   mrb_value fwd = cbor_tag_registry(mrb);
   mrb_value rev = cbor_tag_rev_registry(mrb);
-  mrb_value key = mrb_int_value(mrb, tag_num);
 
   {
     struct RClass *kp_check = mrb_class_ptr(klass);
-    if (MRB_INSTANCE_TT(kp_check) != MRB_TT_OBJECT)
+    if (unlikely(MRB_INSTANCE_TT(kp_check) != MRB_TT_OBJECT))
       mrb_raise(mrb, E_TYPE_ERROR, "registered tag class must be a plain Ruby class (not CDATA or other native type)");
-    if (kp_check == mrb->string_class  ||
+    if (unlikely(kp_check == mrb->string_class  ||
         kp_check == mrb->array_class   ||
         kp_check == mrb->hash_class    ||
         kp_check == mrb->float_class   ||
@@ -1465,16 +1390,16 @@ mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
         kp_check == mrb->false_class   ||
         kp_check == mrb->nil_class     ||
         kp_check == mrb->symbol_class  ||
-        kp_check == mrb->eException_class)
+        kp_check == mrb->eException_class))
       mrb_raise(mrb, E_TYPE_ERROR, "cannot register built-in class as CBOR tag");
   }
 
-  mrb_hash_set(mrb, fwd, key,   klass);
-  mrb_hash_set(mrb, rev, klass, key);
+  /* tag_v is already mrb_value — use directly as hash key */
+  mrb_hash_set(mrb, fwd, tag_v, klass);
+  mrb_hash_set(mrb, rev, klass, tag_v);
 
   return mrb_nil_value();
 }
-
 
 static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 
@@ -1483,9 +1408,6 @@ typedef struct {
   mrb_value   obj;
 } TagEncodeCtx;
 
-/* Encode an object whose class is registered in the tag registry.
-   Emits: Tag(n) + CBOR map of ivar_name(string) → ivar_value
-   for every ivar declared in the net schema. */
 static int
 encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, void *data)
 {
@@ -1493,7 +1415,6 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   CborWriter *w = ctx->w;
   mrb_value obj = ctx->obj;
 
-  /* Key: emit ivar name as CBOR text, stripping leading '@' */
   mrb_int slen;
   const char *sname = mrb_sym_name_len(mrb, mrb_symbol(sym), &slen);
   while (slen > 0 && sname[0] == '@') { sname++; slen--; }
@@ -1501,45 +1422,28 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   encode_len(w, 3, (uint64_t)slen);
   cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
 
-  /* Value: read ivar, validate type, encode */
   mrb_value val = mrb_iv_get(mrb, obj, mrb_symbol(sym));
 
   if (mrb_integer_p(mask)) {
-    uint8_t actual_major = 6;  /* Default: alles was nicht in C encodiert wird → Tag */
+    /* actual_major is an internal bitmask index, not a CBOR value — uint8_t is correct here */
+    uint8_t actual_major = 6;
 
     switch (mrb_type(val)) {
-
-      /* ---------------------------------------------------------
-       * INTEGER → major 0 oder 1
-       * --------------------------------------------------------- */
       case MRB_TT_INTEGER: {
         mrb_int i = mrb_integer(val);
         actual_major = (i >= 0) ? 0 : 1;
         break;
       }
-
-      /* ---------------------------------------------------------
-       * STRING → UTF‑8? → major 3, sonst major 2
-       * --------------------------------------------------------- */
       case MRB_TT_STRING: {
         actual_major = mrb_str_is_utf8(val) ? 3 : 2;
         break;
       }
-
-      /* ---------------------------------------------------------
-       * ARRAY / HASH
-       * --------------------------------------------------------- */
       case MRB_TT_ARRAY:
         actual_major = 4;
         break;
-
       case MRB_TT_HASH:
         actual_major = 5;
         break;
-
-      /* ---------------------------------------------------------
-       * BOOL / FLOAT → major 7
-       * --------------------------------------------------------- */
       case MRB_TT_FALSE:
       case MRB_TT_TRUE:
 #ifndef MRB_NO_FLOAT
@@ -1547,47 +1451,29 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
 #endif
         actual_major = 7;
         break;
-
-      /* ---------------------------------------------------------
-       * BIGINT → klein = major 0/1, groß = Tag2/3 → major 6
-       * --------------------------------------------------------- */
 #ifdef MRB_USE_BIGINT
       case MRB_TT_BIGINT:
         if (mrb_bint_size(mrb, val) <= 8) {
-          mrb_int sign = mrb_bint_sign(mrb, val);
-          actual_major = (sign >= 0) ? 0 : 1;
+          actual_major = (mrb_bint_sign(mrb, val) >= 0) ? 0 : 1;
         } else {
           actual_major = 6;
         }
         break;
 #endif
-
-      /* ---------------------------------------------------------
-       * SYMBOL → hängt vom Symbol‑Modus ab
-       * --------------------------------------------------------- */
       case MRB_TT_SYMBOL: {
-        uint8_t mode = cbor_sym_strategy(mrb);
-
-        if (mode == 0 || mode == 1) {
-          /* Symbol → String/Bytes */
+        mrb_value mode = cbor_sym_strategy(mrb);
+        if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
+          actual_major = 6;
+        } else {
           mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
           actual_major = mrb_str_is_utf8(str) ? 3 : 2;
         }
-        else if (mode == 2) {
-          /* Symbol-ID → Tag 39 */
-          actual_major = 6;
-        }
         break;
       }
-
-      /* ---------------------------------------------------------
-       * DEFAULT → Tag
-       * --------------------------------------------------------- */
       default:
         actual_major = 6;
     }
 
-    /* Maskenprüfung */
     mrb_int allowed = mrb_integer(mask);
     if (unlikely(!((allowed >> actual_major) & 1))) {
       mrb_raisef(mrb, E_TYPE_ERROR,
@@ -1607,22 +1493,19 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
   encode_len(w, 6, (uint64_t)tag_num);
 
   mrb_value schema = mrb_net_schema(mrb, mrb_class(mrb, obj));
-  if (!mrb_hash_p(schema)) {
+  if (likely(mrb_hash_p(schema))) {
+    mrb_int n = mrb_hash_size(mrb, schema);
+    encode_len(w, 5, (uint64_t)n);
+
+    TagEncodeCtx ctx = { w, obj };
+
+    mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
+                    encode_registered_tag_foreach, &ctx);
+  } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "registered class has no ned schema");
   }
-
-  /* definite-length map */
-  mrb_int n = mrb_hash_size(mrb, schema);
-  encode_len(w, 5, (uint64_t)n);
-
-  TagEncodeCtx ctx = { w, obj };
-
-  mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
-                   encode_registered_tag_foreach, &ctx);
 }
 
-/* Decode a registered tag: allocate bare instance, populate ivars
-   from CBOR map payload using net schema as the field list. */
 typedef struct {
   mrb_value obj;
   mrb_value payload;
@@ -1633,7 +1516,6 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
 {
   decode_ctx *ctx = (decode_ctx*)data;
 
-  /* Build string key (without '@') */
   mrb_int slen;
   const char *sname = mrb_sym_name_len(mrb, mrb_symbol(sym), &slen);
   while (slen > 0 && sname[0] == '@') { sname++; slen--; }
@@ -1642,42 +1524,24 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   mrb_value val = mrb_hash_fetch(mrb, ctx->payload, map_key, mrb_undef_value());
 
   if (!mrb_undef_p(val) && mrb_integer_p(mask)) {
-
-    uint8_t actual_major = 6; /* Default: alles was nicht in C decodiert wird → Tag */
+    uint8_t actual_major = 6;
 
     switch (mrb_type(val)) {
-
-      /* ---------------------------------------------------------
-       * INTEGER → major 0 oder 1
-       * --------------------------------------------------------- */
       case MRB_TT_INTEGER: {
         mrb_int i = mrb_integer(val);
         actual_major = (i >= 0) ? 0 : 1;
         break;
       }
-
-      /* ---------------------------------------------------------
-       * STRING → UTF‑8? → major 3, sonst major 2
-       * --------------------------------------------------------- */
       case MRB_TT_STRING: {
         actual_major = mrb_str_is_utf8(val) ? 3 : 2;
         break;
       }
-
-      /* ---------------------------------------------------------
-       * ARRAY / HASH
-       * --------------------------------------------------------- */
       case MRB_TT_ARRAY:
         actual_major = 4;
         break;
-
       case MRB_TT_HASH:
         actual_major = 5;
         break;
-
-      /* ---------------------------------------------------------
-       * BOOL / FLOAT → major 7
-       * --------------------------------------------------------- */
       case MRB_TT_FALSE:
       case MRB_TT_TRUE:
 #ifndef MRB_NO_FLOAT
@@ -1685,47 +1549,29 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
 #endif
         actual_major = 7;
         break;
-
-      /* ---------------------------------------------------------
-       * BIGINT → klein = major 0/1, groß = Tag2/3 → major 6
-       * --------------------------------------------------------- */
 #ifdef MRB_USE_BIGINT
       case MRB_TT_BIGINT:
         if (mrb_bint_size(mrb, val) <= 8) {
-          mrb_int sign = mrb_bint_sign(mrb, val);
-          actual_major = (sign >= 0) ? 0 : 1;
+          actual_major = (mrb_bint_sign(mrb, val) >= 0) ? 0 : 1;
         } else {
           actual_major = 6;
         }
         break;
 #endif
-
-      /* ---------------------------------------------------------
-       * SYMBOL → hängt vom Symbol‑Modus ab
-       * --------------------------------------------------------- */
       case MRB_TT_SYMBOL: {
-        uint8_t mode = cbor_sym_strategy(mrb);
-
-        if (mode == 0 || mode == 1) {
-          /* Symbol → String/Bytes */
+        mrb_value mode = cbor_sym_strategy(mrb);
+        if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
+          actual_major = 6;
+        } else {
           mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
           actual_major = mrb_str_is_utf8(str) ? 3 : 2;
         }
-        else if (mode == 2) {
-          /* Symbol-ID → Tag 39 */
-          actual_major = 6;
-        }
         break;
       }
-
-      /* ---------------------------------------------------------
-       * DEFAULT → Tag
-       * --------------------------------------------------------- */
       default:
         actual_major = 6;
     }
 
-    /* Maskenprüfung */
     mrb_int allowed = mrb_integer(mask);
     if (unlikely(!((allowed >> actual_major) & 1))) {
       mrb_raisef(mrb, E_TYPE_ERROR,
@@ -1767,7 +1613,7 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
     mrb_raise(mrb, E_TYPE_ERROR, "registered tag payload must be a map");
   }
 
-  return mrb_undef_value(); // not reachable
+  return mrb_undef_value();
 }
 
 static void
@@ -1784,26 +1630,29 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
 
     case 0: /* unsigned integer */
     case 1: /* negative integer */
-      if (info >= 24) read_num(mrb, r, info);
+      if (info >= 24) read_cbor_uint(mrb, r, info); /* consume extra bytes */
       return;
 
     case 2: /* byte string */
     case 3: { /* text string */
-      uint64_t len = read_len(mrb, r, info);
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      mrb_int len = cbor_value_to_len(mrb, len_v);
       reader_advance_checked(mrb, r, len);
       return;
     }
 
     case 4: { /* array */
-      uint64_t len = read_len(mrb, r, info);
-      for (uint64_t i = 0; i < len; i++)
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      mrb_int len = cbor_value_to_len(mrb, len_v);
+      for (mrb_int i = 0; i < len; i++)
         skip_cbor(mrb, r, buf, sharedrefs);
       return;
     }
 
     case 5: { /* map */
-      uint64_t len = read_len(mrb, r, info);
-      for (uint64_t i = 0; i < len; i++) {
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      mrb_int len = cbor_value_to_len(mrb, len_v);
+      for (mrb_int i = 0; i < len; i++) {
         skip_cbor(mrb, r, buf, sharedrefs); /* key */
         skip_cbor(mrb, r, buf, sharedrefs); /* value */
       }
@@ -1811,22 +1660,18 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     }
 
     case 6: {
-      uint64_t tag = read_len(mrb, r, info);
+      mrb_value tag = read_cbor_uint(mrb, r, info);
 
-        if (tag == 28) {
-          if (likely(mrb_array_p(sharedrefs))) {
-
-            mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
-            mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
-
-            /* forward:  index → Lazy  (for Tag29 lookups) */
-            mrb_ary_push(mrb, sharedrefs, lazy);
-
-          } else {
-            mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
-          }
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
+        if (likely(mrb_array_p(sharedrefs))) {
+          mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
+          mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
+          mrb_ary_push(mrb, sharedrefs, lazy);
+        } else {
+          mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
         }
-        /* tag 29: just skip the uint index, nothing to register */
+      }
+      /* tag 29: just skip the uint index, nothing to register */
 
       skip_cbor(mrb, r, buf, sharedrefs);
       return;
@@ -1851,7 +1696,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
   mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
 }
 
-/* Lazy#value: vollstaendiges Dekodieren ab Element-Header (p->offset muss auf Header zeigen) */
+/* Lazy#value */
 MRB_API mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
 {
@@ -1870,12 +1715,6 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
     r.p    = base + p->offset;
     r.end  = base + total_len;
 
-    /* decode_value handles all tag types correctly:
-       - Tag28 -> decode_tag_sharedrefs (reverse-map gives correct index)
-       - Tag29 -> decode_tag_sharedref (returns Lazy from table)
-       - Tag2/3 -> decode_tagged_bignum
-       - others -> UnhandledTag wrapper
-       If it returns a Lazy (from a Tag29 sharedref), materialise it. */
     mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
     if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) value = cbor_lazy_value(mrb, value);
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
@@ -1891,7 +1730,6 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
  * Lazy CBOR access
  * ============================================================ */
 
-/* kcache holen + fetch */
 static mrb_value
 lazy_fetch_from_cache(mrb_state *mrb, mrb_value self, mrb_value key)
 {
@@ -1902,7 +1740,6 @@ lazy_fetch_from_cache(mrb_state *mrb, mrb_value self, mrb_value key)
   mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
 }
 
-/* Reader für Lazy-Objekt initialisieren */
 static void
 lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
 {
@@ -1918,25 +1755,6 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
   }
 }
 
-/*
- * Normalize a (possibly negative) Ruby array index against a CBOR array
- * of `len` elements.  Returns the normalized index in [0, len) or -1 if
- * out of bounds.  Handles MRB_INT_MIN safely without signed overflow.
- */
-static mrb_int
-cbor_normalize_index(mrb_int idx, uint64_t len)
-{
-  if (idx >= 0) {
-    if ((uint64_t)idx >= len) return -1;
-    return idx;
-  }
-  /* idx < 0: safe negation via -(idx+1)+1 avoids MRB_INT_MIN overflow */
-  uint64_t abs_idx = (uint64_t)(-(idx + 1)) + 1;
-  if (abs_idx > len) return -1;
-  return (mrb_int)(len - abs_idx);
-}
-
-/* Array-Zugriff */
 static mrb_value
 lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
                 mrb_value self, cbor_lazy_t *p, mrb_value sharedrefs)
@@ -1946,13 +1764,14 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
     mrb_value normalized_key = mrb_ensure_int_type(mrb, key);
     mrb_int idx = mrb_integer(normalized_key);
 
-    uint64_t len = read_len(mrb, r, r->info);
+    mrb_value len_v = read_cbor_uint(mrb, r, r->info);
+    mrb_int len = cbor_value_to_len(mrb, len_v);
 
-    if (idx < 0) idx += (mrb_int)len;
-    if (unlikely((uint64_t)idx >= len || idx < 0)) {
+    if (idx < 0) idx += len;
+    if (unlikely(idx >= len || idx < 0)) {
       mrb_raisef(mrb, E_INDEX_ERROR,
         "index %d outside of array bounds: -%d...%d",
-        idx, (mrb_int)len, (mrb_int)len);
+        idx, len, len);
     }
 
     for (mrb_int i = 0; i < idx; i++) {
@@ -1965,23 +1784,23 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
     mrb_hash_set(mrb, kcache, key, new_lazy);
     return new_lazy;
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a hash");
+    mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
   }
 
-  return mrb_undef_value(); /* unreachable */
+  return mrb_undef_value();
 }
 
-/* Map-Zugriff */
 static mrb_value
 lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
               mrb_value self, cbor_lazy_t *p, mrb_value sharedrefs)
 {
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
   if (likely(mrb_hash_p(kcache))) {
-    uint64_t pairs = read_len(mrb, r, r->info);
+    mrb_value pairs_v = read_cbor_uint(mrb, r, r->info);
+    mrb_int pairs = cbor_value_to_len(mrb, pairs_v);
     mrb_bool key_is_str = mrb_string_p(key);
 
-    for (uint64_t i = 0; i < pairs; i++) {
+    for (mrb_int i = 0; i < pairs; i++) {
       mrb_bool match;
 
       uint8_t kb    = reader_read8(mrb, r);
@@ -1989,9 +1808,10 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
       uint8_t kinfo = (uint8_t)(kb & 0x1F);
 
       if (key_is_str && (kmaj == 2 || kmaj == 3)) {
-        uint64_t klen = read_len(mrb, r, kinfo);
+        mrb_value klen_v = read_cbor_uint(mrb, r, kinfo);
+        mrb_int klen = cbor_value_to_len(mrb, klen_v);
         reader_advance_checked(mrb, r, klen);
-        match = (klen == (uint64_t)RSTRING_LEN(key) &&
+        match = (klen == RSTRING_LEN(key) &&
                 memcmp(r->p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
       } else {
         r->p--;
@@ -2013,16 +1833,14 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
     mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
   }
 
-  return mrb_undef_value(); /* unreachable */
+  return mrb_undef_value();
 }
 
 /*
- * Advance reader past any wrapping tags (major=6) until we reach
- * a non-tag item. Handles Tag 28 (sharedrefs) and Tag 29 (sharedref)
- * so that lazy access works on sharedrefs-encoded data.
- * Returns the resolved major type, or 0xFF if Tag 29 was encountered.
- * When 0xFF is returned, *resolved_out contains the Lazy from the
- * sharedrefs table that the caller should delegate to.
+ * Advance reader past any wrapping tags (major=6) until we reach a
+ * non-tag item.  Handles Tag 28 and Tag 29 for shared references.
+ * Returns resolved major type, or 0xFF if Tag 29 was encountered
+ * (in which case *resolved_out is set to the referenced Lazy).
  */
 static uint8_t
 lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value sharedrefs,
@@ -2030,21 +1848,18 @@ lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value sharedrefs,
 {
   *resolved_out = mrb_undef_value();
   while (r->major == 6) {
-    uint64_t tag = read_len(mrb, r, r->info);
+    mrb_value tag = read_cbor_uint(mrb, r, r->info);
 
-    if (tag == 29) {
-      /* Sharedref: look up pre-registered Lazy and signal caller. */
+    if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0) {
       *resolved_out = decode_tag_sharedref(mrb, r, sharedrefs);
       return 0xFF;
     }
-    /* Tag 28 (sharedrefs) or any other tag: just consume, read next header.
-       The sharedrefs table was pre-populated; no registration needed here. */
+    /* Tag 28 or any other tag: just consume and read next header */
     reader_read_header(mrb, r);
   }
   return r->major;
 }
 
-/* Lazy#[] – internal: key passed directly, no VM dispatch */
 static mrb_value
 cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
 {
@@ -2077,11 +1892,9 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
     mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
   }
 
-
   return mrb_undef_value();
 }
 
-/* Lazy#[] – mruby method binding */
 static mrb_value
 cbor_lazy_aref_m(mrb_state *mrb, mrb_value self)
 {
@@ -2115,13 +1928,11 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
   mrb_value current = self;
 
   for (mrb_int ki = 0; ki < nkeys; ki++) {
-    /* nil in the middle -> nil out */
     if (mrb_nil_p(current)) return mrb_nil_value();
 
     cbor_lazy_t *p = mrb_data_get_ptr(mrb, current, &cbor_lazy_type);
     mrb_value key  = keys[ki];
 
-    /* --- check kcache first --- */
     mrb_value kcache = mrb_iv_get(mrb, current, MRB_SYM(kcache));
     if (likely(mrb_hash_p(kcache))) {
       mrb_value cached = mrb_hash_fetch(mrb, kcache, key, mrb_undef_value());
@@ -2150,7 +1961,6 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     uint8_t major = lazy_resolve_tags(mrb, &r, sharedrefs, &dig_resolved);
 
     if (major == 0xFF) {
-      /* Tag29: delegate this key to the referenced Lazy, then continue dig */
       if (mrb_data_check_get_ptr(mrb, dig_resolved, &cbor_lazy_type)) {
         current = cbor_lazy_aref(mrb, dig_resolved, key);
         continue;
@@ -2161,13 +1971,14 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     mrb_value result;
 
     switch (major) {
-      case 4: { /* Array */
+      case 4: {
         mrb_value nkey = mrb_ensure_int_type(mrb, key);
         mrb_int   idx  = mrb_integer(nkey);
-        uint64_t  len  = read_len(mrb, &r, r.info);
+        mrb_value len_v = read_cbor_uint(mrb, &r, r.info);
+        mrb_int   len  = cbor_value_to_len(mrb, len_v);
 
-        if (idx < 0) idx += (mrb_int)len;
-        if (idx < 0 || (uint64_t)idx >= len) { current = mrb_nil_value(); continue; }
+        if (idx < 0) idx += len;
+        if (idx < 0 || idx >= len) { current = mrb_nil_value(); continue; }
 
         for (mrb_int i = 0; i < idx; i++)
           skip_cbor(mrb, &r, current, sharedrefs);
@@ -2176,14 +1987,15 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
         result = cbor_lazy_new(mrb, p->buf, elem_off, sharedrefs);
         mrb_hash_set(mrb, kcache, key, result);
 
-      }break;
+      } break;
 
-      case 5: { /* Map */
-        uint64_t pairs     = read_len(mrb, &r, r.info);
-        mrb_bool key_is_str = mrb_string_p(key);
-        mrb_bool found      = FALSE;
+      case 5: {
+        mrb_value pairs_v  = read_cbor_uint(mrb, &r, r.info);
+        mrb_int   pairs    = cbor_value_to_len(mrb, pairs_v);
+        mrb_bool  key_is_str = mrb_string_p(key);
+        mrb_bool  found      = FALSE;
 
-        for (uint64_t i = 0; i < pairs; i++) {
+        for (mrb_int i = 0; i < pairs; i++) {
           mrb_bool match;
 
           uint8_t kb    = reader_read8(mrb, &r);
@@ -2191,9 +2003,10 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
           uint8_t kinfo = kb & 0x1F;
 
           if (key_is_str && (kmaj == 2 || kmaj == 3)) {
-            uint64_t klen = read_len(mrb, &r, kinfo);
+            mrb_value klen_v = read_cbor_uint(mrb, &r, kinfo);
+            mrb_int klen = cbor_value_to_len(mrb, klen_v);
             reader_advance_checked(mrb, &r, klen);
-            match = (klen == (uint64_t)RSTRING_LEN(key) &&
+            match = (klen == RSTRING_LEN(key) &&
                      memcmp(r.p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
           } else {
             r.p--;
@@ -2333,13 +2146,9 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, lazy, MRB_SYM(end_offset),   lazy_end_offset, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),     cbor_lazy_dig,   MRB_ARGS_ANY());
 
-
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),
                                 mrb_cbor_decode_lazy, MRB_ARGS_REQ(1));
 
-  /* CBOR::Type — bitmask constants for use with native_ext_type.
-     Each primitive is 1<<major_type so multiple types can be OR-ed together.
-     Convenience aliases cover common combinations. */
   struct RClass *type_mod = mrb_define_module_under_id(mrb, cbor, MRB_SYM(Type));
   mrb_define_const_id(mrb, type_mod, MRB_SYM(UnsignedInt),  mrb_fixnum_value(1 << 0));
   mrb_define_const_id(mrb, type_mod, MRB_SYM(NegativeInt),  mrb_fixnum_value(1 << 1));
@@ -2349,10 +2158,8 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Map),          mrb_fixnum_value(1 << 5));
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Tagged),       mrb_fixnum_value(1 << 6));
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Simple),       mrb_fixnum_value(1 << 7));
-  /* Convenience combinations */
   mrb_define_const_id(mrb, type_mod, MRB_SYM(Integer),      mrb_fixnum_value((1 << 0) | (1 << 1)));
   mrb_define_const_id(mrb, type_mod, MRB_SYM(BytesOrString), mrb_fixnum_value((1 << 2) | (1 << 3)));
-
 }
 
 

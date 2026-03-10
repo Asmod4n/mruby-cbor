@@ -14,7 +14,8 @@
 | **BigInt Support** | Tags 2/3 (RFC 8949) when compiled with `MRB_USE_BIGINT` |
 | **Float Precision** | Float16/32/64 with subnormals, Inf, and NaN |
 | **Shared References** | Tags 28/29 for deduplication, including cyclic structures |
-| **Zero-Copy Lazy Decoding** | `CBOR::Lazy` for on-demand nested access |
+| **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
+| **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with result caching |
 | **Streaming** | `CBOR.stream` for CBOR sequence reading |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
 
@@ -27,7 +28,6 @@
 ## 🚀 Quick Start
 
 ### Basic Encode/Decode
-
 ```ruby
 # Encode
 buf = CBOR.encode({ "hello" => [1, 2, 3], "ok" => true })
@@ -45,10 +45,9 @@ lazy["hello"][1].value  # => 2 (constant-time after first access)
 
 ## 📖 Usage Guide
 
-### CBOR::Lazy – Zero-Copy On-Demand Access
+### CBOR::Lazy – On-Demand Access
 
 `decode_lazy` returns a `CBOR::Lazy` object wrapping the raw buffer **without decoding**. Navigate with `[]` or `dig`, then call `.value` when you need the actual value.
-
 ```ruby
 lazy = CBOR.decode_lazy(big_payload)
 
@@ -64,7 +63,6 @@ lazy.dig("missing", "text")  # => nil (safe)
 ```
 
 **Performance:** Access is O(n) only in skipped elements, not the full document. Results are cached for O(1) repeated access.
-
 ```ruby
 # Repeated access uses cache
 inner = lazy["outer"]["inner"].value
@@ -77,7 +75,6 @@ assert_same inner, inner2  # Same object (cached)
 ### Shared References (Tags 28/29)
 
 Eliminate duplication and represent cyclic structures.
-
 ```ruby
 # Encode with deduplication
 shared_array = [1, 2, 3]
@@ -96,7 +93,6 @@ lazy["x"].value.equal?(lazy["y"].value)  # => true ✓
 ```
 
 **Cyclic Structures:**
-
 ```ruby
 cyclic = []
 cyclic << cyclic
@@ -112,7 +108,6 @@ result.equal?(result[0])  # => true (self-referential)
 ### Custom Tags & Type Registration
 
 Register your own classes for CBOR encoding/decoding.
-
 ```ruby
 class Person
   attr_accessor :name, :age
@@ -148,7 +143,7 @@ decoded = CBOR.decode(encoded)  # => Person object
 - `CBOR::Type::Tagged` (for Bigint, your own registered Tags)
 - `CBOR::Type::Simple` (nil, false, true, Floats)
 
-Convience Types
+Convenience Types:
 - `CBOR::Type::BytesOrString`
 - `CBOR::Type::Integer`
 
@@ -157,32 +152,48 @@ Convience Types
 ### Symbol Handling
 
 Three strategies for encoding Ruby symbols:
-
 ```ruby
-# 1. Default: convert to strings
-CBOR.symbols_as_strings
+# 1. Default: convert to strings (no tag)
+CBOR.no_symbols
 
-# 2. Use tag 39 + uint32 (mruby-to-mruby only)
+# 2. Use tag 39 + string
+CBOR.symbols_as_string
+
+# 3. Use tag 39 + uint32 (mruby-to-mruby only)
 CBOR.symbols_as_uint32
 sym = :hello
 encoded = CBOR.encode(sym)
 decoded = CBOR.decode(encoded)  # => :hello
 ```
 
-> **⚠️ Warning:** Symbol as uint32 are mruby instance–specific. Only use `symbols_as_uint32` when both encoder and decoder run on the same mruby executable and when all symbols are interned at compile time, see https://github.com/mruby/mruby/blob/master/doc/guides/symbol.md#preallocate-symbols
+> **⚠️ Warning:** `symbols_as_uint32` is mruby instance–specific. Only use it when both encoder and decoder run on the same mruby executable and when all symbols are interned at compile time, see https://github.com/mruby/mruby/blob/master/doc/guides/symbol.md#preallocate-symbols
+
+---
+
+### Streaming
+
+Read a sequence of CBOR documents from any IO-like object:
+```ruby
+File.open("data.cbor", "rb") do |f|
+  CBOR.stream(f) do |doc|
+    puts doc.value.inspect
+  end
+end
+
+# Or as an enumerator
+docs = CBOR.stream(io).map(&:value)
+```
 
 ---
 
 ## 📦 Installation
 
 Add to your `build_config.rb`:
-
 ```ruby
 conf.gem github: "Asmod4n/mruby-cbor"
 ```
 
 Then build:
-
 ```bash
 rake compile
 rake test

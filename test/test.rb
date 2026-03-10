@@ -821,3 +821,78 @@ assert('CBOR.stream: offset parameter skips first bytes') do
   assert_equal 1,      results.length
   assert_equal "keep", results[0]
 end
+
+assert('CBOR.stream: document containing float') do
+  buf = CBOR.encode(1.5)
+  io  = MockIO.new(buf)
+  results = []
+  CBOR.stream(io) { |doc| results << doc.value }
+  assert_equal 1,   results.length
+  assert_equal 1.5, results[0]
+end
+
+assert('CBOR.stream: document containing shared refs') do
+  v = [1, 2, 3]
+  obj = { "a" => v, "b" => v }
+  buf = CBOR.encode(obj, sharedrefs: true)
+  io  = MockIO.new(buf)
+  results = []
+  CBOR.stream(io) { |doc| results << doc.value }
+  assert_equal 1, results.length
+  assert_equal({ "a" => [1,2,3], "b" => [1,2,3] }, results[0])
+end
+
+assert('CBOR.stream: documents with various integer sizes') do
+  docs = [
+    0,           # 0 bits
+    23,          # inline
+    24,          # uint8 boundary
+    255,         # uint8 max
+    256,         # uint16 boundary
+    65535,       # uint16 max
+    65536,       # uint32 boundary
+    0xFFFFFFFF,  # uint32 max
+    0x100000000, # uint64 boundary
+  ]
+  buf = docs.map { |n| CBOR.encode(n) }.join
+  io  = MockIO.new(buf)
+  results = []
+  CBOR.stream(io) { |doc| results << doc.value }
+  assert_equal docs, results
+end
+
+
+assert('CBOR integer overflow: negative uint32 boundary') do
+  # major 1, value 0xFFFFFFFF => -4294967296
+  buf = "\x3A\xFF\xFF\xFF\xFF"
+  assert_equal(-(2**32), CBOR.decode(buf))
+end
+
+assert('CBOR integer overflow: negative uint64 > MRB_INT_MAX+1') do
+  # major 1, value 0x8000000000000000
+  buf = "\x3B\x80\x00\x00\x00\x00\x00\x00\x00"
+  assert_equal(-(2**63) - 1, CBOR.decode(buf))
+end
+
+assert('CBOR integer overflow: unsigned uint64 > MRB_INT_MAX+1') do
+  # major 0, value 0xFFFFFFFFFFFFFFFF
+  buf = "\x1B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+  assert_equal(2**64 - 1, CBOR.decode(buf))
+end
+
+assert('CBOR array with bigint length raises') do
+  buf = "\x9B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+  assert_raise(RangeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR negative integer: -1 - UINT64_MAX') do
+  # major 1, info 27, value 0xFFFFFFFFFFFFFFFF
+  # decoded as -1 - UINT64_MAX = -2^64
+  buf = "\x3B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+  begin
+    result = CBOR.decode(buf)
+    assert_equal(-(2**64), result)  # MRB_USE_BIGINT path
+  rescue RangeError
+    # kein MRB_USE_BIGINT, raise ist korrekt
+  end
+end

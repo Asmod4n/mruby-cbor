@@ -95,16 +95,6 @@ cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
   return 0;
 }
 
-#ifndef _WIN32
-# include <sys/types.h>
-# include <sys/stat.h>
-# include <sys/mman.h>
-# include <fcntl.h>
-# include <unistd.h>
-#else
-# include <windows.h>
-#endif
-
 static uint8_t hex_nibble(uint8_t c)
 {
   return (uint8_t)((c & 0xF) + ((c >> 6) & 1) * 9);
@@ -144,7 +134,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     case 24:
       if (likely(p < end)) {
         r->p++;
-        return mrb_convert_uint8(mrb, p[0]);
+        uint8_t u = p[0];
+    #ifndef MRB_USE_BIGINT
+        if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
+          return mrb_convert_uint8(mrb, u);
+        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+    #else
+        return mrb_convert_uint8(mrb, u);
+    #endif
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint8");
       break;
@@ -152,8 +149,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     case 25:
       if (likely(end - p >= 2)) {
         r->p += 2;
-        return mrb_convert_uint16(mrb,
-          ((uint16_t)p[0] << 8) | p[1]);
+        uint16_t u = ((uint16_t)p[0] << 8) | p[1];
+    #ifndef MRB_USE_BIGINT
+        if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
+          return mrb_convert_uint16(mrb, u);
+        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+    #else
+        return mrb_convert_uint16(mrb, u);
+    #endif
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint16");
       break;
@@ -161,11 +164,18 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     case 26:
       if (likely(end - p >= 4)) {
         r->p += 4;
-        return mrb_convert_uint32(mrb,
+        uint32_t u =
           ((uint32_t)p[0] << 24) |
           ((uint32_t)p[1] << 16) |
           ((uint32_t)p[2] << 8)  |
-          ((uint32_t)p[3]));
+          ((uint32_t)p[3]);
+    #ifndef MRB_USE_BIGINT
+        if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
+          return mrb_convert_uint32(mrb, u);
+        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+    #else
+        return mrb_convert_uint32(mrb, u);
+    #endif
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint32");
       break;
@@ -173,15 +183,18 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     case 27:
       if (likely(end - p >= 8)) {
         r->p += 8;
-        return mrb_convert_uint64(mrb,
-          ((uint64_t)p[0] << 56) |
-          ((uint64_t)p[1] << 48) |
-          ((uint64_t)p[2] << 40) |
-          ((uint64_t)p[3] << 32) |
-          ((uint64_t)p[4] << 24) |
-          ((uint64_t)p[5] << 16) |
-          ((uint64_t)p[6] << 8)  |
-          ((uint64_t)p[7]));
+        uint64_t u =
+          ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+          ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+          ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+          ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+    #ifndef MRB_USE_BIGINT
+        if (likely(u <= (uint64_t)MRB_INT_MAX + 1))
+          return mrb_convert_uint64(mrb, u);
+        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+    #else
+        return mrb_convert_uint64(mrb, u);
+    #endif
       }
       mrb_raise(mrb, E_RANGE_ERROR, "invalid uint64");
       break;
@@ -255,8 +268,10 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
   mrb_value n = read_cbor_uint(mrb, r, info);
 
   if (likely(mrb_integer_p(n))) {
-    /* n in [0, MRB_INT_MAX]; -1 - n in [MRB_INT_MIN, -1] — always representable */
-    return mrb_int_value(mrb, -1 - mrb_integer(n));
+    mrb_int v = mrb_integer(n);
+    if (likely(v >= 0))
+      return mrb_int_value(mrb, -1 - v);
+    mrb_raise(mrb, E_RANGE_ERROR, "negative integer out of range");
   }
 
 #ifdef MRB_USE_BIGINT

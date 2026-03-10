@@ -2064,67 +2064,6 @@ cbor_symbols_as_uint32(mrb_state *mrb, mrb_value self)
   return self;
 }
 
-static mrb_value
-lazy_end_offset(mrb_state *mrb, mrb_value self)
-{
-  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
-
-  const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
-  const uint8_t *ptr  = base + p->offset;
-  const uint8_t *end  = base + (size_t)RSTRING_LEN(p->buf);
-
-  if (unlikely(ptr >= end))
-    mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
-
-  uint8_t info = ptr[0] & 0x1F;
-
-  size_t header_len = 1;
-  size_t payload_len = 0;
-
-  switch (info) {
-    case 24:
-      if (unlikely(ptr + 2 > end))
-        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
-      payload_len = ptr[1];
-      header_len = 2;
-      break;
-    case 25:
-      if (unlikely(ptr + 3 > end))
-        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
-      payload_len = ((size_t)ptr[1] << 8) | ptr[2];
-      header_len = 3;
-      break;
-    case 26:
-      if (unlikely(ptr + 5 > end))
-        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
-      payload_len = ((size_t)ptr[1] << 24) |
-                    ((size_t)ptr[2] << 16) |
-                    ((size_t)ptr[3] << 8)  |
-                    ptr[4];
-      header_len = 5;
-      break;
-    case 27:
-      if (unlikely(ptr + 9 > end))
-        mrb_raise(mrb, E_RANGE_ERROR, "CBOR header out of bounds");
-      payload_len = ((uint64_t)ptr[1] << 56) |
-                    ((uint64_t)ptr[2] << 48) |
-                    ((uint64_t)ptr[3] << 40) |
-                    ((uint64_t)ptr[4] << 32) |
-                    ((uint64_t)ptr[5] << 24) |
-                    ((uint64_t)ptr[6] << 16) |
-                    ((uint64_t)ptr[7] << 8)  |
-                    ptr[8];
-      header_len = 9;
-      break;
-    default:
-      payload_len = info; /* info < 24 */
-  }
-
-  size_t end_offset = p->offset + header_len + payload_len;
-  return mrb_convert_size_t(mrb, end_offset);
-}
-
-
 MRB_BEGIN_DECL
 
 MRB_API void
@@ -2143,7 +2082,6 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
 
   mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref),  cbor_lazy_aref_m,  MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, lazy, MRB_SYM(value),   cbor_lazy_value, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, lazy, MRB_SYM(end_offset),   lazy_end_offset, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),     cbor_lazy_dig,   MRB_ARGS_ANY());
 
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),

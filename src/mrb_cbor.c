@@ -256,7 +256,7 @@ ensure_slice_bounds(mrb_state* mrb, mrb_value src, mrb_int off, mrb_int blen)
 // ============================================================================
 // Integers
 // ============================================================================
-static mrb_value
+static inline mrb_value
 decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
 {
   return read_cbor_uint(mrb, r, info);
@@ -269,9 +269,7 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
 
   if (likely(mrb_integer_p(n))) {
     mrb_int v = mrb_integer(n);
-    if (likely(v >= 0))
-      return mrb_int_value(mrb, -1 - v);
-    mrb_raise(mrb, E_RANGE_ERROR, "negative integer out of range");
+    return mrb_convert_mrb_int(mrb, -1 - v);
   }
 
 #ifdef MRB_USE_BIGINT
@@ -518,7 +516,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 
         if (mrb_integer_p(n)) {
           mrb_int v = mrb_integer(n);
-          mrb_value ret = mrb_convert_int64(mrb, -1 - v);
+          mrb_value ret = mrb_convert_mrb_int(mrb, -1 - v);
           mrb_gc_arena_restore(mrb, idx);
           mrb_gc_protect(mrb, ret);
           return ret;

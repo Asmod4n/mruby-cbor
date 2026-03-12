@@ -5,7 +5,6 @@ MRuby::Build.new do |conf|
     end
     unless for_windows?
         conf.enable_sanitizer "address,undefined"
-        conf.linker.flags_before_libraries << '-static-libasan'
     end
     conf.cxx.flags << '-fno-omit-frame-pointer' << '-g3' << '-ggdb3' << '-Og'
     conf.cc.flags << '-fno-omit-frame-pointer' << '-g3' << '-ggdb3' << '-Og'

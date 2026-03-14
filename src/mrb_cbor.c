@@ -1488,9 +1488,6 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   const char *sname = mrb_sym_name_len(mrb, mrb_symbol(sym), &slen);
   while (slen > 0 && sname[0] == '@') { sname++; slen--; }
 
-  encode_len(w, 3, (uint64_t)slen);
-  cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
-
   mrb_value val = mrb_iv_get(mrb, obj, mrb_symbol(sym));
 
   if (mrb_integer_p(mask)) {
@@ -1550,6 +1547,8 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
     }
   }
 
+  encode_len(w, 3, (uint64_t)slen);
+  cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
   encode_value(w, val);
   return 0;
 }
@@ -1563,10 +1562,9 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
     obj = mrb_funcall_argv(mrb, obj, MRB_SYM(_before_encode), 0, NULL);
   }
 
-  encode_len(w, 6, (uint64_t)tag_num);
-
   mrb_value schema = mrb_net_schema(mrb, mrb_class(mrb, obj));
   if (likely(mrb_hash_p(schema))) {
+    encode_len(w, 6, (uint64_t)tag_num);
     mrb_int n = mrb_hash_size(mrb, schema);
     encode_len(w, 5, (uint64_t)n);
 

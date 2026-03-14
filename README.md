@@ -235,7 +235,7 @@ decoded = CBOR.decode(encoded)  # => :hello (symbol preserved, same mruby only)
 
 ### Streaming
 
-Read a sequence of CBOR documents from any IO-like object:
+Read a sequence of CBOR documents from any File-like object:
 ```ruby
 File.open("data.cbor", "rb") do |f|
   CBOR.stream(f) do |doc|
@@ -244,7 +244,7 @@ File.open("data.cbor", "rb") do |f|
 end
 
 # Or as an enumerator
-docs = CBOR.stream(io).map(&:value)
+docs = CBOR.stream(f).map(&:value)
 ```
 
 ---

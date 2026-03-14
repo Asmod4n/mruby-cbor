@@ -101,6 +101,9 @@ typedef struct {
      mrb_undef_value() = disabled
      mrb_hash         = obj -> share_idx mapping */
   mrb_value seen;
+
+  /* Recursion depth counter to prevent stack overflow */
+  mrb_int depth;
 } CborWriter;
 
 /* Forward declarations */
@@ -816,6 +819,7 @@ cbor_writer_init(CborWriter *w, mrb_state *mrb)
   w->arena_index = mrb_gc_arena_save(mrb);
 
   w->seen       = mrb_undef_value();
+  w->depth      = 0;
 }
 
 static size_t next_pow2(size_t x)
@@ -1253,8 +1257,16 @@ static void
 encode_value(CborWriter* w, mrb_value obj)
 {
   mrb_state* mrb = w->mrb;
+
+  if (likely(w->depth < CBOR_MAX_DEPTH)) {
+    w->depth++;
+  } else {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+  }
+
   if (!mrb_undef_p(w->seen)) {
       if (!mrb_immediate_p(obj) && encode_check_shared(w, obj)) {
+          w->depth--;
           return;
       }
   }
@@ -1309,6 +1321,8 @@ encode_value(CborWriter* w, mrb_value obj)
       }
     } break;
   }
+
+  w->depth--;
 }
 
 
@@ -1472,6 +1486,45 @@ mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
 
 static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 
+/* Map Ruby type to CBOR major type for schema validation */
+static uint8_t
+cbor_type_major(mrb_state *mrb, mrb_value val)
+{
+  switch (mrb_type(val)) {
+    case MRB_TT_INTEGER:
+      return mrb_integer(val) >= 0 ? 0 : 1;
+    case MRB_TT_STRING:
+      return mrb_str_is_utf8(val) ? 3 : 2;
+    case MRB_TT_ARRAY:
+      return 4;
+    case MRB_TT_HASH:
+      return 5;
+    case MRB_TT_FALSE:
+    case MRB_TT_TRUE:
+#ifndef MRB_NO_FLOAT
+    case MRB_TT_FLOAT:
+#endif
+      return 7;
+#ifdef MRB_USE_BIGINT
+    case MRB_TT_BIGINT:
+      if (mrb_bint_size(mrb, val) <= 8) {
+        return mrb_bint_sign(mrb, val) >= 0 ? 0 : 6;
+      }
+      return 6;
+#endif
+    case MRB_TT_SYMBOL: {
+      mrb_value mode = cbor_sym_strategy(mrb);
+      if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
+        return 6;
+      }
+      mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
+      return mrb_str_is_utf8(str) ? 3 : 2;
+    }
+    default:
+      return 6;
+  }
+}
+
 typedef struct {
   CborWriter *w;
   mrb_value   obj;
@@ -1490,66 +1543,21 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
 
   mrb_value val = mrb_iv_get(mrb, obj, mrb_symbol(sym));
 
-  if (mrb_integer_p(mask)) {
-    /* actual_major is an internal bitmask index, not a CBOR value — uint8_t is correct here */
-    uint8_t actual_major = 6;
-
-    switch (mrb_type(val)) {
-      case MRB_TT_INTEGER: {
-        mrb_int i = mrb_integer(val);
-        actual_major = (i >= 0) ? 0 : 1;
-        break;
-      }
-      case MRB_TT_STRING: {
-        actual_major = mrb_str_is_utf8(val) ? 3 : 2;
-        break;
-      }
-      case MRB_TT_ARRAY:
-        actual_major = 4;
-        break;
-      case MRB_TT_HASH:
-        actual_major = 5;
-        break;
-      case MRB_TT_FALSE:
-      case MRB_TT_TRUE:
-#ifndef MRB_NO_FLOAT
-      case MRB_TT_FLOAT:
-#endif
-        actual_major = 7;
-        break;
-#ifdef MRB_USE_BIGINT
-      case MRB_TT_BIGINT:
-        if (mrb_bint_size(mrb, val) <= 8) {
-          actual_major = (mrb_bint_sign(mrb, val) >= 0) ? 0 : 1;
-        } else {
-          actual_major = 6;
-        }
-        break;
-#endif
-      case MRB_TT_SYMBOL: {
-        mrb_value mode = cbor_sym_strategy(mrb);
-        if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
-          actual_major = 6;
-        } else {
-          mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
-          actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-        }
-        break;
-      }
-      default:
-        actual_major = 6;
-    }
-
+  if (likely(mrb_integer_p(mask))) {
+    uint8_t actual_major = cbor_type_major(mrb, val);
     mrb_int allowed = mrb_integer(mask);
-    if (unlikely(!((allowed >> actual_major) & 1))) {
+    if (likely(((allowed >> actual_major) & 1))) {
+      encode_len(w, 3, (uint64_t)slen);
+      cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
+      encode_value(w, val);
+    } else {
       mrb_raisef(mrb, E_TYPE_ERROR,
         "CBOR tag field type mismatch for ivar %v", sym);
     }
+  } else {
+    mrb_raise(mrb, E_TYPE_ERROR, "mask is not a Integer");
   }
 
-  encode_len(w, 3, (uint64_t)slen);
-  cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
-  encode_value(w, val);
   return 0;
 }
 
@@ -1594,64 +1602,20 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value mask, voi
   mrb_value map_key = mrb_str_new_static(mrb, sname, slen);
   mrb_value val = mrb_hash_fetch(mrb, ctx->payload, map_key, mrb_undef_value());
 
-  if (!mrb_undef_p(val) && mrb_integer_p(mask)) {
-    uint8_t actual_major = 6;
-
-    switch (mrb_type(val)) {
-      case MRB_TT_INTEGER: {
-        mrb_int i = mrb_integer(val);
-        actual_major = (i >= 0) ? 0 : 1;
-        break;
+  if (!mrb_undef_p(val)) {
+    if (likely(mrb_integer_p(mask))) {
+      uint8_t actual_major = cbor_type_major(mrb, val);
+      mrb_int allowed = mrb_integer(mask);
+      if (likely(((allowed >> actual_major) & 1))) {
+        mrb_iv_set(mrb, ctx->obj, mrb_symbol(sym), val);
+      } else {
+        mrb_raisef(mrb, E_TYPE_ERROR,
+          "CBOR tag field type mismatch for ivar %v", sym);
       }
-      case MRB_TT_STRING: {
-        actual_major = mrb_str_is_utf8(val) ? 3 : 2;
-        break;
-      }
-      case MRB_TT_ARRAY:
-        actual_major = 4;
-        break;
-      case MRB_TT_HASH:
-        actual_major = 5;
-        break;
-      case MRB_TT_FALSE:
-      case MRB_TT_TRUE:
-#ifndef MRB_NO_FLOAT
-      case MRB_TT_FLOAT:
-#endif
-        actual_major = 7;
-        break;
-#ifdef MRB_USE_BIGINT
-      case MRB_TT_BIGINT:
-        if (mrb_bint_size(mrb, val) <= 8) {
-          actual_major = (mrb_bint_sign(mrb, val) >= 0) ? 0 : 1;
-        } else {
-          actual_major = 6;
-        }
-        break;
-#endif
-      case MRB_TT_SYMBOL: {
-        mrb_value mode = cbor_sym_strategy(mrb);
-        if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
-          actual_major = 6;
-        } else {
-          mrb_value str = mrb_sym2str(mrb, mrb_symbol(val));
-          actual_major = mrb_str_is_utf8(str) ? 3 : 2;
-        }
-        break;
-      }
-      default:
-        actual_major = 6;
-    }
-
-    mrb_int allowed = mrb_integer(mask);
-    if (unlikely(!((allowed >> actual_major) & 1))) {
-      mrb_raisef(mrb, E_TYPE_ERROR,
-        "CBOR tag field type mismatch for ivar %v", sym);
+    } else {
+      mrb_raise(mrb, E_TYPE_ERROR, "mask is not a Integer");
     }
   }
-
-  mrb_iv_set(mrb, ctx->obj, mrb_symbol(sym),
-             mrb_undef_p(val) ? mrb_nil_value() : val);
 
   return 0;
 }

@@ -19,9 +19,45 @@
 | **Streaming** | `CBOR.stream` for CBOR sequence reading |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
 
-### ⚠️ Limitations
+### ⚠️ Limitations & Design Decisions
 
-- No indefinite-length item support (RFC 8949 Section 4.2.1)
+| Limitation | Reason |
+|-----------|--------|
+| No indefinite-length items | Use CBOR.stream mode instead. |
+
+**Determinism Guarantees:**
+- Encoding is deterministic *within a single mruby build*
+- Hash field order follows insertion order (per mruby hash impl)
+- Float width (16/32/64) is compile-time fixed via `MRB_USE_FLOAT32`
+- Symbol encoding strategy is global; don't mix `no_symbols` / `symbols_as_string` / `symbols_as_uint32` in the same program
+- **Not deterministic across builds** if you rebuild mruby with different CFLAGS or config
+
+**Recursion Depth Limits:**
+Default `CBOR_MAX_DEPTH` depends on mruby profile:
+- `MRB_PROFILE_MAIN` / `MRB_PROFILE_HIGH`: 512
+- `MRB_PROFILE_BASELINE`: 64
+- Constrained / other: 32
+
+Exceeding this raises `RuntimeError: "CBOR nesting depth exceeded"`. Override by setting `CBOR_MAX_DEPTH` at compile time.
+
+---
+
+## 📊 Performance Notes
+
+- **Encoding:** ~30% faster than msgpack (SBO + incremental writes)
+- **Lazy decoding:** 1.3–3× faster than simdjson for selective access
+- **Shared refs:** Tags 28/29 deduplication is O(1) amortized
+- **Float encoding:** No overhead; width selection happens once per value at encode time
+
+**When to use lazy decoding:**
+- Decoding large payloads where you only access a subset of fields
+- Streaming/telemetry where you care about specific fields
+- Network protocols where you validate before deserializing
+
+**When to use eager decoding:**
+- Small payloads
+- You need the full object in memory instantly
+- Simplicity over optimization
 
 ---
 
@@ -47,7 +83,7 @@ lazy["hello"][1].value  # => 2 (constant-time after first access)
 
 ### CBOR::Lazy – On-Demand Access
 
-`decode_lazy` returns a `CBOR::Lazy` object wrapping the raw buffer **without decoding**. Navigate with `[]` or `dig`, then call `.value` when you need the actual value.
+`decode_lazy` returns a `CBOR::Lazy` object wrapping the raw buffer **without decoding the value**. Navigate with `[]` or `dig`, then call `.value` when you need the actual value.
 ```ruby
 lazy = CBOR.decode_lazy(big_payload)
 
@@ -159,21 +195,41 @@ Convenience Types:
 ### Symbol Handling
 
 Three strategies for encoding Ruby symbols:
+
 ```ruby
-# 1. Default: convert to strings (no tag)
+# 1. Default: strip symbols (no tag, no round-trip)
 CBOR.no_symbols
+sym = :hello
+encoded = CBOR.encode(sym)  # Encodes as plain string "hello"
+decoded = CBOR.decode(encoded)  # => "hello" (not a symbol!)
 
-# 2. Use tag 39 + string
+# 2. Use tag 39 + string (RFC 8949, interoperable)
 CBOR.symbols_as_string
+sym = :hello
+encoded = CBOR.encode(sym)
+decoded = CBOR.decode(encoded)  # => :hello (symbol preserved)
 
-# 3. Use tag 39 + uint32 (mruby-to-mruby only)
+# 3. Use tag 39 + uint32 (mruby presym only, fastest)
 CBOR.symbols_as_uint32
 sym = :hello
 encoded = CBOR.encode(sym)
-decoded = CBOR.decode(encoded)  # => :hello
+decoded = CBOR.decode(encoded)  # => :hello (symbol preserved, same mruby only)
 ```
 
-> **⚠️ Warning:** `symbols_as_uint32` is mruby instance–specific. Only use it when both encoder and decoder run on the same mruby executable and when all symbols are interned at compile time, see https://github.com/mruby/mruby/blob/master/doc/guides/symbol.md#preallocate-symbols
+**Mode Comparison:**
+
+| Mode | Encoding | Interop | Round-trip | Speed |
+|------|----------|---------|-----------|-------|
+| `no_symbols` | Plain string | ✅ All | ❌ No | Fast |
+| `symbols_as_string` | Tag 39 + string | ✅ All | ✅ Yes | Good |
+| `symbols_as_uint32` | Tag 39 + uint32 | ❌ mruby only | ✅ Yes | Fastest |
+
+> **⚠️ Warning:** `symbols_as_uint32` requires:
+> - **Same mruby build** — encoder and decoder must use the same mruby executable (same `libmruby.a`)
+> - **Compile-time symbols** — all symbols must be interned at build time (see [presym docs](https://github.com/mruby/mruby/blob/master/doc/guides/symbol.md#preallocate-symbols))
+> - **No runtime symbol creation** — decoding fails if the symbol ID doesn't exist in the decoder's presym table
+>
+> Use only for internal mruby-to-mruby IPC on the same build. For external/user data, use `symbols_as_string`.
 
 ---
 
@@ -205,6 +261,20 @@ Then build:
 rake compile
 rake test
 ```
+
+---
+
+## ⚠️ Error Handling
+
+| Error | When | Example |
+|-------|------|---------|
+| `ArgumentError` | Invalid encode options | `CBOR.encode(obj, bad_option: true)` |
+| `RangeError` | Integer out of bounds | Encoding a Bigint larger than uint64 |
+| `RuntimeError` | Nesting depth exceeded | Deeply nested structures beyond `CBOR_MAX_DEPTH` |
+| `RuntimeError` | Truncated/invalid CBOR | `CBOR.decode(incomplete_buffer)` |
+| `TypeError` | Type mismatch in registered tags | Field marked as String gets an Array |
+| `KeyError` | Lazy access to missing key | `lazy["nonexistent"]` (use `.dig` to get nil instead) |
+| `NotImplementedError` | Presym on non-presym mruby | `CBOR.symbols_as_uint32` on build without presym |
 
 ---
 

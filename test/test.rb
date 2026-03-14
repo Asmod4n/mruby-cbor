@@ -1819,3 +1819,81 @@ assert('CBOR registered tag: lazy decode with _after_decode') do
   assert_true materialized.materialized?
   assert_equal 99, materialized.value
 end
+
+assert('CBOR registered tag: extra fields are silently ignored') do
+  class WhitelistPerson
+    attr_accessor :allowed_a, :allowed_b, :ignored_field
+    native_ext_type :@allowed_a, CBOR::Type::String
+    native_ext_type :@allowed_b, CBOR::Type::Integer
+
+    def initialize
+      @allowed_a = ""
+      @allowed_b = 0
+      @ignored_field = nil
+    end
+  end
+
+  CBOR.register_tag(2000, WhitelistPerson)
+
+  # Payload with extra fields mixed in
+  payload_with_extras = {
+    "allowed_a" => "hello",
+    "allowed_b" => 42,
+    "extra_field_1" => "this should be ignored",
+    "extra_field_2" => [1, 2, 3],
+    "extra_field_3" => { "nested" => "data" }
+  }
+
+  payload_cbor = CBOR.encode(payload_with_extras)
+  tag_bytes = "\xD9\x07\xD0"  # Tag(2000)
+  tagged_cbor = tag_bytes + payload_cbor
+
+  # Decode: should only load allowed_a and allowed_b, ignore the rest
+  decoded = CBOR.decode(tagged_cbor)
+
+  assert_true decoded.is_a?(WhitelistPerson)
+  assert_equal "hello", decoded.allowed_a
+  assert_equal 42, decoded.allowed_b
+  assert_nil decoded.ignored_field  # Not in payload, becomes nil
+
+  # The extra fields should not cause any error or be present in the object
+end
+
+assert('CBOR registered tag: extra fields do not corrupt registered fields') do
+  class StrictRecord
+    attr_accessor :id, :name
+    native_ext_type :@id, CBOR::Type::Integer
+    native_ext_type :@name, CBOR::Type::String
+
+    def initialize
+      @id = 0
+      @name = ""
+    end
+  end
+
+  CBOR.register_tag(2001, StrictRecord)
+
+  # Payload with many extra fields mixed in
+  payload = {
+    "id" => 999,
+    "name" => "test",
+    "secret" => "should not appear",
+    "data" => { "nested" => "ignored" },
+    "array" => [1, 2, 3, 4, 5],
+    "extra_int" => 12345,
+    "extra_bool" => true,
+    "extra_nil" => nil
+  }
+
+  payload_cbor = CBOR.encode(payload)
+  tag_bytes = "\xD9\x07\xD1"  # Tag(2001)
+  tagged_cbor = tag_bytes + payload_cbor
+
+  decoded = CBOR.decode(tagged_cbor)
+
+  assert_true decoded.is_a?(StrictRecord)
+  assert_equal 999, decoded.id
+  assert_equal "test", decoded.name
+  # Verify extra fields don't leak into the object's ivars
+  assert_equal 2, decoded.instance_variables.length  # Only @id and @name
+end

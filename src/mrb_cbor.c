@@ -1178,7 +1178,6 @@ encode_simple(CborWriter* w, mrb_value obj)
     default: {
       mrb_state *mrb = w->mrb;
       mrb_raise(mrb, E_TYPE_ERROR, "unexpected simple value");
-      b = 0;
     } break;
   }
   cbor_writer_write(w, &b, 1);
@@ -1560,6 +1559,10 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
 {
   mrb_state *mrb = w->mrb;
 
+  if (mrb_respond_to(mrb, obj, MRB_SYM(_before_encode))) {
+    obj = mrb_funcall_argv(mrb, obj, MRB_SYM(_before_encode), 0, NULL);
+  }
+
   encode_len(w, 6, (uint64_t)tag_num);
 
   mrb_value schema = mrb_net_schema(mrb, mrb_class(mrb, obj));
@@ -1572,7 +1575,7 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
     mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
                     encode_registered_tag_foreach, &ctx);
   } else {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "registered class has no ned schema");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "registered class has no net schema");
   }
 }
 
@@ -1671,8 +1674,8 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
       mrb_hash_foreach(mrb, mrb_hash_ptr(schema),
                       decode_registered_tag_foreach, &ctx);
 
-      if (mrb_respond_to(mrb, obj, MRB_SYM(from_allocate))) {
-        return mrb_funcall_argv(mrb, obj, MRB_SYM(from_allocate), 0, NULL);
+      if (mrb_respond_to(mrb, obj, MRB_SYM(_after_decode))) {
+        return mrb_funcall_argv(mrb, obj, MRB_SYM(_after_decode), 0, NULL);
       } else {
         return obj;
       }

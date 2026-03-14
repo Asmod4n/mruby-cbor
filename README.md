@@ -15,7 +15,7 @@
 | **Float Precision** | Float16/32/64 with subnormals, Inf, and NaN |
 | **Shared References** | Tags 28/29 for deduplication, including cyclic structures |
 | **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
-| **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with result caching |
+| **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with key and result caching |
 | **Streaming** | `CBOR.stream` for CBOR sequence reading |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
 
@@ -62,7 +62,7 @@ lazy["missing"]              # => KeyError (raises)
 lazy.dig("missing", "text")  # => nil (safe)
 ```
 
-**Performance:** Access is O(n) only in skipped elements, not the full document. Results are cached for O(1) repeated access.
+**Performance:** Access is O(n) only in skipped elements, not the full document. Keys and Results are cached for O(1) repeated access.
 ```ruby
 # Repeated access uses cache
 inner = lazy["outer"]["inner"].value
@@ -116,9 +116,16 @@ class Person
   native_ext_type :@name, CBOR::Type::String
   native_ext_type :@age, CBOR::Type::Integer
 
-  # Called after allocation during decode
-  def from_allocate
+  # Called after decoding (optional)
+  def _after_decode
     puts "Person #{@name} loaded"
+    self
+  end
+
+  # Called before encoding (optional)
+  # Must return self or a modified object
+  def _before_encode
+    @age += 1 if @age < 18  # Example transformation
     self
   end
 end
@@ -131,7 +138,7 @@ person.name = "Alice"
 person.age = 30
 
 encoded = CBOR.encode(person)
-decoded = CBOR.decode(encoded)  # => Person object
+decoded = CBOR.decode(encoded)  # => Person object, after_decode called
 ```
 
 **Available Types:**

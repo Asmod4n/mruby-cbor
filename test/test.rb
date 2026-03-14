@@ -368,7 +368,11 @@ assert('CBOR register_tag: encode and decode custom class') do
       @y = y
     end
 
-    def from_allocate
+    def _after_decode
+      self
+    end
+
+    def _before_encode
       self
     end
 
@@ -1565,4 +1569,253 @@ assert('CBOR::Lazy: dig on integer raises') do
 
   # dig on non-container should raise
   assert_raise(TypeError) { lazy.dig("key") }
+end
+
+# ============================================================================
+# Registered tag hooks: _before_encode and _after_decode
+# ============================================================================
+
+assert('CBOR registered tag: _after_decode hook called') do
+  class Person
+    attr_accessor :name, :age
+    native_ext_type :@name, CBOR::Type::String
+    native_ext_type :@age, CBOR::Type::Integer
+
+    def initialize
+      @loaded = false
+    end
+
+    def _after_decode
+      @loaded = true
+      self
+    end
+
+    def loaded?
+      @loaded
+    end
+  end
+
+  CBOR.register_tag(1000, Person)
+
+  person = Person.new
+  person.name = "Alice"
+  person.age = 30
+
+  encoded = CBOR.encode(person)
+  decoded = CBOR.decode(encoded)
+
+  assert_true decoded.is_a?(Person)
+  assert_equal "Alice", decoded.name
+  assert_equal 30, decoded.age
+  assert_true decoded.loaded?
+end
+
+assert('CBOR registered tag: _before_encode hook called') do
+  class Item
+    attr_accessor :value
+    native_ext_type :@value, CBOR::Type::Integer
+
+    def initialize(val)
+      @value = val
+    end
+
+    def _before_encode
+      @value = @value * 2  # Double before encoding
+      self
+    end
+  end
+
+  CBOR.register_tag(1001, Item)
+
+  item = Item.new(5)
+  encoded = CBOR.encode(item)
+  decoded = CBOR.decode(encoded)
+
+  assert_equal 10, decoded.value
+end
+
+assert('CBOR registered tag: both hooks in sequence') do
+  class Counter
+    attr_accessor :count
+    native_ext_type :@count, CBOR::Type::Integer
+
+    def initialize(n)
+      @count = n
+      @before_encode_called = false
+      @after_decode_called = false
+    end
+
+    def _before_encode
+      @before_encode_called = true
+      @count = @count + 1
+      self
+    end
+
+    def _after_decode
+      @after_decode_called = true
+      @count = @count + 1
+      self
+    end
+
+    def before_encode_called?
+      @before_encode_called
+    end
+
+    def after_decode_called?
+      @after_decode_called
+    end
+  end
+
+  CBOR.register_tag(1002, Counter)
+
+  counter = Counter.new(10)
+
+  encoded = CBOR.encode(counter)
+  assert_true counter.before_encode_called?  # _before_encode was called during encode
+  decoded = CBOR.decode(encoded)
+
+  assert_equal 12, decoded.count  # 10 + 1 (before_encode) + 1 (after_decode)
+  assert_true decoded.after_decode_called?
+end
+
+assert('CBOR registered tag: _before_encode without _after_decode') do
+  class Price
+    attr_accessor :amount
+    native_ext_type :@amount, CBOR::Type::Integer
+
+    def initialize(val)
+      @amount = val
+    end
+
+    def _before_encode
+      @amount = (@amount * 100).to_i  # Convert to cents
+      self
+    end
+  end
+
+  CBOR.register_tag(1003, Price)
+
+  price = Price.new(5)
+  encoded = CBOR.encode(price)
+  decoded = CBOR.decode(encoded)
+
+  assert_equal 500, decoded.amount
+  assert_true decoded.is_a?(Price)
+end
+
+assert('CBOR registered tag: _after_decode without _before_encode') do
+  class Config
+    attr_accessor :timeout
+    native_ext_type :@timeout, CBOR::Type::Integer
+
+    def initialize(val)
+      @timeout = val
+      @validated = false
+    end
+
+    def _after_decode
+      @timeout = @timeout.abs
+      @validated = true
+      self
+    end
+
+    def validated?
+      @validated
+    end
+  end
+
+  CBOR.register_tag(1004, Config)
+
+  config = Config.new(30)
+  encoded = CBOR.encode(config)
+  decoded = CBOR.decode(encoded)
+
+  assert_equal 30, decoded.timeout
+  assert_true decoded.validated?
+end
+
+assert('CBOR registered tag: hook exception propagates') do
+  class Strict
+    attr_accessor :value
+    native_ext_type :@value, CBOR::Type::Integer
+
+    def initialize(val)
+      @value = val
+    end
+
+    def _before_encode
+      raise "encode forbidden"
+    end
+  end
+
+  CBOR.register_tag(1005, Strict)
+
+  strict = Strict.new(42)
+  assert_raise(RuntimeError) { CBOR.encode(strict) }
+end
+
+assert('CBOR registered tag: hook modifies multiple fields') do
+  class User
+    attr_accessor :username, :email
+    native_ext_type :@username, CBOR::Type::String
+    native_ext_type :@email, CBOR::Type::String
+
+    def initialize
+      @username = ""
+      @email = ""
+    end
+
+    def _after_decode
+      @username = @username.downcase
+      @email = @email.downcase
+      self
+    end
+  end
+
+  CBOR.register_tag(1006, User)
+
+  user = User.new
+  user.username = "AlicE"
+  user.email = "Alice@Example.COM"
+
+  encoded = CBOR.encode(user)
+  decoded = CBOR.decode(encoded)
+
+  assert_equal "alice", decoded.username
+  assert_equal "alice@example.com", decoded.email
+end
+
+assert('CBOR registered tag: lazy decode with _after_decode') do
+  class Data
+    attr_accessor :value
+    native_ext_type :@value, CBOR::Type::Integer
+
+    def initialize(val)
+      @value = val
+      @materialized = false
+    end
+
+    def _after_decode
+      @materialized = true
+      self
+    end
+
+    def materialized?
+      @materialized
+    end
+  end
+
+  CBOR.register_tag(1007, Data)
+
+  data = Data.new(99)
+  encoded = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(encoded)
+
+  # Lazy hasn't materialized yet
+  assert_false data.materialized?
+
+  # Calling .value triggers decode and _after_decode
+  materialized = lazy.value
+  assert_true materialized.materialized?
+  assert_equal 99, materialized.value
 end

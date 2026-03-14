@@ -58,6 +58,4 @@ mruby
 .cache
 build_config.rb.lock
 compile_commands.json
-/test.rb
-test2.rb
-twitter.json
+findings

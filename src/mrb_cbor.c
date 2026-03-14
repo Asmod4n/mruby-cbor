@@ -3,7 +3,6 @@
 #include <mruby/array.h>
 #include <mruby/hash.h>
 #include <mruby/class.h>
-#include <stdlib.h>
 MRB_BEGIN_DECL
 #include <mruby/internal.h>
 MRB_END_DECL
@@ -16,10 +15,22 @@ MRB_END_DECL
 #include <mruby/error.h>
 #include <mruby/ned.h>
 
+#include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdbool.h>
+
+/* Configurable CBOR recursion depth limits */
+#ifndef CBOR_MAX_DEPTH
+  #if defined(MRB_PROFILE_MAIN) || defined(MRB_PROFILE_HIGH)
+    #define CBOR_MAX_DEPTH 512
+  #elif defined(MRB_PROFILE_BASELINE)
+    #define CBOR_MAX_DEPTH 64
+  #else
+    #define CBOR_MAX_DEPTH 32
+  #endif
+#endif
 
 typedef struct {
   const uint8_t* base;
@@ -28,6 +39,9 @@ typedef struct {
 
   uint8_t major;
   uint8_t info;
+
+  /* Recursion depth counter to prevent stack overflow */
+  mrb_int depth;
 } Reader;
 
 static uint8_t
@@ -54,6 +68,17 @@ reader_init(Reader* r, const uint8_t* buf, size_t len)
   r->end    = buf + len;
   r->major  = 0;
   r->info   = 0;
+  r->depth  = 0;
+}
+
+/* Check recursion depth before entering recursive functions */
+static inline void
+reader_check_depth(mrb_state *mrb, Reader *r)
+{
+  if (likely(r->depth < CBOR_MAX_DEPTH))
+    return;
+  else
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
 }
 
 #define CBOR_SBO_STACK_CAP (16 * 1024)
@@ -278,7 +303,7 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
     mrb_value np1 = mrb_bint_add(mrb, n, mrb_fixnum_value(1));
     return mrb_bint_neg(mrb, np1);
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "paylod is not a number");
+    mrb_raise(mrb, E_TYPE_ERROR, "payload is not a number");
   }
 #else
   mrb_raise(mrb, E_RANGE_ERROR, "negative integer out of range");
@@ -656,22 +681,39 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 }
 
 // ============================================================================
-// Master decode
+// Master decode with depth protection
 // ============================================================================
 static mrb_value
 decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 {
+  reader_check_depth(mrb, r);
+  r->depth++;
+
+  mrb_value result = mrb_undef_value();
+
   uint8_t b = reader_read8(mrb, r);
   uint8_t major = (uint8_t)(b >> 5);
   uint8_t info = (uint8_t)(b & 0x1F);
 
   switch (major) {
-    case 0: return decode_unsigned(mrb, r, info);
-    case 1: return decode_negative(mrb, r, info);
-    case 2: return decode_bytes(mrb, r, src, info);
-    case 3: return decode_text(mrb, r, src, info);
-    case 4: return decode_array(mrb, r, src, info, sharedrefs, false);
-    case 5: return decode_map(mrb, r, src, info, sharedrefs, false);
+    case 0:
+      result = decode_unsigned(mrb, r, info);
+      break;
+    case 1:
+      result = decode_negative(mrb, r, info);
+      break;
+    case 2:
+      result = decode_bytes(mrb, r, src, info);
+      break;
+    case 3:
+      result = decode_text(mrb, r, src, info);
+      break;
+    case 4:
+      result = decode_array(mrb, r, src, info, sharedrefs, false);
+      break;
+    case 5:
+      result = decode_map(mrb, r, src, info, sharedrefs, false);
+      break;
     case 6: {
       /* tag is already an mrb_value — no conversion needed for hash lookup or
          ivar storage, and mrb_cmp handles all comparisons without C numerics */
@@ -680,58 +722,85 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 #ifdef MRB_USE_BIGINT
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(2)) == 0 ||
           mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0) {
-        return decode_tagged_bignum(mrb, r, src, tag);
+        result = decode_tagged_bignum(mrb, r, src, tag);
+        goto done;
       }
 #endif
 
-      if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0)
-        return decode_tag_sharedrefs(mrb, r, src, sharedrefs);
-      if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0)
-        return decode_tag_sharedref(mrb, r, sharedrefs);
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
+        result = decode_tag_sharedrefs(mrb, r, src, sharedrefs);
+        goto done;
+      }
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0) {
+        result = decode_tag_sharedref(mrb, r, sharedrefs);
+        goto done;
+      }
+      if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
+        result = decode_symbol(mrb, r, src, sharedrefs);
+        goto done;
+      }
 
       /* Check tag registry before falling back to UnhandledTag */
       {
         mrb_value reg   = cbor_tag_registry(mrb);
         mrb_value klass = mrb_hash_fetch(mrb, reg, tag, mrb_undef_value());
         if (mrb_class_p(klass)) {
-          return decode_registered_tag(mrb, r, src, sharedrefs, klass);
+          result = decode_registered_tag(mrb, r, src, sharedrefs, klass);
+          goto done;
         }
       }
-
-      /* Tag 39: Symbol */
-      if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0)
-        return decode_symbol(mrb, r, src, sharedrefs);
 
       /* Unknown tag: wrap in UnhandledTag */
       mrb_value tagged_value = decode_value(mrb, r, src, sharedrefs);
       struct RClass *unhandled_tag = mrb_class_get_under_id(mrb,
         mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
-      mrb_value result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
+      result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
       mrb_iv_set(mrb, result, MRB_IVSYM(tag),   tag);   /* already mrb_value */
       mrb_iv_set(mrb, result, MRB_IVSYM(value), tagged_value);
-      return result;
+      goto done;
     }
 
     case 7:
-      if (info < 20) return mrb_nil_value();
+      if (info < 20) {
+        result = mrb_nil_value();
+        break;
+      }
       switch (info) {
-        case 20: return mrb_false_value();
-        case 21: return mrb_true_value();
+        case 20:
+          result = mrb_false_value();
+          break;
+        case 21:
+          result = mrb_true_value();
+          break;
         case 22:
-        case 23: return mrb_nil_value();
-        case 24: return decode_null_with_skip(mrb, r, info);
+        case 23:
+          result = mrb_nil_value();
+          break;
+        case 24:
+          result = decode_null_with_skip(mrb, r, info);
+          break;
 #ifndef MRB_NO_FLOAT
         case 25:
         case 26:
-        case 27: return decode_float(mrb, r, info);
+        case 27:
+          result = decode_float(mrb, r, info);
+          break;
 #endif
-        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+        case 31:
+          mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+          break;
       }
-      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
+      if (unlikely(mrb_undef_p(result)))
+        mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
+      break;
+
+    default:
+      mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type %d", major);
   }
 
-  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type %d", major);
-  return mrb_undef_value();
+done:
+  r->depth--;
+  return result;
 }
 
 static void
@@ -979,11 +1048,9 @@ encode_bignum(CborWriter *w, mrb_value obj)
   if (mrb_bint_size(mrb, obj) <= 8) {
     if (sign >= 0) {
       encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
-    } else {
-      encode_int64(w, mrb_bint_as_int64(mrb, obj));
+      mrb_gc_arena_restore(mrb, idx);
+      return;
     }
-    mrb_gc_arena_restore(mrb, idx);
-    return;
   }
 
   mrb_value mag = mrb_bint_abs(mrb, obj);
@@ -1632,6 +1699,9 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
 static void
 skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
 {
+  reader_check_depth(mrb, r);
+  r->depth++;
+
   if (unlikely(r->p >= r->end))
     mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
 
@@ -1644,14 +1714,14 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     case 0: /* unsigned integer */
     case 1: /* negative integer */
       if (info >= 24) read_cbor_uint(mrb, r, info); /* consume extra bytes */
-      return;
+      break;
 
     case 2: /* byte string */
     case 3: { /* text string */
       mrb_value len_v = read_cbor_uint(mrb, r, info);
       mrb_int len = cbor_value_to_len(mrb, len_v);
       reader_advance_checked(mrb, r, len);
-      return;
+      break;
     }
 
     case 4: { /* array */
@@ -1659,7 +1729,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
       mrb_int len = cbor_value_to_len(mrb, len_v);
       for (mrb_int i = 0; i < len; i++)
         skip_cbor(mrb, r, buf, sharedrefs);
-      return;
+      break;
     }
 
     case 5: { /* map */
@@ -1669,7 +1739,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
         skip_cbor(mrb, r, buf, sharedrefs); /* key */
         skip_cbor(mrb, r, buf, sharedrefs); /* value */
       }
-      return;
+      break;
     }
 
     case 6: {
@@ -1687,26 +1757,30 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
       /* tag 29: just skip the uint index, nothing to register */
 
       skip_cbor(mrb, r, buf, sharedrefs);
-      return;
+      break;
     }
 
     case 7: {
-      if (info < 24) return;
+      if (info < 24) break;
       switch (info) {
-        case 24: if (likely(r->p < r->end)) { r->p++; return; }
+        case 24: if (likely(r->p < r->end)) { r->p++; break; }
                  mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
-        case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; return; }
+        case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; break; }
                  mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
-        case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; return; }
+        case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; break; }
                  mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
-        case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; return; }
+        case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; break; }
                  mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
         case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       }
+      break;
     }
+
+    default:
+      mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
   }
 
-  mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
+  r->depth--;
 }
 
 /* Lazy#value */
@@ -1727,6 +1801,7 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
     r.base = base;
     r.p    = base + p->offset;
     r.end  = base + total_len;
+    r.depth = 0;
 
     mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
     if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) value = cbor_lazy_value(mrb, value);
@@ -1763,6 +1838,7 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
     r->base = base;
     r->p    = base + p->offset;
     r->end  = base + total_len;
+    r->depth = 0;
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
   }
@@ -1938,6 +2014,11 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 
   if (nkeys == 0) return self;
 
+  /* Limit dig nesting to prevent pathological recursion */
+  if (unlikely(nkeys > CBOR_MAX_DEPTH / 2)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR#dig nesting too deep");
+  }
+
   mrb_value current = self;
 
   for (mrb_int ki = 0; ki < nkeys; ki++) {
@@ -1968,6 +2049,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     r.base = base;
     r.p    = base + p->offset;
     r.end  = base + total;
+    r.depth = 0;
 
     reader_read_header(mrb, &r);
     mrb_value dig_resolved;

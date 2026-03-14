@@ -990,20 +990,10 @@ encode_integer(CborWriter *w, mrb_int n)
   }
 }
 
-static void
+static inline void
 encode_uint64(CborWriter *w, uint64_t v)
 {
   encode_len(w, 0, v);
-}
-
-static void
-encode_int64(CborWriter *w, int64_t n)
-{
-  if (n >= 0) {
-    encode_len(w, 0, (uint64_t)n);
-  } else {
-    encode_len(w, 1, (uint64_t)(-1 - n));
-  }
 }
 
 // ============================================================================

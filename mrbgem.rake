@@ -1,8 +1,11 @@
+require_relative 'mrblib/version'
+
 MRuby::Gem::Specification.new('mruby-cbor') do |spec|
 
   spec.license = 'Apache-2'
   spec.author  = 'Hendrik Beskow'
   spec.summary = 'CBOR implementation for mruby'
+  spec.version = CBOR::VERSION
   spec.add_dependency 'mruby-c-ext-helpers'
   spec.add_dependency 'mruby-time'
   spec.add_dependency 'mruby-string-is-utf8'

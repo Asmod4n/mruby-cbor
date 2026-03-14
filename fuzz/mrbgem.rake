@@ -1,6 +1,6 @@
 MRuby::Gem::Specification.new('mruby-cbor-fuzzer') do |spec|
-  spec.license = 'MIT'
-  spec.author  = 'Meastro'
+  spec.license = 'Apache-2'
+  spec.author  = 'Asmod4n'
   spec.summary = 'libFuzzer harness for mruby-cbor'
 
   spec.bins = %w[mruby-cbor-fuzzer]

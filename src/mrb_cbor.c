@@ -416,7 +416,6 @@ decode_null_with_skip(mrb_state *mrb, Reader *r, uint8_t info)
 static mrb_value
 decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 {
-  mrb_float f;
 
   switch (info) {
     case 25: { /* Float16 */
@@ -453,7 +452,7 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 
       float f32;
       memcpy(&f32, &u, sizeof(float));
-      f = (mrb_float)f32;
+      return mrb_convert_float(mrb, f32);
       break;
     }
 
@@ -466,7 +465,7 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 
       float f32;
       memcpy(&f32, &u, sizeof(float));
-      f = (mrb_float)f32;
+      return mrb_convert_float(mrb, f32);
       break;
     }
 
@@ -483,16 +482,15 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 
       double f64;
       memcpy(&f64, &u, sizeof(double));
-      f = (mrb_float)f64;
+      return mrb_convert_double(mrb, f64);
       break;
     }
 
     default:
       mrb_raise(mrb, E_RUNTIME_ERROR, "invalid float encoding");
-      f = 0;
   }
 
-  return mrb_float_value(mrb, f);
+  return mrb_undef_value();
 }
 #endif
 

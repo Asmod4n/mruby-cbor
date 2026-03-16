@@ -16,7 +16,7 @@
 | **Shared References** | Tags 28/29 for deduplication, including cyclic structures |
 | **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
 | **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with key and result caching |
-| **Streaming** | `CBOR.stream` for CBOR sequence reading |
+| **Streaming** | `CBOR.stream` for CBOR sequences from strings, files, and sockets |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
 
 ### ⚠️ Limitations & Design Decisions
@@ -28,7 +28,7 @@
 **Determinism Guarantees:**
 - Encoding is deterministic *within a single mruby build*
 - Hash field order follows insertion order (per mruby hash impl)
-- Float width (16/32/64) is compile-time fixed via `MRB_USE_FLOAT32`
+- Float width is compile-time fixed via `MRB_USE_FLOAT32` (f32 build) or defaults to f64
 - Symbol encoding strategy is global; don't mix `no_symbols` / `symbols_as_string` / `symbols_as_uint32` in the same program
 - **Not deterministic across builds** if you rebuild mruby with different CFLAGS or config
 
@@ -47,7 +47,7 @@ Exceeding this raises `RuntimeError: "CBOR nesting depth exceeded"`. Override by
 - **Encoding:** ~30% faster than msgpack (SBO + incremental writes)
 - **Lazy decoding:** 1.3–3× faster than simdjson for selective access
 - **Shared refs:** Tags 28/29 deduplication is O(1) amortized
-- **Float encoding:** No overhead; width selection happens once per value at encode time
+- **Float encoding:** Width is fixed at compile time; no runtime overhead
 
 **When to use lazy decoding:**
 - Decoding large payloads where you only access a subset of fields
@@ -98,7 +98,7 @@ lazy["missing"]              # => KeyError (raises)
 lazy.dig("missing", "text")  # => nil (safe)
 ```
 
-**Performance:** Access is O(n) only in skipped elements, not the full document. Keys and Results are cached for O(1) repeated access.
+**Performance:** Access is O(n) only in skipped elements, not the full document. Keys and results are cached for O(1) repeated access.
 ```ruby
 # Repeated access uses cache
 inner = lazy["outer"]["inner"].value
@@ -161,7 +161,7 @@ class Person
   # Called before encoding (optional)
   # Must return self or a modified object
   def _before_encode
-    @age += 1 if @age < 18  # Example transformation
+    @age += 1 if @age < 18
     self
   end
 end
@@ -174,7 +174,7 @@ person.name = "Alice"
 person.age = 30
 
 encoded = CBOR.encode(person)
-decoded = CBOR.decode(encoded)  # => Person object, after_decode called
+decoded = CBOR.decode(encoded)  # => Person object, _after_decode called
 ```
 
 **Available Types:**
@@ -235,7 +235,24 @@ decoded = CBOR.decode(encoded)  # => :hello (symbol preserved, same mruby only)
 
 ### Streaming
 
-Read a sequence of CBOR documents from any File-like object:
+`CBOR.stream` reads a sequence of CBOR documents from a String, File, or socket. It dispatches automatically based on the source type.
+
+**From a String:**
+```ruby
+buf = CBOR.encode("hello") + CBOR.encode("world")
+
+CBOR.stream(buf) do |doc|
+  puts doc.value
+end
+
+# With offset (skip the first document)
+CBOR.stream(buf, skip) { |doc| ... }
+
+# As an enumerator
+CBOR.stream(buf).map(&:value)  # => ["hello", "world"]
+```
+
+**From a File:**
 ```ruby
 File.open("data.cbor", "rb") do |f|
   CBOR.stream(f) do |doc|
@@ -243,9 +260,45 @@ File.open("data.cbor", "rb") do |f|
   end
 end
 
-# Or as an enumerator
-docs = CBOR.stream(f).map(&:value)
+# With byte offset into the file
+File.open("data.cbor", "rb") do |f|
+  CBOR.stream(f, 1024) { |doc| ... }
+end
 ```
+
+**From a Socket (block form — drives the read loop):**
+```ruby
+sock = TCPSocket.new("host", 1234)
+
+CBOR.stream(sock) do |doc|
+  handle(doc.value)
+end
+```
+
+**From a Socket (no-block form — returns a `CBOR::StreamDecoder`):**
+
+Use this when you control the read loop yourself, e.g. in an event-driven or async context:
+
+```ruby
+decoder = CBOR.stream(sock) { |doc| handle(doc.value) }
+# or equivalently:
+decoder = CBOR::StreamDecoder.new { |doc| handle(doc.value) }
+
+# Feed chunks as they arrive
+while chunk = sock.recv(4096)
+  decoder.feed(chunk)
+end
+```
+
+`StreamDecoder` buffers only the minimum bytes needed to complete the current document. Once a document is decoded and yielded, its bytes are discarded immediately — each `CBOR::Lazy` owns its own view of the data and is independent of the decoder's internal buffer.
+
+**Dispatch rules:**
+
+| Source type | Detection | Behaviour |
+|-------------|-----------|-----------|
+| String-like | reponds to `bytesize` and `byteslice` | Walks buffer directly, no copy |
+| Socket-like | responds to `recv` | Accumulates chunks, yields complete docs |
+| File-like   | responds to `seek` and `read` | Uses `seek`+`read` with doubling read-ahead |
 
 ---
 
@@ -253,7 +306,7 @@ docs = CBOR.stream(f).map(&:value)
 
 Add to your `build_config.rb`:
 ```ruby
-conf.gem github: "Asmod4n/mruby-cbor"
+conf.gem mgem: "mruby-cbor"
 ```
 
 Then build:
@@ -273,6 +326,7 @@ rake test
 | `RuntimeError` | Nesting depth exceeded | Deeply nested structures beyond `CBOR_MAX_DEPTH` |
 | `RuntimeError` | Truncated/invalid CBOR | `CBOR.decode(incomplete_buffer)` |
 | `TypeError` | Type mismatch in registered tags | Field marked as String gets an Array |
+| `TypeError` | Unknown stream source | `CBOR.stream(42)` |
 | `KeyError` | Lazy access to missing key | `lazy["nonexistent"]` (use `.dig` to get nil instead) |
 | `NotImplementedError` | Presym on non-presym mruby | `CBOR.symbols_as_uint32` on build without presym |
 

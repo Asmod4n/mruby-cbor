@@ -1897,3 +1897,135 @@ assert('CBOR registered tag: extra fields do not corrupt registered fields') do
   # Verify extra fields don't leak into the object's ivars
   assert_equal 2, decoded.instance_variables.length  # Only @id and @name
 end
+
+# ============================================================================
+# CBOR.stream
+# ============================================================================
+
+assert('CBOR.stream: string with single doc') do
+  buf = CBOR.encode({"a" => 1})
+  docs = []
+  CBOR.stream(buf) {|d| docs << d.value }
+  assert_equal 1, docs.length
+  assert_equal({"a" => 1}, docs[0])
+end
+
+assert('CBOR.stream: string with multiple docs') do
+  buf = CBOR.encode(1) + CBOR.encode(2) + CBOR.encode(3)
+  docs = []
+  CBOR.stream(buf) {|d| docs << d.value }
+  assert_equal [1, 2, 3], docs
+end
+
+assert('CBOR.stream: string with offset') do
+  buf = CBOR.encode(1) + CBOR.encode(2) + CBOR.encode(3)
+  skip = CBOR.encode(1).bytesize
+  docs = []
+  CBOR.stream(buf, skip) {|d| docs << d.value }
+  assert_equal [2, 3], docs
+end
+
+assert('CBOR.stream: string without block returns enumerator') do
+  buf = CBOR.encode(1) + CBOR.encode(2)
+  e = CBOR.stream(buf)
+  assert_true e.respond_to?(:each)
+end
+
+assert('CBOR.stream: file-like io') do
+  class MockFile
+    def initialize(data)
+      @data = data
+      @pos  = 0
+    end
+    def path; "mock"; end
+    def seek(pos); @pos = pos; end
+    def read(n)
+      return nil if @pos >= @data.bytesize
+      slice = @data.byteslice(@pos, n)
+      @pos += slice.bytesize
+      slice
+    end
+  end
+
+  buf = CBOR.encode("x") + CBOR.encode("y") + CBOR.encode("z")
+  io  = MockFile.new(buf)
+  docs = []
+  CBOR.stream(io) {|d| docs << d.value }
+  assert_equal ["x", "y", "z"], docs
+end
+
+assert('CBOR.stream: file-like io with offset') do
+  buf  = CBOR.encode("x") + CBOR.encode("y") + CBOR.encode("z")
+  skip = CBOR.encode("x").bytesize
+  io   = MockFile.new(buf)
+  docs = []
+  CBOR.stream(io, skip) {|d| docs << d.value }
+  assert_equal ["y", "z"], docs
+end
+
+assert('CBOR.stream: socket-like io single chunk') do
+  class MockSocket
+    def initialize(data)
+      @data = data
+      @pos  = 0
+    end
+    def recv(n)
+      return nil if @pos >= @data.bytesize
+      slice = @data.byteslice(@pos, n)
+      @pos += slice.bytesize
+      slice
+    end
+    def read(n); recv(n); end
+  end
+
+  buf = CBOR.encode(42) + CBOR.encode(43)
+  io  = MockSocket.new(buf)
+  docs = []
+  CBOR.stream(io) {|d| docs << d.value }
+  assert_equal [42, 43], docs
+end
+
+assert('CBOR.stream: socket-like io fragmented chunks') do
+  buf = CBOR.encode({"key" => "value"}) + CBOR.encode([1, 2, 3])
+
+  class FragSocket
+    def initialize(data, chunk_size)
+      @data       = data
+      @pos        = 0
+      @chunk_size = chunk_size
+    end
+    def recv(n)
+      return nil if @pos >= @data.bytesize
+      take  = [@chunk_size, @data.bytesize - @pos].min
+      slice = @data.byteslice(@pos, take)
+      @pos += take
+      slice
+    end
+    def read(n); recv(n); end
+  end
+
+  io   = FragSocket.new(buf, 2)
+  docs = []
+  CBOR.stream(io) {|d| docs << d.value }
+  assert_equal [{"key" => "value"}, [1, 2, 3]], docs
+end
+
+assert('CBOR.stream: socket without block returns StreamDecoder') do
+  io  = MockSocket.new("")
+  dec = CBOR.stream(io)
+  assert_true dec.respond_to?(:feed)
+end
+
+assert('CBOR.stream: StreamDecoder fed in chunks') do
+  buf  = CBOR.encode("hello") + CBOR.encode("world")
+  docs = []
+  dec  = CBOR::StreamDecoder.new {|d| docs << d.value }
+
+  # feed one byte at a time
+  buf.each_byte {|b| dec.feed(b.chr) }
+  assert_equal ["hello", "world"], docs
+end
+
+assert('CBOR.stream: type error on unknown io') do
+  assert_raise(TypeError) { CBOR.stream(42) }
+end

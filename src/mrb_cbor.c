@@ -71,7 +71,7 @@ reader_init(Reader* r, const uint8_t* buf, size_t len)
   r->depth  = 0;
 }
 
-static inline void
+static void
 reader_check_depth(mrb_state *mrb, Reader *r)
 {
   if (likely(r->depth < CBOR_MAX_DEPTH))
@@ -105,7 +105,7 @@ static mrb_value cbor_tag_rev_registry(mrb_state *mrb);
 static void      encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num);
 static mrb_value decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value klass);
 
-static inline mrb_int
+static mrb_int
 cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
 {
   mrb_int i = mrb_integer(mrb_to_int(mrb, mrb_convert_ptrdiff(mrb, p - base)));
@@ -255,7 +255,7 @@ ensure_slice_bounds(mrb_state* mrb, mrb_value src, mrb_int off, mrb_int blen)
 // ============================================================================
 // Integers
 // ============================================================================
-static inline mrb_value
+static mrb_value
 decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
 {
   return read_cbor_uint(mrb, r, info);
@@ -304,7 +304,7 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
       r->p += blen;
       return slice;
     }
-    mrb_raise(mrb, E_RUNTIME_ERROR, "string slice isn't utf8");
+    mrb_raise(mrb, E_TYPE_ERROR, "string slice isn't utf8");
 #else
     r->p += blen;
     return slice;
@@ -331,18 +331,18 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 
 static mrb_value
 decode_array(mrb_state* mrb, Reader* r, mrb_value src,
-             uint8_t info, mrb_value shared, bool reg)
+             uint8_t info, mrb_value sharedrefs, bool reg)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value ary = mrb_ary_new(mrb);
 
   if (reg) {
-    mrb_ary_push(mrb, shared, ary);
+    mrb_ary_push(mrb, sharedrefs, ary);
   }
 
   for (mrb_int i = 0; i < len; i++) {
-    mrb_value v = decode_value(mrb, r, src, shared);
+    mrb_value v = decode_value(mrb, r, src, sharedrefs);
     mrb_ary_push(mrb, ary, v);
   }
 
@@ -351,19 +351,19 @@ decode_array(mrb_state* mrb, Reader* r, mrb_value src,
 
 static mrb_value
 decode_map(mrb_state* mrb, Reader* r, mrb_value src,
-           uint8_t info, mrb_value shared, bool reg)
+           uint8_t info, mrb_value sharedrefs, bool reg)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value hash = mrb_hash_new(mrb);
 
   if (reg) {
-    mrb_ary_push(mrb, shared, hash);
+    mrb_ary_push(mrb, sharedrefs, hash);
   }
 
   for (mrb_int i = 0; i < len; i++) {
-    mrb_value key = decode_value(mrb, r, src, shared);
-    mrb_value val = decode_value(mrb, r, src, shared);
+    mrb_value key = decode_value(mrb, r, src, sharedrefs);
+    mrb_value val = decode_value(mrb, r, src, sharedrefs);
     mrb_hash_set(mrb, hash, key, val);
   }
 
@@ -527,20 +527,20 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 
 static mrb_value
 decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
-                     mrb_value src, mrb_value sharedrefs_array)
+                     mrb_value src, mrb_value sharedrefs)
 {
   uint8_t nb = reader_read8(mrb, r);
   uint8_t major = nb >> 5;
   uint8_t info  = nb & 0x1F;
 
   switch (major) {
-    case 4: return decode_array(mrb, r, src, info, sharedrefs_array, true);
-    case 5: return decode_map(mrb, r, src, info, sharedrefs_array, true);
+    case 4: return decode_array(mrb, r, src, info, sharedrefs, true);
+    case 5: return decode_map(mrb, r, src, info, sharedrefs, true);
   }
 
   r->p--;
-  mrb_value v = decode_value(mrb, r, src, sharedrefs_array);
-  mrb_ary_push(mrb, sharedrefs_array, v);
+  mrb_value v = decode_value(mrb, r, src, sharedrefs);
+  mrb_ary_push(mrb, sharedrefs, v);
   return v;
 }
 
@@ -566,7 +566,7 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
       mrb_raise(mrb, E_TYPE_ERROR, "sharedref payload must be unsigned integer");
     }
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: sharedrefs is not a array");
   }
 
   return mrb_undef_value();
@@ -785,7 +785,7 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
     w->heap_capa = (size_t)RSTR_CAPA(s);
   } else {
     mrb_state *mrb = w->mrb;
-    mrb_raise(w->mrb, E_RANGE_ERROR, "heap size overflow");
+    mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
   }
 }
 
@@ -826,7 +826,7 @@ cbor_writer_finish(CborWriter *w)
     w->heap_ptr[w->heap_len] = '\0';
     return w->heap_str;
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "heap string is not a string");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: heap string is not a string");
   }
   return mrb_undef_value();
 }
@@ -864,7 +864,7 @@ static void encode_integer(CborWriter *w, mrb_int n)
   else        encode_len(w, 1, (uint64_t)(-1 - n));
 }
 
-static inline void encode_uint64(CborWriter *w, uint64_t v) { encode_len(w, 0, v); }
+static void encode_uint64(CborWriter *w, uint64_t v) { encode_len(w, 0, v); }
 
 // ============================================================================
 // Shared reference tracking
@@ -876,7 +876,7 @@ encode_check_shared(CborWriter *w, mrb_value obj)
   if (mrb_undef_p(w->seen)) return FALSE;
   mrb_state *mrb = w->mrb;
 
-  mrb_value id_key = mrb_int_value(mrb, mrb_obj_id(obj));
+  mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
   mrb_value found  = mrb_hash_get(mrb, w->seen, id_key);
 
   if (mrb_integer_p(found)) {
@@ -886,7 +886,7 @@ encode_check_shared(CborWriter *w, mrb_value obj)
     return TRUE;
   }
 
-  mrb_hash_set(mrb, w->seen, id_key, mrb_int_value(mrb, mrb_hash_size(mrb, w->seen)));
+  mrb_hash_set(mrb, w->seen, id_key, mrb_convert_mrb_int(mrb, mrb_hash_size(mrb, w->seen)));
   uint8_t tag28[2] = { 0xD8, 0x1C };
   cbor_writer_write(w, tag28, 2);
   return FALSE;
@@ -955,14 +955,15 @@ static void encode_value(CborWriter* w, mrb_value obj);
 static void
 encode_array(CborWriter* w, mrb_value ary)
 {
-  unsigned int was_frozen = mrb_basic_ptr(ary)->frozen;
-  mrb_basic_ptr(ary)->frozen = TRUE;
+  struct RBasic *basic_ary = mrb_basic_ptr(ary);
+  unsigned int was_frozen = basic_ary->frozen;
+  basic_ary->frozen = TRUE;
   struct RArray *a = mrb_ary_ptr(ary);
   mrb_int len = ARY_LEN(a);
   encode_len(w, 4, (uint64_t)len);
   mrb_value *ptr = ARY_PTR(a);
   for (mrb_int i = 0; i < len; i++) encode_value(w, ptr[i]);
-  mrb_basic_ptr(ary)->frozen = was_frozen;
+  basic_ary->frozen = was_frozen;
 }
 
 static int
@@ -978,13 +979,14 @@ static void
 encode_map(CborWriter* w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
-  unsigned int was_frozen = mrb_basic_ptr(hash)->frozen;
-  mrb_basic_ptr(hash)->frozen = TRUE;
+  struct RBasic *basic_hash = mrb_basic_ptr(hash);
+  unsigned int was_frozen = basic_hash->frozen;
+  basic_hash->frozen = TRUE;
   struct RHash *h = mrb_hash_ptr(hash);
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
   mrb_hash_foreach(mrb, h, encode_map_foreach, w);
-  mrb_basic_ptr(hash)->frozen = was_frozen;
+  basic_hash->frozen = was_frozen;
 }
 
 static void
@@ -1080,9 +1082,9 @@ encode_value(CborWriter* w, mrb_value obj)
     case MRB_TT_FLOAT:  encode_float(w, mrb_float(obj)); break;
 #endif
     case MRB_TT_INTEGER: encode_integer(w, mrb_integer(obj)); break;
-    case MRB_TT_STRING:  encode_string(w, obj); break;
-    case MRB_TT_ARRAY:   encode_array(w, obj); break;
     case MRB_TT_HASH:    encode_map(w, obj); break;
+    case MRB_TT_ARRAY:   encode_array(w, obj); break;
+    case MRB_TT_STRING:  encode_string(w, obj); break;
 #ifdef MRB_USE_BIGINT
     case MRB_TT_BIGINT:  encode_bignum(w, obj); break;
 #endif
@@ -1100,11 +1102,6 @@ encode_value(CborWriter* w, mrb_value obj)
 
   w->depth--;
 }
-
-// ============================================================================
-// Ruby bindings
-// ============================================================================
-
 
 // ============================================================================
 // CBOR::Lazy
@@ -1338,7 +1335,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
           mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
           mrb_ary_push(mrb, sharedrefs, lazy);
         } else {
-          mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
+          mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: sharedrefs is not a array");
         }
       }
       skip_cbor(mrb, r, buf, sharedrefs);
@@ -1531,7 +1528,7 @@ lazy_fetch_from_cache(mrb_state *mrb, mrb_value self, mrb_value key)
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
   if (likely(mrb_hash_p(kcache)))
     return mrb_hash_fetch(mrb, kcache, key, mrb_undef_value());
-  mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
+  mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: kcache corrupted");
   return mrb_undef_value();
 }
 
@@ -1609,7 +1606,7 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
 
     mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "kcache is not a hash");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: kcache corrupted");
   }
   return mrb_undef_value();
 }
@@ -1630,9 +1627,20 @@ lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value sharedrefs,
   return r->major;
 }
 
+static mrb_value cbor_lazy_aref_r(mrb_state *mrb, mrb_value self, mrb_value key, mrb_int depth);
+
 static mrb_value
 cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
 {
+  return cbor_lazy_aref_r(mrb, self, key, 0);
+}
+
+static mrb_value
+cbor_lazy_aref_r(mrb_state *mrb, mrb_value self, mrb_value key, mrb_int depth)
+{
+  if (unlikely(depth >= CBOR_MAX_DEPTH))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+
   mrb_value cached = lazy_fetch_from_cache(mrb, self, key);
   if (!mrb_undef_p(cached)) return cached;
 
@@ -1650,13 +1658,13 @@ cbor_lazy_aref(mrb_state *mrb, mrb_value self, mrb_value key)
       case 5: return lazy_aref_map(mrb, &r, key, self, p, sharedrefs);
       case 0xFF:
         if (mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type))
-          return cbor_lazy_aref(mrb, resolved, key);
+          return cbor_lazy_aref_r(mrb, resolved, key, depth + 1);
         /* fall through */
       default:
         mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
     }
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: sharedrefs corrupted");
   }
   return mrb_undef_value();
 }
@@ -1704,7 +1712,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
       mrb_value cached = mrb_hash_fetch(mrb, kcache, key, mrb_undef_value());
       if (!mrb_undef_p(cached)) { current = cached; continue; }
     } else {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "kcache is not a hash");
+      mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: kcache corrupted");
     }
 
     const uint8_t *base    = (const uint8_t*)RSTRING_PTR(p->buf);
@@ -1952,8 +1960,6 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value buf)
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
 }
 
-/* mrb_cbor_lazy_value: already exported as MRB_API cbor_lazy_value() in the
- * existing code. Renamed here to match the header. */
 MRB_API mrb_value
 mrb_cbor_lazy_value(mrb_state *mrb, mrb_value lazy)
 {
@@ -1974,9 +1980,9 @@ mrb_cbor_doc_end(mrb_state *mrb, mrb_value buf, mrb_int offset)
 }
 
 MRB_API void
-mrb_cbor_register_tag(mrb_state *mrb, mrb_int tag_num, struct RClass *klass)
+mrb_cbor_register_tag(mrb_state *mrb, uint64_t tag_num, struct RClass *klass)
 {
-  cbor_register_tag_impl(mrb, mrb_convert_mrb_int(mrb, tag_num), mrb_obj_value(klass));
+  cbor_register_tag_impl(mrb, mrb_convert_uint64(mrb, tag_num), mrb_obj_value(klass));
 }
 
 MRB_API void

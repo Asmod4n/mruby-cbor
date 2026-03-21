@@ -20,6 +20,7 @@ MRB_END_DECL
 #include <stddef.h>
 #include <string.h>
 #include <stdbool.h>
+#include <mruby/cbor.h>
 
 /* Configurable CBOR recursion depth limits */
 #ifndef CBOR_MAX_DEPTH
@@ -802,7 +803,7 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
           cbor_writer_init_heap(w, len);
         } else {
           mrb_state *mrb = w->mrb;
-          mrb_raise(w->mrb, E_RANGE_ERROR, "heap size overflow");
+          mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
         }
       }
       cbor_writer_ensure_heap(w, len);
@@ -992,7 +993,7 @@ encode_string(CborWriter* w, mrb_value str)
   const char* p = RSTRING_PTR(str);
   mrb_int blen  = RSTRING_LEN(str);
   if (mrb_str_is_utf8(str)) encode_len(w, 3, (uint64_t)blen);
-  else                       encode_len(w, 2, (uint64_t)blen);
+  else                      encode_len(w, 2, (uint64_t)blen);
   cbor_writer_write(w, (const uint8_t*)p, (size_t)blen);
 }
 
@@ -1103,46 +1104,7 @@ encode_value(CborWriter* w, mrb_value obj)
 // ============================================================================
 // Ruby bindings
 // ============================================================================
-static mrb_value
-mrb_cbor_encode(mrb_state* mrb, mrb_value self)
-{
-  mrb_value obj;
-  (void)self;
 
-  mrb_kwargs kwargs;
-  mrb_sym    kw_keys[1]   = { MRB_SYM(sharedrefs) };
-  mrb_value  kw_values[1] = { mrb_undef_value() };
-  kwargs.num      = 1;
-  kwargs.required = 0;
-  kwargs.table    = kw_keys;
-  kwargs.values   = kw_values;
-  kwargs.rest     = NULL;
-
-  mrb_get_args(mrb, "o:", &obj, &kwargs);
-
-  CborWriter w;
-  cbor_writer_init(&w, mrb);
-
-  if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
-    w.seen = mrb_hash_new(mrb);
-  }
-
-  encode_value(&w, obj);
-  return cbor_writer_finish(&w);
-}
-
-static mrb_value
-mrb_cbor_decode(mrb_state* mrb, mrb_value self)
-{
-  mrb_value src;
-  Reader r;
-  (void)self;
-
-  mrb_get_args(mrb, "S", &src);
-  src = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
-  reader_init(&r, (const uint8_t*)RSTRING_PTR(src), (size_t)RSTRING_LEN(src));
-  return decode_value(mrb, &r, src, mrb_ary_new(mrb));
-}
 
 // ============================================================================
 // CBOR::Lazy
@@ -1203,40 +1165,6 @@ cbor_tag_rev_registry(mrb_state *mrb)
   return reg;
 }
 
-static mrb_value
-mrb_cbor_register_tag(mrb_state *mrb, mrb_value self)
-{
-  mrb_value tag_v;
-  mrb_value klass;
-  mrb_get_args(mrb, "oC", &tag_v, &klass);
-
-  if (!mrb_integer_p(tag_v))
-    mrb_raise(mrb, E_TYPE_ERROR, "tag must be an integer");
-
-  static const int reserved[] = { 2, 3, 28, 29, 39 };
-  for (uint8_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
-    if (unlikely(mrb_cmp(mrb, tag_v, mrb_fixnum_value(reserved[i])) == 0))
-      mrb_raisef(mrb, E_ARGUMENT_ERROR,
-        "tag %v is reserved for internal CBOR use", tag_v);
-  }
-
-  {
-    struct RClass *kp = mrb_class_ptr(klass);
-    if (unlikely(MRB_INSTANCE_TT(kp) != MRB_TT_OBJECT))
-      mrb_raise(mrb, E_TYPE_ERROR,
-        "registered tag class must be a plain Ruby class (not CDATA or other native type)");
-    if (unlikely(kp == mrb->string_class  || kp == mrb->array_class   ||
-                 kp == mrb->hash_class    || kp == mrb->float_class   ||
-                 kp == mrb->integer_class || kp == mrb->true_class    ||
-                 kp == mrb->false_class   || kp == mrb->nil_class     ||
-                 kp == mrb->symbol_class  || kp == mrb->eException_class))
-      mrb_raise(mrb, E_TYPE_ERROR, "cannot register built-in class as CBOR tag");
-  }
-
-  mrb_hash_set(mrb, cbor_tag_registry(mrb),     tag_v, klass);
-  mrb_hash_set(mrb, cbor_tag_rev_registry(mrb), klass, tag_v);
-  return mrb_nil_value();
-}
 
 static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 
@@ -1244,7 +1172,7 @@ static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 // Registered tag encode/decode
 //
 // The schema value stored by native_ext_type is now a Class (or Module).
-// mrb_ned_check_type handles the is_a? check via mrb_obj_is_kind_of.
+// mrb_net_check_type handles the is_a? check via mrb_obj_is_kind_of.
 // ============================================================================
 
 typedef struct {
@@ -1265,7 +1193,7 @@ encode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value schema_ty
 
   mrb_value val = mrb_iv_get(mrb, obj, mrb_symbol(sym));
 
-  if (likely(mrb_ned_check_type(mrb, schema_type, val))) {
+  if (likely(mrb_net_check_type(mrb, schema_type, val))) {
     encode_len(w, 3, (uint64_t)slen);
     cbor_writer_write(w, (const uint8_t*)sname, (size_t)slen);
     encode_value(w, val);
@@ -1317,7 +1245,7 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value schema_ty
   mrb_value val = mrb_hash_fetch(mrb, ctx->payload, map_key, mrb_undef_value());
 
   if (!mrb_undef_p(val)) {
-    if (likely(mrb_ned_check_type(mrb, schema_type, val))) {
+    if (likely(mrb_net_check_type(mrb, schema_type, val))) {
       mrb_iv_set(mrb, ctx->obj, mrb_symbol(sym), val);
     } else {
       mrb_raisef(mrb, E_TYPE_ERROR,
@@ -1325,7 +1253,7 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value schema_ty
         sym, schema_type, mrb_obj_value(mrb_class(mrb, val)));
     }
   }
-  /* Fields absent from the payload are silently skipped (security: whitelist). */
+  /* Fields absent from the payload are silently skipped (security: allowlist). */
 
   return 0;
 }
@@ -1559,24 +1487,21 @@ cbor_doc_end(mrb_state *mrb, const uint8_t *buf, size_t buf_len, mrb_int offset)
   return mrb_convert_ptrdiff(mrb, (r.p - buf));
 }
 
-static mrb_value
-mrb_cbor_doc_end(mrb_state *mrb, mrb_value self)
-{
-  mrb_value buf;
-  mrb_int offset = 0;
-  (void)self;
-
-  mrb_get_args(mrb, "S|i", &buf, &offset);
-  return cbor_doc_end(mrb,
-    (const uint8_t*)RSTRING_PTR(buf),
-    (size_t)RSTRING_LEN(buf),
-    offset);
-}
-
 /* Lazy#value */
-MRB_API mrb_value
+static mrb_value cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth);
+
+static mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
 {
+  return cbor_lazy_value_r(mrb, self, 0);
+}
+
+static mrb_value
+cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
+{
+  if (unlikely(depth >= CBOR_MAX_DEPTH))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+
   mrb_value vcache = mrb_iv_get(mrb, self, MRB_SYM(vcache));
   if (!mrb_undef_p(vcache)) return vcache;
 
@@ -1587,11 +1512,11 @@ cbor_lazy_value(mrb_state *mrb, mrb_value self)
 
   if (likely((size_t)p->offset < total_len)) {
     Reader r;
-    r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = 0;
+    r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = depth;
 
     mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
     if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type))
-      value = cbor_lazy_value(mrb, value);
+      value = cbor_lazy_value_r(mrb, value, r.depth + 1);
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
@@ -1745,7 +1670,7 @@ cbor_lazy_aref_m(mrb_state *mrb, mrb_value self)
 }
 
 static mrb_value
-mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value self)
+cbor_decode_rb_lazy(mrb_state *mrb, mrb_value self)
 {
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
@@ -1881,7 +1806,178 @@ cbor_symbols_as_uint32(mrb_state *mrb, mrb_value self)
   return self;
 }
 
+static void
+cbor_register_tag_impl(mrb_state *mrb, mrb_value tag_v, mrb_value klass)
+{
+  if (!mrb_integer_p(tag_v))
+    mrb_raise(mrb, E_TYPE_ERROR, "tag must be an integer");
+
+  static const int reserved[] = { 2, 3, 28, 29, 39 };
+  for (uint8_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    if (unlikely(mrb_cmp(mrb, tag_v, mrb_fixnum_value(reserved[i])) == 0))
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "tag %v is reserved for internal CBOR use", tag_v);
+  }
+
+  {
+    struct RClass *kp = mrb_class_ptr(klass);
+    if (unlikely(MRB_INSTANCE_TT(kp) != MRB_TT_OBJECT))
+      mrb_raise(mrb, E_TYPE_ERROR,
+        "registered tag class must be a plain Ruby class (not CDATA or other native type)");
+    if (unlikely(kp == mrb->string_class  || kp == mrb->array_class   ||
+                 kp == mrb->hash_class    || kp == mrb->float_class   ||
+                 kp == mrb->integer_class || kp == mrb->true_class    ||
+                 kp == mrb->false_class   || kp == mrb->nil_class     ||
+                 kp == mrb->symbol_class  || kp == mrb->eException_class))
+      mrb_raise(mrb, E_TYPE_ERROR, "cannot register built-in class as CBOR tag");
+  }
+
+  mrb_hash_set(mrb, cbor_tag_registry(mrb),     tag_v, klass);
+  mrb_hash_set(mrb, cbor_tag_rev_registry(mrb), klass, tag_v);
+}
+
+/* Ruby binding: CBOR.register_tag(tag, klass) */
+static mrb_value
+cbor_register_tag_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value tag_v;
+  mrb_value klass;
+  mrb_get_args(mrb, "oC", &tag_v, &klass);
+  (void)self;
+  cbor_register_tag_impl(mrb, tag_v, klass);
+  return mrb_nil_value();
+}
+
+/* ── Step 2: rename Ruby binding functions ──────────────────────────────── */
+
+/* CBOR.encode(obj, sharedrefs: false) — Ruby binding */
+static mrb_value
+cbor_encode_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value obj;
+  (void)self;
+
+  mrb_kwargs kwargs;
+  mrb_sym    kw_keys[1]   = { MRB_SYM(sharedrefs) };
+  mrb_value  kw_values[1] = { mrb_undef_value() };
+  kwargs.num      = 1;
+  kwargs.required = 0;
+  kwargs.table    = kw_keys;
+  kwargs.values   = kw_values;
+  kwargs.rest     = NULL;
+
+  mrb_get_args(mrb, "o:", &obj, &kwargs);
+
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
+
+  if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
+    w.seen = mrb_hash_new(mrb);
+  }
+
+  encode_value(&w, obj);
+  return cbor_writer_finish(&w);
+}
+
+/* CBOR.decode(buf) — Ruby binding */
+static mrb_value
+cbor_decode_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value src;
+  Reader r;
+  (void)self;
+
+  mrb_get_args(mrb, "S", &src);
+  src = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
+  reader_init(&r, (const uint8_t*)RSTRING_PTR(src), (size_t)RSTRING_LEN(src));
+  return decode_value(mrb, &r, src, mrb_ary_new(mrb));
+}
+
+/* CBOR.doc_end(buf, offset=0) — Ruby binding */
+static mrb_value
+cbor_doc_end_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value buf;
+  mrb_int offset = 0;
+  (void)self;
+
+  mrb_get_args(mrb, "S|i", &buf, &offset);
+  return cbor_doc_end(mrb,
+    (const uint8_t*)RSTRING_PTR(buf),
+    (size_t)RSTRING_LEN(buf),
+    offset);
+}
+
 MRB_BEGIN_DECL
+
+MRB_API mrb_value
+mrb_cbor_encode(mrb_state *mrb, mrb_value obj)
+{
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
+  encode_value(&w, obj);
+  return cbor_writer_finish(&w);
+}
+
+MRB_API mrb_value
+mrb_cbor_encode_sharedrefs(mrb_state *mrb, mrb_value obj)
+{
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
+  w.seen = mrb_hash_new(mrb);
+  encode_value(&w, obj);
+  return cbor_writer_finish(&w);
+}
+
+MRB_API mrb_value
+mrb_cbor_decode(mrb_state *mrb, mrb_value buf)
+{
+  if (likely(mrb_string_p(buf))) {
+    mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+    Reader r;
+    reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
+    return decode_value(mrb, &r, owned, mrb_ary_new(mrb));
+  }
+  mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
+}
+
+MRB_API mrb_value
+mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value buf)
+{
+  if (likely(mrb_string_p(buf))) {
+    mrb_value owned      = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+    mrb_value sharedrefs = mrb_ary_new(mrb);
+    return cbor_lazy_new(mrb, owned, 0, sharedrefs);
+  }
+  mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
+}
+
+/* mrb_cbor_lazy_value: already exported as MRB_API cbor_lazy_value() in the
+ * existing code. Renamed here to match the header. */
+MRB_API mrb_value
+mrb_cbor_lazy_value(mrb_state *mrb, mrb_value lazy)
+{
+  mrb_data_check_type(mrb, lazy, &cbor_lazy_type);
+  return cbor_lazy_value(mrb, lazy);
+}
+
+MRB_API mrb_value
+mrb_cbor_doc_end(mrb_state *mrb, mrb_value buf, mrb_int offset)
+{
+  if (likely(mrb_string_p(buf))) {
+    return cbor_doc_end(mrb,
+      (const uint8_t*)RSTRING_PTR(buf),
+      (size_t)RSTRING_LEN(buf),
+      offset);
+  }
+  mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
+}
+
+MRB_API void
+mrb_cbor_register_tag(mrb_state *mrb, mrb_int tag_num, struct RClass *klass)
+{
+  cbor_register_tag_impl(mrb, mrb_convert_mrb_int(mrb, tag_num), mrb_obj_value(klass));
+}
 
 MRB_API void
 mrb_mruby_cbor_gem_init(mrb_state* mrb)
@@ -1890,11 +1986,11 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(no_symbols),       cbor_no_symbols,       MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32),cbor_symbols_as_uint32,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string),cbor_symbols_as_string,MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           mrb_cbor_decode,       MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),     mrb_cbor_register_tag, MRB_ARGS_REQ(2));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           mrb_cbor_encode,       MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          mrb_cbor_doc_end,      MRB_ARGS_ARG(1,1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),      mrb_cbor_decode_lazy,  MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           cbor_decode_rb,       MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),     cbor_register_tag_rb, MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           cbor_encode_rb,       MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          cbor_doc_end_rb,      MRB_ARGS_ARG(1,1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),      cbor_decode_rb_lazy,  MRB_ARGS_REQ(1));
 
   struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);

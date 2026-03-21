@@ -156,6 +156,7 @@ class Person
   native_ext_type :@name,    String
   native_ext_type :@age,     Integer
   native_ext_type :@address, Address   # nested registered class
+  native_ext_type :@has_kids, TrueClass, FalseClass
 
   # Called after decoding (optional)
   def _after_decode
@@ -180,11 +181,13 @@ person = Person.new
 person.instance_variable_set(:@name, "Alice")
 person.instance_variable_set(:@age, 30)
 person.instance_variable_set(:@address, addr)
+person.instance_variable_set(:@has_kids, true)
 
 encoded = CBOR.encode(person)
 decoded = CBOR.decode(encoded)  # => Person object, _after_decode called
 
-decoded.instance_variable_get(:@name)                            # => "Alice"
+decoded.instance_variable_get(:@name)                           # => "Alice"
+decoded.instance_variable_get(:@has_kids)                       # => true
 decoded.instance_variable_get(:@address).class                  # => Address
 decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Berlin"
 ```

@@ -1,6 +1,6 @@
 assert('CBOR encode/decode primitives') do
   assert_equal 123, CBOR.decode(CBOR.encode(123))
-  assert_equal -5,  CBOR.decode(CBOR.encode(-5))
+  assert_equal(-5,  CBOR.decode(CBOR.encode(-5)))
   assert_equal true, CBOR.decode(CBOR.encode(true))
   assert_equal false, CBOR.decode(CBOR.encode(false))
   assert_equal nil, CBOR.decode(CBOR.encode(nil))

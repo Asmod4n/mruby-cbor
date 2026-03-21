@@ -156,7 +156,7 @@ class Person
   native_ext_type :@name,    String
   native_ext_type :@age,     Integer
   native_ext_type :@address, Address   # nested registered class
-  native_ext_type :@has_kids, TrueClass, FalseClass
+  native_ext_type :@has_kids, TrueClass, FalseClass # you could also add NilClass here to make a value be present but not set.
 
   # Called after decoding (optional)
   def _after_decode
@@ -199,6 +199,7 @@ decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Be
 | `String` | UTF-8 strings and byte strings |
 | `Integer` | Integer values (fixnum or bigint) |
 | `Float` | Floating-point values |
+| `Numeric` | Any Numeric value |
 | `Array` | Arrays |
 | `Hash` | Maps |
 | `TrueClass` / `FalseClass` | Booleans |
@@ -206,6 +207,7 @@ decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Be
 | Any registered class | Instances of that class (or subclasses) |
 
 Type checking uses `is_a?`, so inheritance works: a schema of `Numeric` accepts both `Integer` and `Float`, and a schema of `Animal` accepts any subclass of `Animal`.
+You can mix and match any number of classes to represent whatever you need.
 
 Fields absent from a decoded payload are silently skipped — only declared ivars are populated (allowlist model). Extra fields in the payload are ignored.
 

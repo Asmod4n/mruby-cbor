@@ -9,7 +9,6 @@ end
 assert('CBOR text and bytes') do
   s = "hällo"
   b = "\0\xFF\xFE\xFA"
-
   assert_equal s, CBOR.decode(CBOR.encode(s))
   assert_equal b, CBOR.decode(CBOR.encode(b))
 end
@@ -119,7 +118,6 @@ assert('CBOR bignum roundtrip') do
   assert_equal big, CBOR.decode(CBOR.encode(big))
 end
 
-
 assert('CBOR negative bignum roundtrip') do
   big = -(1 << 200) - 999
   assert_equal(big, CBOR.decode(CBOR.encode(big)))
@@ -141,7 +139,6 @@ assert('CBOR negative bignum boundary: -(2^64)') do
 end
 
 assert('CBOR very large bignum (4 KB)') do
-  # 32768-bit number
   big = (1 << 32768) + 123456789
   assert_equal big, CBOR.decode(CBOR.encode(big))
 end
@@ -171,7 +168,6 @@ assert('CBOR bignum does not corrupt following lazy values') do
 end
 
 assert('CBOR shared ref: two refs to same array (eager)') do
-  # 82 D8 1C 82 01 02 D8 1D 00
   buf = "\x82\xD8\x1C\x82\x01\x02\xD8\x1D\x00"
   result = CBOR.decode(buf)
   assert_equal [[1, 2], [1, 2]], result
@@ -179,7 +175,6 @@ assert('CBOR shared ref: two refs to same array (eager)') do
 end
 
 assert('CBOR shared ref: map with shared value (eager)') do
-  # A2 61 61 D8 1C 83 01 02 03 61 62 D8 1D 00
   buf = "\xA2\x61\x61\xD8\x1C\x83\x01\x02\x03\x61\x62\xD8\x1D\x00"
   result = CBOR.decode(buf)
   assert_equal [1, 2, 3], result["a"]
@@ -188,7 +183,6 @@ assert('CBOR shared ref: map with shared value (eager)') do
 end
 
 assert('CBOR shared ref: cyclic array (eager)') do
-  # D8 1C 81 D8 1D 00
   buf = "\xD8\x1C\x81\xD8\x1D\x00"
   result = CBOR.decode(buf)
   assert_same result, result[0]
@@ -215,14 +209,11 @@ assert('CBOR shared ref: cyclic array (lazy)') do
 end
 
 assert('CBOR shared ref: invalid index raises') do
-  # Standalone Tag29(99) - shareable table is empty, index 99 not found
-  # D8 1D 18 63  =  Tag(29), uint8(99)
   buf = "\xD8\x1D\x18\x63"
   assert_raise(IndexError) { CBOR.decode(buf) }
 end
 
 assert('CBOR shared ref: scalar shareable (integer)') do
-  # [Tag28(42), Tag29(0)]
   buf = "\x82\xD8\x1C\x18\x2A\xD8\x1D\x00"
   result = CBOR.decode(buf)
   assert_equal [42, 42], result
@@ -231,10 +222,8 @@ end
 assert('CBOR shared ref: two refs to same array (eager)') do
   a = [1, 2]
   obj = [a, a]
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_equal [[1, 2], [1, 2]], result
   assert_same result[0], result[1]
 end
@@ -242,10 +231,8 @@ end
 assert('CBOR shared ref: map with shared value (eager)') do
   v = [1, 2, 3]
   obj = { "a" => v, "b" => v }
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_equal [1, 2, 3], result["a"]
   assert_equal [1, 2, 3], result["b"]
   assert_same result["a"], result["b"]
@@ -254,20 +241,16 @@ end
 assert('CBOR shared ref: cyclic array (eager)') do
   a = []
   a << a
-
   buf = CBOR.encode(a, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_same result, result[0]
 end
 
 assert('CBOR shared ref: two refs to same array (lazy)') do
   a = [1, 2]
   obj = [a, a]
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode_lazy(buf).value
-
   assert_equal [[1, 2], [1, 2]], result
   assert_same result[0], result[1]
 end
@@ -275,10 +258,8 @@ end
 assert('CBOR shared ref: map with shared value (lazy)') do
   v = [1, 2, 3]
   obj = { "a" => v, "b" => v }
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode_lazy(buf).value
-
   assert_equal [1, 2, 3], result["a"]
   assert_same result["a"], result["b"]
 end
@@ -286,24 +267,18 @@ end
 assert('CBOR shared ref: cyclic array (lazy)') do
   a = []
   a << a
-
   buf = CBOR.encode(a, sharedrefs: true)
   result = CBOR.decode_lazy(buf).value
-
   assert_same result, result[0]
 end
 
 assert('CBOR lazy sharedref: tag28 inside lazy path without prior registration') do
-
   buf = "\xA2" \
         "\x65outer" \
         "\xD8\x1C\x82\x01\x02" \
         "\x63ref" \
         "\xD8\x1D\x00"
-
   lazy = CBOR.decode_lazy(buf)
-
-
   assert_equal [1,2], lazy["ref"].value
 end
 
@@ -355,13 +330,13 @@ assert('CBOR symbols_as_string: in arrays') do
 end
 
 # ============================================================================
-# register_tag
+# register_tag — now uses Ruby classes for native_ext_type
 # ============================================================================
 
 assert('CBOR register_tag: encode and decode custom class') do
   class Point
-    native_ext_type :@x, CBOR::Type::Integer
-    native_ext_type :@y, CBOR::Type::Integer
+    native_ext_type :@x, Integer
+    native_ext_type :@y, Integer
 
     def initialize(x, y)
       @x = x
@@ -377,7 +352,9 @@ assert('CBOR register_tag: encode and decode custom class') do
     end
 
     def ==(other)
-      other.is_a?(Point) && @x == other.instance_variable_get(:@x) && @y == other.instance_variable_get(:@y)
+      other.is_a?(Point) &&
+        @x == other.instance_variable_get(:@x) &&
+        @y == other.instance_variable_get(:@y)
     end
   end
 
@@ -413,8 +390,6 @@ end
 # ============================================================================
 
 assert('CBOR UnhandledTag: unknown tag wraps value') do
-  # Tag 100 (unknown), payload integer 42
-  # D8 64 = tag(100), 18 2A = uint8(42)
   buf = "\xD8\x64\x18\x2A"
   result = CBOR.decode(buf)
   assert_true result.is_a?(CBOR::UnhandledTag)
@@ -423,7 +398,7 @@ assert('CBOR UnhandledTag: unknown tag wraps value') do
 end
 
 assert('CBOR UnhandledTag: unknown tag with string payload') do
-  buf = "\xD8\x64\x63\x61\x62\x63"  # tag(100) + "abc"
+  buf = "\xD8\x64\x63\x61\x62\x63"
   result = CBOR.decode(buf)
   assert_true result.is_a?(CBOR::UnhandledTag)
   assert_equal "abc", result.value
@@ -441,19 +416,15 @@ end
 # ============================================================================
 
 assert('CBOR float: positive infinity roundtrip') do
-  f = Float::INFINITY
-  assert_equal f, CBOR.decode(CBOR.encode(f))
+  assert_equal Float::INFINITY, CBOR.decode(CBOR.encode(Float::INFINITY))
 end
 
 assert('CBOR float: negative infinity roundtrip') do
-  f = -Float::INFINITY
-  assert_equal f, CBOR.decode(CBOR.encode(f))
+  assert_equal(-Float::INFINITY, CBOR.decode(CBOR.encode(-Float::INFINITY)))
 end
 
 assert('CBOR float: NaN roundtrip') do
-  f = Float::NAN
-  result = CBOR.decode(CBOR.encode(f))
-  assert_true result.nan?
+  assert_true CBOR.decode(CBOR.encode(Float::NAN)).nan?
 end
 
 assert('CBOR float: zero roundtrip') do
@@ -461,8 +432,7 @@ assert('CBOR float: zero roundtrip') do
 end
 
 assert('CBOR float: negative zero roundtrip') do
-  result = CBOR.decode(CBOR.encode(-0.0))
-  assert_equal 0.0, result
+  assert_equal 0.0, CBOR.decode(CBOR.encode(-0.0))
 end
 
 assert('CBOR float: small float roundtrip') do
@@ -475,41 +445,29 @@ assert('CBOR float: large float roundtrip') do
 end
 
 assert('CBOR float16: decode 1.0') do
-  # F9 3C 00 = float16(1.0)
-  buf = "\xF9\x3C\x00"
-  assert_equal 1.0, CBOR.decode(buf)
+  assert_equal 1.0, CBOR.decode("\xF9\x3C\x00")
 end
 
 assert('CBOR float16: decode 0.0') do
-  # F9 00 00 = float16(0.0)
-  buf = "\xF9\x00\x00"
-  assert_equal 0.0, CBOR.decode(buf)
+  assert_equal 0.0, CBOR.decode("\xF9\x00\x00")
 end
 
 assert('CBOR float16: decode infinity') do
-  # F9 7C 00 = float16(+Inf)
-  buf = "\xF9\x7C\x00"
-  assert_equal Float::INFINITY, CBOR.decode(buf)
+  assert_equal Float::INFINITY, CBOR.decode("\xF9\x7C\x00")
 end
 
 assert('CBOR float16: decode NaN') do
-  # F9 7E 00 = float16(NaN)
-  buf = "\xF9\x7E\x00"
-  assert_true CBOR.decode(buf).nan?
+  assert_true CBOR.decode("\xF9\x7E\x00").nan?
 end
 
 assert('CBOR float16: decode subnormal') do
-  # F9 00 01 = float16 subnormal (smallest positive subnormal)
-  buf = "\xF9\x00\x01"
-  result = CBOR.decode(buf)
+  result = CBOR.decode("\xF9\x00\x01")
   assert_true result > 0.0
   assert_true result < 1.0e-4
 end
 
 assert('CBOR float32: decode 1.0') do
-  # FA 3F 80 00 00 = float32(1.0)
-  buf = "\xFA\x3F\x80\x00\x00"
-  assert_equal 1.0, CBOR.decode(buf)
+  assert_equal 1.0, CBOR.decode("\xFA\x3F\x80\x00\x00")
 end
 
 # ============================================================================
@@ -517,16 +475,12 @@ end
 # ============================================================================
 
 assert('CBOR simple value with skip (info=24)') do
-  # F8 00 = simple(0) with one-byte payload — decoded as nil
-  buf = "\xF8\x00"
-  assert_nil CBOR.decode(buf)
+  assert_nil CBOR.decode("\xF8\x00")
 end
 
 assert('CBOR simple values below 20 decode as nil') do
-  # major 7, info 0..19 -> nil
   (0..19).each do |i|
-    buf = (0xE0 | i).chr
-    assert_nil CBOR.decode(buf)
+    assert_nil CBOR.decode((0xE0 | i).chr)
   end
 end
 
@@ -638,7 +592,6 @@ assert('CBOR shared ref: no sharedrefs by default') do
   obj = [s, s]
   buf = CBOR.encode(obj)
   result = CBOR.decode(buf)
-  # values equal but not necessarily same object
   assert_equal result[0], result[1]
 end
 
@@ -656,7 +609,7 @@ end
 # ============================================================================
 
 assert('CBOR integer: MRB_INT_MAX roundtrip') do
-  n = 2**30 - 1  # safe for 32-bit mrb_int
+  n = 2**30 - 1
   assert_equal n, CBOR.decode(CBOR.encode(n))
 end
 
@@ -764,10 +717,10 @@ assert('CBOR.stream: multiple concatenated documents') do
   io   = MockIO.new(doc1 + doc2 + doc3)
   results = []
   CBOR.stream(io) { |doc| results << doc.value }
-  assert_equal 3,              results.length
-  assert_equal({ "a" => 1 },  results[0])
-  assert_equal [1, 2, 3],     results[1]
-  assert_equal 42,            results[2]
+  assert_equal 3,             results.length
+  assert_equal({ "a" => 1 }, results[0])
+  assert_equal [1, 2, 3],    results[1]
+  assert_equal 42,           results[2]
 end
 
 assert('CBOR.stream: document shorter than 9 bytes') do
@@ -838,17 +791,7 @@ assert('CBOR.stream: document containing shared refs') do
 end
 
 assert('CBOR.stream: documents with various integer sizes') do
-  docs = [
-    0,           # 0 bits
-    23,          # inline
-    24,          # uint8 boundary
-    255,         # uint8 max
-    256,         # uint16 boundary
-    65535,       # uint16 max
-    65536,       # uint32 boundary
-    0xFFFFFFFF,  # uint32 max
-    0x100000000, # uint64 boundary
-  ]
+  docs = [0, 23, 24, 255, 256, 65535, 65536, 0xFFFFFFFF, 0x100000000]
   buf = docs.map { |n| CBOR.encode(n) }.join
   io  = MockIO.new(buf)
   results = []
@@ -856,21 +799,17 @@ assert('CBOR.stream: documents with various integer sizes') do
   assert_equal docs, results
 end
 
-
 assert('CBOR integer overflow: negative uint32 boundary') do
-  # major 1, value 0xFFFFFFFF => -4294967296
   buf = "\x3A\xFF\xFF\xFF\xFF"
   assert_equal(-(2**32), CBOR.decode(buf))
 end
 
 assert('CBOR integer overflow: negative uint64 > MRB_INT_MAX+1') do
-  # major 1, value 0x8000000000000000
   buf = "\x3B\x80\x00\x00\x00\x00\x00\x00\x00"
   assert_equal(-(2**63) - 1, CBOR.decode(buf))
 end
 
 assert('CBOR integer overflow: unsigned uint64 > MRB_INT_MAX+1') do
-  # major 0, value 0xFFFFFFFFFFFFFFFF
   buf = "\x1B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
   assert_equal(2**64 - 1, CBOR.decode(buf))
 end
@@ -881,21 +820,14 @@ assert('CBOR array with bigint length raises') do
 end
 
 assert('CBOR negative integer: -1 - UINT64_MAX') do
-  # major 1, info 27, value 0xFFFFFFFFFFFFFFFF
-  # decoded as -1 - UINT64_MAX = -2^64
   buf = "\x3B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
   begin
     result = CBOR.decode(buf)
-    assert_equal(-(2**64), result)  # MRB_USE_BIGINT path
+    assert_equal(-(2**64), result)
   rescue RangeError
-    # kein MRB_USE_BIGINT, raise ist korrekt
+    # no MRB_USE_BIGINT — raise is correct
   end
 end
-
-# ============================================================================
-# Additional comprehensive test suite for mruby-cbor
-# These tests complement test.rb and cover additional edge cases
-# ============================================================================
 
 # ============================================================================
 # Lazy decoding with registered tags
@@ -903,20 +835,18 @@ end
 
 assert('CBOR register_tag: lazy decode with custom class') do
   class Point
-    native_ext_type :@x, CBOR::Type::Integer
-    native_ext_type :@y, CBOR::Type::Integer
+    native_ext_type :@x, Integer
+    native_ext_type :@y, Integer
 
     def initialize(x = 0, y = 0)
       @x = x
       @y = y
     end
 
-    def from_allocate
-      self
-    end
-
     def ==(other)
-      other.is_a?(Point) && @x == other.instance_variable_get(:@x) && @y == other.instance_variable_get(:@y)
+      other.is_a?(Point) &&
+        @x == other.instance_variable_get(:@x) &&
+        @y == other.instance_variable_get(:@y)
     end
   end
 
@@ -928,20 +858,16 @@ assert('CBOR register_tag: lazy decode with custom class') do
   decoded = lazy.value
 
   assert_true decoded.is_a?(Point)
-  assert_equal 5, decoded.instance_variable_get(:@x)
+  assert_equal 5,  decoded.instance_variable_get(:@x)
   assert_equal 10, decoded.instance_variable_get(:@y)
 end
 
 assert('CBOR register_tag: lazy nested access through registered tag') do
   class Rect
-    native_ext_type :@corners, CBOR::Type::Array
+    native_ext_type :@corners, Array
 
     def initialize(corners = [])
       @corners = corners
-    end
-
-    def from_allocate
-      self
     end
   end
 
@@ -951,7 +877,6 @@ assert('CBOR register_tag: lazy nested access through registered tag') do
   buf = CBOR.encode(rect)
   lazy = CBOR.decode_lazy(buf)
 
-  # Access first corner via lazy
   first = lazy.dig("corners", 0)
   assert_not_nil first
   assert_equal 0, first[0].value
@@ -964,7 +889,6 @@ end
 assert('CBOR::Lazy: repeated dig calls on same path') do
   h = { "a" => { "b" => { "c" => { "d" => 42 } } } }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
   100.times do
     result = lazy.dig("a", "b", "c", "d")
     assert_equal 42, result.value
@@ -980,10 +904,7 @@ assert('CBOR::Lazy: interleaved access patterns') do
     ],
     "meta" => { "count" => 3 }
   }
-
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
-  # Access in non-sequential order
   assert_equal "Carol", lazy["users"][2]["name"].value
   assert_equal 1, lazy["users"][0]["id"].value
   assert_equal 3, lazy["meta"]["count"].value
@@ -993,39 +914,29 @@ end
 assert('CBOR::Lazy: access on shared structure (eager materialization)') do
   shared_val = { "data" => [1, 2, 3] }
   obj = { "x" => shared_val, "y" => shared_val }
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode_lazy(buf).value
-
-  # Verify identity is preserved
   assert_same result["x"], result["y"]
   assert_equal [1, 2, 3], result["x"]["data"]
 end
 
 assert('CBOR::Lazy: cyclic structure eager materialization') do
-  # Build cyclic: a=[a]
   a = []
   a << a
-
   buf = CBOR.encode(a, sharedrefs: true)
   result = CBOR.decode_lazy(buf).value
-
-  # Verify cyclic identity
   assert_same result, result[0]
 end
 
 assert('CBOR::Lazy: array with mixed types') do
   ary = [42, "hello", 3.14, true, nil, [1, 2], { "x" => 9 }]
   lazy = CBOR.decode_lazy(CBOR.encode(ary))
-
-  assert_equal 42, lazy[0].value
+  assert_equal 42,      lazy[0].value
   assert_equal "hello", lazy[1].value
-  # Float comparison with tolerance
-  result = lazy[2].value
-  assert_true (result - 3.14).abs < 0.01
-  assert_equal true, lazy[3].value
-  assert_nil lazy[4].value
-  assert_equal [1, 2], lazy[5].value
+  assert_true (lazy[2].value - 3.14).abs < 0.01
+  assert_equal true,    lazy[3].value
+  assert_nil            lazy[4].value
+  assert_equal [1, 2],  lazy[5].value
   assert_equal({ "x" => 9 }, lazy[6].value)
 end
 
@@ -1034,14 +945,10 @@ end
 # ============================================================================
 
 assert('CBOR tag: unknown tag wrapping another unknown tag') do
-  # Tag100(Tag101(42))
   buf = "\xD8\x64\xD8\x65\x18\x2A"
   result = CBOR.decode(buf)
-
   assert_true result.is_a?(CBOR::UnhandledTag)
   assert_equal 100, result.tag
-
-  # Inner value should also be UnhandledTag
   inner = result.value
   assert_true inner.is_a?(CBOR::UnhandledTag)
   assert_equal 101, inner.tag
@@ -1049,20 +956,16 @@ assert('CBOR tag: unknown tag wrapping another unknown tag') do
 end
 
 assert('CBOR tag: unknown tag wrapping array') do
-  # Tag200([1, 2, 3])
   buf = "\xD8\xC8\x83\x01\x02\x03"
   result = CBOR.decode(buf)
-
   assert_true result.is_a?(CBOR::UnhandledTag)
   assert_equal 200, result.tag
   assert_equal [1, 2, 3], result.value
 end
 
 assert('CBOR tag: unknown tag wrapping map') do
-  # Tag300({ "x" => 1 })
   buf = "\xD9\x01\x2C\xA1\x61\x78\x01"
   result = CBOR.decode(buf)
-
   assert_true result.is_a?(CBOR::UnhandledTag)
   assert_equal 300, result.tag
   assert_equal({ "x" => 1 }, result.value)
@@ -1070,9 +973,7 @@ end
 
 assert('CBOR tag: lazy decode of unknown tag') do
   buf = "\xD8\x64\x18\x2A"
-  lazy = CBOR.decode_lazy(buf)
-  result = lazy.value
-
+  result = CBOR.decode_lazy(buf).value
   assert_true result.is_a?(CBOR::UnhandledTag)
   assert_equal 100, result.tag
   assert_equal 42, result.value
@@ -1162,26 +1063,16 @@ end
 
 assert('CBOR tag: unknown wrapping registered tag') do
   class SimpleValue
-    native_ext_type :@val, CBOR::Type::Integer
+    native_ext_type :@val, Integer
 
     def initialize(val = 0)
       @val = val
-    end
-
-    def from_allocate
-      self
     end
   end
 
   CBOR.register_tag(2000, SimpleValue)
 
-  # Tag100(Tag2000({val: 42}))
   obj = SimpleValue.new(42)
-  inner_buf = CBOR.encode(obj)
-
-  # Manually wrap in unknown tag 100
-  # Can't easily construct this without manual binary construction
-  # So encode-decode roundtrip to verify nesting works
   wrapped = { "tagged" => obj }
   buf = CBOR.encode(wrapped)
   result = CBOR.decode(buf)
@@ -1191,40 +1082,30 @@ assert('CBOR tag: unknown wrapping registered tag') do
 end
 
 assert('CBOR tag: unknown in lazy array with mixed tags') do
-  # [Tag100(1), Tag100(2), 3, "text"]
   buf = "\x84\xD8\x64\x01\xD8\x64\x02\x03\x64text"
   lazy = CBOR.decode_lazy(buf)
-
-  # Access unknown tags through lazy
   elem0 = lazy[0].value
   assert_true elem0.is_a?(CBOR::UnhandledTag)
   assert_equal 100, elem0.tag
   assert_equal 1, elem0.value
-
   elem1 = lazy[1].value
   assert_true elem1.is_a?(CBOR::UnhandledTag)
   assert_equal 100, elem1.tag
   assert_equal 2, elem1.value
-
-  assert_equal 3, lazy[2].value
+  assert_equal 3,      lazy[2].value
   assert_equal "text", lazy[3].value
 end
 
 assert('CBOR tag: triple-nested unknowns in structure') do
-  # {"a": Tag100(Tag101(Tag102(42))), "b": Tag103("x")}
   buf = "\xA2\x61\x61\xD8\x64\xD8\x65\xD8\x66\x18\x2A\x61\x62\xD8\x67\x61\x78"
   result = CBOR.decode(buf)
-
   assert_true result["a"].is_a?(CBOR::UnhandledTag)
   assert_equal 100, result["a"].tag
-
   nested = result["a"].value
   assert_equal 101, nested.tag
-
   deep = nested.value
   assert_equal 102, deep.tag
   assert_equal 42, deep.value
-
   assert_true result["b"].is_a?(CBOR::UnhandledTag)
   assert_equal 103, result["b"].tag
   assert_equal "x", result["b"].value
@@ -1235,33 +1116,20 @@ end
 # ============================================================================
 
 assert('CBOR.stream: multiple documents with different major types') do
-  docs = [
-    42,
-    "hello",
-    [1, 2, 3],
-    { "x" => 1 },
-    true,
-    nil
-  ]
-
+  docs = [42, "hello", [1, 2, 3], { "x" => 1 }, true, nil]
   buf = docs.map { |d| CBOR.encode(d) }.join
   io = MockIO.new(buf)
   results = CBOR.stream(io).map(&:value)
-
   assert_equal docs.length, results.length
-  docs.each_with_index do |expected, i|
-    assert_equal expected, results[i]
-  end
+  docs.each_with_index { |expected, i| assert_equal expected, results[i] }
 end
 
 assert('CBOR.stream: document with nested shared refs') do
   inner = { "data" => [1, 2, 3] }
   obj = [inner, inner, inner]
   buf = CBOR.encode(obj, sharedrefs: true)
-
   io = MockIO.new(buf)
   results = CBOR.stream(io).map(&:value)
-
   assert_equal 1, results.length
   assert_same results[0][0], results[0][1]
   assert_same results[0][1], results[0][2]
@@ -1282,10 +1150,8 @@ assert('CBOR shared ref: deeply nested shared structure') do
   shared = [1, 2, 3]
   obj = { "a" => { "b" => { "c" => shared } } }
   obj["x"] = shared
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_same result["a"]["b"]["c"], result["x"]
 end
 
@@ -1293,10 +1159,8 @@ assert('CBOR shared ref: multiple shared objects') do
   a = [1, 2]
   b = [3, 4]
   obj = { "x" => a, "y" => a, "z" => b, "w" => b }
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_same result["x"], result["y"]
   assert_same result["z"], result["w"]
   assert_not_same result["x"], result["z"]
@@ -1305,10 +1169,8 @@ end
 assert('CBOR shared ref: shared string in array') do
   s = "shared_string"
   obj = [s, s, s, { "key" => s }]
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
   assert_same result[0], result[1]
   assert_same result[1], result[2]
   assert_same result[2], result[3]["key"]
@@ -1317,11 +1179,8 @@ end
 assert('CBOR shared ref: eager identity preservation') do
   shared = { "value" => 42 }
   obj = { "ref1" => shared, "ref2" => shared }
-
   buf = CBOR.encode(obj, sharedrefs: true)
   result = CBOR.decode(buf)
-
-  # Verify identity when decoded
   assert_same result["ref1"], result["ref2"]
   assert_equal 42, result["ref1"]["value"]
 end
@@ -1331,25 +1190,17 @@ end
 # ============================================================================
 
 assert('CBOR::Lazy: very deep nesting') do
-  # Create [[[[[42]]]]]
   deep = 42
   5.times { deep = [deep] }
-
   lazy = CBOR.decode_lazy(CBOR.encode(deep))
-
-  # Navigate to deepest value
-  result = lazy[0][0][0][0][0].value
-  assert_equal 42, result
+  assert_equal 42, lazy[0][0][0][0][0].value
 end
 
 assert('CBOR::Lazy: wide structure (many keys)') do
   h = {}
   100.times { |i| h["key_#{i}"] = i }
-
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
-  # Spot-check random keys
-  assert_equal 0, lazy["key_0"].value
+  assert_equal 0,  lazy["key_0"].value
   assert_equal 50, lazy["key_50"].value
   assert_equal 99, lazy["key_99"].value
 end
@@ -1357,13 +1208,8 @@ end
 assert('CBOR::Lazy: cache coherence across dig and aref') do
   h = { "a" => { "b" => { "c" => 99 } } }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
-  # Access via dig
-  via_dig = lazy.dig("a", "b", "c")
-  # Access via sequential aref
+  via_dig  = lazy.dig("a", "b", "c")
   via_aref = lazy["a"]["b"]["c"]
-
-  # Both should cache and return same lazy wrapper
   assert_same via_dig, via_aref
 end
 
@@ -1372,17 +1218,11 @@ end
 # ============================================================================
 
 assert('CBOR integer: all powers of 2 up to 32-bit') do
-  (0..31).each do |i|
-    n = 1 << i
-    assert_equal n, CBOR.decode(CBOR.encode(n))
-  end
+  (0..31).each { |i| n = 1 << i; assert_equal n, CBOR.decode(CBOR.encode(n)) }
 end
 
 assert('CBOR integer: negative powers of 2') do
-  (0..30).each do |i|
-    n = -(1 << i)
-    assert_equal n, CBOR.decode(CBOR.encode(n))
-  end
+  (0..30).each { |i| n = -(1 << i); assert_equal n, CBOR.decode(CBOR.encode(n)) }
 end
 
 # ============================================================================
@@ -1391,7 +1231,6 @@ end
 
 assert('CBOR symbols: nested in complex structure') do
   CBOR.symbols_as_string
-
   obj = {
     :name => "Alice",
     :metadata => {
@@ -1399,14 +1238,11 @@ assert('CBOR symbols: nested in complex structure') do
       :nested => { :sym => :value }
     }
   }
-
   buf = CBOR.encode(obj)
   decoded = CBOR.decode(buf)
-
-  assert_equal :name, decoded.keys[0]
+  assert_equal :name,      decoded.keys[0]
   assert_equal :important, decoded[:metadata][:tags][0]
-  assert_equal :value, decoded[:metadata][:nested][:sym]
-
+  assert_equal :value,     decoded[:metadata][:nested][:sym]
   CBOR.no_symbols
 end
 
@@ -1427,20 +1263,16 @@ end
 assert('CBOR bignum: in array with normal integers') do
   big = (1 << 100)
   obj = [1, 2, big, 4, 5]
-
   decoded = CBOR.decode(CBOR.encode(obj))
-
-  assert_equal 1, decoded[0]
+  assert_equal 1,   decoded[0]
   assert_equal big, decoded[2]
-  assert_equal 5, decoded[4]
+  assert_equal 5,   decoded[4]
 end
 
 assert('CBOR bignum: lazy decode in nested structure') do
   big = (1 << 200) + 12345
   obj = { "nums" => [1, 2, big], "meta" => { "big" => big } }
-
   lazy = CBOR.decode_lazy(CBOR.encode(obj))
-
   assert_equal big, lazy["nums"][2].value
   assert_equal big, lazy["meta"]["big"].value
 end
@@ -1452,7 +1284,6 @@ end
 assert('CBOR::Lazy array: negative index with dig') do
   ary = [10, 20, 30, 40, 50]
   lazy = CBOR.decode_lazy(CBOR.encode(ary))
-
   assert_equal 50, lazy.dig(-1).value
   assert_equal 40, lazy.dig(-2).value
   assert_equal 10, lazy.dig(-5).value
@@ -1461,113 +1292,66 @@ end
 assert('CBOR::Lazy array: negative out of bounds with dig') do
   ary = [1, 2, 3]
   lazy = CBOR.decode_lazy(CBOR.encode(ary))
-
-  # dig returns nil for out of bounds
   assert_nil lazy.dig(-99)
 end
-
-# ============================================================================
-# Lazy access after materializing parent
-# ============================================================================
 
 assert('CBOR::Lazy: lazy access after calling value on parent') do
   h = { "a" => { "b" => 42 } }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
-  # Materialize parent
   parent = lazy.value
-
-  # Parent is now eager, but lazy wrappers still work
   inner_lazy = lazy["a"]
   assert_not_nil inner_lazy
   assert_equal 42, inner_lazy["b"].value
 end
 
-# ============================================================================
-# Map key type consistency in lazy
-# ============================================================================
-
 assert('CBOR::Lazy map: integer and string keys mixed') do
   h = { 1 => "int_key", "str" => "str_key", 100 => "int_100" }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
   assert_equal "int_key", lazy[1].value
   assert_equal "str_key", lazy["str"].value
   assert_equal "int_100", lazy[100].value
 end
 
-# ============================================================================
-# Lazy dig with nil intermediate
-# ============================================================================
-
 assert('CBOR::Lazy dig: handles missing keys') do
   h = { "a" => 1, "b" => { "c" => 42 } }
   lazy = CBOR.decode_lazy(CBOR.encode(h))
-
-  # dig returns nil when key doesn't exist
   assert_nil lazy.dig("missing")
   assert_nil lazy.dig("missing", "x")
-
-  # dig returns value when path is valid
   assert_equal 42, lazy.dig("b", "c").value
 end
-
-# ============================================================================
-# Stream with different offsets
-# ============================================================================
 
 assert('CBOR.stream: stream documents from middle of buffer') do
   doc1 = CBOR.encode("first")
   doc2 = CBOR.encode("second")
   doc3 = CBOR.encode("third")
-
   buf = doc1 + doc2 + doc3
   io = MockIO.new(buf)
-
   results = []
   CBOR.stream(io, doc1.bytesize) { |d| results << d.value }
-
-  assert_equal 2, results.length
+  assert_equal 2,        results.length
   assert_equal "second", results[0]
-  assert_equal "third", results[1]
+  assert_equal "third",  results[1]
 end
 
-# ============================================================================
-# Unhandled tag with shared refs
-# ============================================================================
-
 assert('CBOR tag: unknown tag with various payloads') do
-  # Unknown tag with integer
-  buf1 = "\xD8\x64\x18\x2A"
-  result1 = CBOR.decode(buf1)
+  result1 = CBOR.decode("\xD8\x64\x18\x2A")
   assert_true result1.is_a?(CBOR::UnhandledTag)
   assert_equal 100, result1.tag
-  assert_equal 42, result1.value
+  assert_equal 42,  result1.value
 
-  # Unknown tag with string
-  buf2 = "\xD8\x64\x63\x61\x62\x63"
-  result2 = CBOR.decode(buf2)
+  result2 = CBOR.decode("\xD8\x64\x63\x61\x62\x63")
   assert_true result2.is_a?(CBOR::UnhandledTag)
-  assert_equal 100, result2.tag
+  assert_equal 100,   result2.tag
   assert_equal "abc", result2.value
 end
 
-# ============================================================================
-# Lazy access error conditions
-# ============================================================================
-
 assert('CBOR::Lazy: invalid array index type') do
-  ary = [1, 2, 3]
-  lazy = CBOR.decode_lazy(CBOR.encode(ary))
-
-  # String index on array raises TypeError (string can't convert to integer)
+  lazy = CBOR.decode_lazy(CBOR.encode([1, 2, 3]))
   assert_raise(TypeError) { lazy["invalid"].value }
 end
 
 assert('CBOR::Lazy: dig on integer raises') do
   lazy = CBOR.decode_lazy(CBOR.encode(42))
-
-  # dig on non-container should raise
   assert_raise(TypeError) { lazy.dig("key") }
 end
 
@@ -1578,8 +1362,8 @@ end
 assert('CBOR registered tag: _after_decode hook called') do
   class Person
     attr_accessor :name, :age
-    native_ext_type :@name, CBOR::Type::String
-    native_ext_type :@age, CBOR::Type::Integer
+    native_ext_type :@name, String
+    native_ext_type :@age,  Integer
 
     def initialize
       @loaded = false
@@ -1613,14 +1397,14 @@ end
 assert('CBOR registered tag: _before_encode hook called') do
   class Item
     attr_accessor :value
-    native_ext_type :@value, CBOR::Type::Integer
+    native_ext_type :@value, Integer
 
     def initialize(val)
       @value = val
     end
 
     def _before_encode
-      @value = @value * 2  # Double before encoding
+      @value = @value * 2
       self
     end
   end
@@ -1630,14 +1414,13 @@ assert('CBOR registered tag: _before_encode hook called') do
   item = Item.new(5)
   encoded = CBOR.encode(item)
   decoded = CBOR.decode(encoded)
-
   assert_equal 10, decoded.value
 end
 
 assert('CBOR registered tag: both hooks in sequence') do
   class Counter
     attr_accessor :count
-    native_ext_type :@count, CBOR::Type::Integer
+    native_ext_type :@count, Integer
 
     def initialize(n)
       @count = n
@@ -1657,38 +1440,31 @@ assert('CBOR registered tag: both hooks in sequence') do
       self
     end
 
-    def before_encode_called?
-      @before_encode_called
-    end
-
-    def after_decode_called?
-      @after_decode_called
-    end
+    def before_encode_called?; @before_encode_called; end
+    def after_decode_called?;  @after_decode_called;  end
   end
 
   CBOR.register_tag(1002, Counter)
 
   counter = Counter.new(10)
-
   encoded = CBOR.encode(counter)
-  assert_true counter.before_encode_called?  # _before_encode was called during encode
+  assert_true counter.before_encode_called?
   decoded = CBOR.decode(encoded)
-
-  assert_equal 12, decoded.count  # 10 + 1 (before_encode) + 1 (after_decode)
+  assert_equal 12, decoded.count
   assert_true decoded.after_decode_called?
 end
 
 assert('CBOR registered tag: _before_encode without _after_decode') do
   class Price
     attr_accessor :amount
-    native_ext_type :@amount, CBOR::Type::Integer
+    native_ext_type :@amount, Integer
 
     def initialize(val)
       @amount = val
     end
 
     def _before_encode
-      @amount = (@amount * 100).to_i  # Convert to cents
+      @amount = (@amount * 100).to_i
       self
     end
   end
@@ -1698,7 +1474,6 @@ assert('CBOR registered tag: _before_encode without _after_decode') do
   price = Price.new(5)
   encoded = CBOR.encode(price)
   decoded = CBOR.decode(encoded)
-
   assert_equal 500, decoded.amount
   assert_true decoded.is_a?(Price)
 end
@@ -1706,7 +1481,7 @@ end
 assert('CBOR registered tag: _after_decode without _before_encode') do
   class Config
     attr_accessor :timeout
-    native_ext_type :@timeout, CBOR::Type::Integer
+    native_ext_type :@timeout, Integer
 
     def initialize(val)
       @timeout = val
@@ -1719,9 +1494,7 @@ assert('CBOR registered tag: _after_decode without _before_encode') do
       self
     end
 
-    def validated?
-      @validated
-    end
+    def validated?; @validated; end
   end
 
   CBOR.register_tag(1004, Config)
@@ -1729,7 +1502,6 @@ assert('CBOR registered tag: _after_decode without _before_encode') do
   config = Config.new(30)
   encoded = CBOR.encode(config)
   decoded = CBOR.decode(encoded)
-
   assert_equal 30, decoded.timeout
   assert_true decoded.validated?
 end
@@ -1737,7 +1509,7 @@ end
 assert('CBOR registered tag: hook exception propagates') do
   class Strict
     attr_accessor :value
-    native_ext_type :@value, CBOR::Type::Integer
+    native_ext_type :@value, Integer
 
     def initialize(val)
       @value = val
@@ -1757,8 +1529,8 @@ end
 assert('CBOR registered tag: hook modifies multiple fields') do
   class User
     attr_accessor :username, :email
-    native_ext_type :@username, CBOR::Type::String
-    native_ext_type :@email, CBOR::Type::String
+    native_ext_type :@username, String
+    native_ext_type :@email,    String
 
     def initialize
       @username = ""
@@ -1777,18 +1549,16 @@ assert('CBOR registered tag: hook modifies multiple fields') do
   user = User.new
   user.username = "AlicE"
   user.email = "Alice@Example.COM"
-
   encoded = CBOR.encode(user)
   decoded = CBOR.decode(encoded)
-
-  assert_equal "alice", decoded.username
+  assert_equal "alice",             decoded.username
   assert_equal "alice@example.com", decoded.email
 end
 
 assert('CBOR registered tag: lazy decode with _after_decode') do
   class Data
     attr_accessor :value
-    native_ext_type :@value, CBOR::Type::Integer
+    native_ext_type :@value, Integer
 
     def initialize(val)
       @value = val
@@ -1800,9 +1570,7 @@ assert('CBOR registered tag: lazy decode with _after_decode') do
       self
     end
 
-    def materialized?
-      @materialized
-    end
+    def materialized?; @materialized; end
   end
 
   CBOR.register_tag(1007, Data)
@@ -1810,11 +1578,7 @@ assert('CBOR registered tag: lazy decode with _after_decode') do
   data = Data.new(99)
   encoded = CBOR.encode(data)
   lazy = CBOR.decode_lazy(encoded)
-
-  # Lazy hasn't materialized yet
   assert_false data.materialized?
-
-  # Calling .value triggers decode and _after_decode
   materialized = lazy.value
   assert_true materialized.materialized?
   assert_equal 99, materialized.value
@@ -1823,8 +1587,8 @@ end
 assert('CBOR registered tag: extra fields are silently ignored') do
   class WhitelistPerson
     attr_accessor :allowed_a, :allowed_b, :ignored_field
-    native_ext_type :@allowed_a, CBOR::Type::String
-    native_ext_type :@allowed_b, CBOR::Type::Integer
+    native_ext_type :@allowed_a, String
+    native_ext_type :@allowed_b, Integer
 
     def initialize
       @allowed_a = ""
@@ -1835,10 +1599,9 @@ assert('CBOR registered tag: extra fields are silently ignored') do
 
   CBOR.register_tag(2000, WhitelistPerson)
 
-  # Payload with extra fields mixed in
   payload_with_extras = {
-    "allowed_a" => "hello",
-    "allowed_b" => 42,
+    "allowed_a"   => "hello",
+    "allowed_b"   => 42,
     "extra_field_1" => "this should be ignored",
     "extra_field_2" => [1, 2, 3],
     "extra_field_3" => { "nested" => "data" }
@@ -1847,59 +1610,52 @@ assert('CBOR registered tag: extra fields are silently ignored') do
   payload_cbor = CBOR.encode(payload_with_extras)
   tag_bytes = "\xD9\x07\xD0"  # Tag(2000)
   tagged_cbor = tag_bytes + payload_cbor
-
-  # Decode: should only load allowed_a and allowed_b, ignore the rest
   decoded = CBOR.decode(tagged_cbor)
 
   assert_true decoded.is_a?(WhitelistPerson)
   assert_equal "hello", decoded.allowed_a
-  assert_equal 42, decoded.allowed_b
-  assert_nil decoded.ignored_field  # Not in payload, becomes nil
-
-  # The extra fields should not cause any error or be present in the object
+  assert_equal 42,      decoded.allowed_b
+  assert_nil decoded.ignored_field
 end
 
 assert('CBOR registered tag: extra fields do not corrupt registered fields') do
   class StrictRecord
     attr_accessor :id, :name
-    native_ext_type :@id, CBOR::Type::Integer
-    native_ext_type :@name, CBOR::Type::String
+    native_ext_type :@id,   Integer
+    native_ext_type :@name, String
 
     def initialize
-      @id = 0
+      @id   = 0
       @name = ""
     end
   end
 
   CBOR.register_tag(2001, StrictRecord)
 
-  # Payload with many extra fields mixed in
   payload = {
-    "id" => 999,
-    "name" => "test",
-    "secret" => "should not appear",
-    "data" => { "nested" => "ignored" },
-    "array" => [1, 2, 3, 4, 5],
-    "extra_int" => 12345,
+    "id"         => 999,
+    "name"       => "test",
+    "secret"     => "should not appear",
+    "data"       => { "nested" => "ignored" },
+    "array"      => [1, 2, 3, 4, 5],
+    "extra_int"  => 12345,
     "extra_bool" => true,
-    "extra_nil" => nil
+    "extra_nil"  => nil
   }
 
   payload_cbor = CBOR.encode(payload)
   tag_bytes = "\xD9\x07\xD1"  # Tag(2001)
   tagged_cbor = tag_bytes + payload_cbor
-
   decoded = CBOR.decode(tagged_cbor)
 
   assert_true decoded.is_a?(StrictRecord)
-  assert_equal 999, decoded.id
+  assert_equal 999,    decoded.id
   assert_equal "test", decoded.name
-  # Verify extra fields don't leak into the object's ivars
-  assert_equal 2, decoded.instance_variables.length  # Only @id and @name
+  assert_equal 2, decoded.instance_variables.length
 end
 
 # ============================================================================
-# CBOR.stream
+# CBOR.stream (string/socket variants)
 # ============================================================================
 
 assert('CBOR.stream: string with single doc') do
@@ -2020,8 +1776,6 @@ assert('CBOR.stream: StreamDecoder fed in chunks') do
   buf  = CBOR.encode("hello") + CBOR.encode("world")
   docs = []
   dec  = CBOR::StreamDecoder.new {|d| docs << d.value }
-
-  # feed one byte at a time
   buf.each_byte {|b| dec.feed(b.chr) }
   assert_equal ["hello", "world"], docs
 end

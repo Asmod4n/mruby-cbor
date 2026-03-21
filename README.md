@@ -46,7 +46,6 @@ Exceeding this raises `RuntimeError: "CBOR nesting depth exceeded"`. Override by
 
 - **Encoding:** ~30% faster than msgpack (SBO + incremental writes)
 - **Lazy decoding:** 1.3–3× faster than simdjson for selective access
-- **Shared refs:** Tags 28/29 deduplication is O(1) amortized
 - **Float encoding:** Width is fixed at compile time; no runtime overhead
 
 **When to use lazy decoding:**
@@ -143,14 +142,20 @@ result.equal?(result[0])  # => true (self-referential)
 
 ### Custom Tags & Type Registration
 
-Register your own classes for CBOR encoding/decoding.
-```ruby
-class Person
-  attr_accessor :name, :age
+Register your own classes for CBOR encoding/decoding. The `native_ext_type` DSL declares which ivars to encode/decode and their expected Ruby type. Any Ruby class works as a type constraint — including other registered classes, enabling nested structures.
 
-  # Declare which fields to encode/decode and their expected CBOR types
-  native_ext_type :@name, CBOR::Type::String
-  native_ext_type :@age, CBOR::Type::Integer
+```ruby
+class Address
+  native_ext_type :@street, String
+  native_ext_type :@city,   String
+end
+
+CBOR.register_tag(1001, Address)
+
+class Person
+  native_ext_type :@name,    String
+  native_ext_type :@age,     Integer
+  native_ext_type :@address, Address   # nested registered class
 
   # Called after decoding (optional)
   def _after_decode
@@ -158,37 +163,48 @@ class Person
     self
   end
 
-  # Called before encoding (optional)
-  # Must return self or a modified object
+  # Called before encoding (optional). Must return self or a modified object.
   def _before_encode
     @age += 1 if @age < 18
     self
   end
 end
 
-# Register with a tag number (user-defined: 1000+)
 CBOR.register_tag(1000, Person)
 
+addr = Address.new
+addr.instance_variable_set(:@street, "Main St")
+addr.instance_variable_set(:@city, "Berlin")
+
 person = Person.new
-person.name = "Alice"
-person.age = 30
+person.instance_variable_set(:@name, "Alice")
+person.instance_variable_set(:@age, 30)
+person.instance_variable_set(:@address, addr)
 
 encoded = CBOR.encode(person)
 decoded = CBOR.decode(encoded)  # => Person object, _after_decode called
+
+decoded.instance_variable_get(:@name)                            # => "Alice"
+decoded.instance_variable_get(:@address).class                  # => Address
+decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Berlin"
 ```
 
-**Available Types:**
-- `CBOR::Type::UnsignedInt`
-- `CBOR::Type::NegativeInt`
-- `CBOR::Type::String` (UTF-8 text)
-- `CBOR::Type::Bytes` (raw bytes)
-- `CBOR::Type::Array`, `CBOR::Type::Map`
-- `CBOR::Type::Tagged` (for Bigint, your own registered Tags)
-- `CBOR::Type::Simple` (nil, false, true, Floats)
+**Type constraints use standard Ruby classes:**
 
-Convenience Types:
-- `CBOR::Type::BytesOrString`
-- `CBOR::Type::Integer`
+| Schema type | Accepts |
+|-------------|---------|
+| `String` | UTF-8 strings and byte strings |
+| `Integer` | Integer values (fixnum or bigint) |
+| `Float` | Floating-point values |
+| `Array` | Arrays |
+| `Hash` | Maps |
+| `TrueClass` / `FalseClass` | Booleans |
+| `NilClass` | nil |
+| Any registered class | Instances of that class (or subclasses) |
+
+Type checking uses `is_a?`, so inheritance works: a schema of `Numeric` accepts both `Integer` and `Float`, and a schema of `Animal` accepts any subclass of `Animal`.
+
+Fields absent from a decoded payload are silently skipped — only declared ivars are populated (allowlist model). Extra fields in the payload are ignored.
 
 ---
 
@@ -280,8 +296,6 @@ end
 Use this when you control the read loop yourself, e.g. in an event-driven or async context:
 
 ```ruby
-decoder = CBOR.stream(sock) { |doc| handle(doc.value) }
-# or equivalently:
 decoder = CBOR::StreamDecoder.new { |doc| handle(doc.value) }
 
 # Feed chunks as they arrive
@@ -296,7 +310,7 @@ end
 
 | Source type | Detection | Behaviour |
 |-------------|-----------|-----------|
-| String-like | reponds to `bytesize` and `byteslice` | Walks buffer directly, no copy |
+| String-like | responds to `bytesize` and `byteslice` | Walks buffer directly, no copy |
 | Socket-like | responds to `recv` | Accumulates chunks, yields complete docs |
 | File-like   | responds to `seek` and `read` | Uses `seek`+`read` with doubling read-ahead |
 
@@ -325,7 +339,7 @@ rake test
 | `RangeError` | Integer out of bounds | Encoding a Bigint larger than uint64 |
 | `RuntimeError` | Nesting depth exceeded | Deeply nested structures beyond `CBOR_MAX_DEPTH` |
 | `RuntimeError` | Truncated/invalid CBOR | `CBOR.decode(incomplete_buffer)` |
-| `TypeError` | Type mismatch in registered tags | Field marked as String gets an Array |
+| `TypeError` | Type mismatch in registered tags | Field declared as `String` receives an `Array` |
 | `TypeError` | Unknown stream source | `CBOR.stream(42)` |
 | `KeyError` | Lazy access to missing key | `lazy["nonexistent"]` (use `.dig` to get nil instead) |
 | `NotImplementedError` | Presym on non-presym mruby | `CBOR.symbols_as_uint32` on build without presym |

@@ -113,14 +113,13 @@ static void      encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag
 static mrb_value decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value klass);
 
 /* Safe pointer-diff -> mrb_int. Raises if negative or > MRB_INT_MAX. */
-static mrb_int
+static inline mrb_int
 cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
 {
-  ptrdiff_t d = p - base;
-  if (likely(d >= 0 && d <= (ptrdiff_t)MRB_INT_MAX))
-    return (mrb_int)d;
-  mrb_raise(mrb, E_RANGE_ERROR, "CBOR offset out of range");
-  return 0;
+  mrb_int i = mrb_integer(mrb_to_int(mrb, mrb_convert_ptrdiff(mrb, p - base)));
+  if (likely(i >= 0))
+    return i;
+  mrb_raise(mrb, E_RANGE_ERROR, "ptrdiff was negative");
 }
 
 static uint8_t hex_nibble(uint8_t c)
@@ -516,7 +515,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
         r->p += len;
 
         const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
-        mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
+        const mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
 
         const uint8_t* bigbuf = buf;
 
@@ -1666,7 +1665,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
 
     case 0: /* unsigned integer */
     case 1: /* negative integer */
-      if (info >= 24) read_cbor_uint(mrb, r, info); /* consume extra bytes */
+      if (info >= 24) read_cbor_uint(mrb, r, info);
       break;
 
     case 2: /* byte string */
@@ -1689,8 +1688,8 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
       mrb_value len_v = read_cbor_uint(mrb, r, info);
       mrb_int len = cbor_value_to_len(mrb, len_v);
       for (mrb_int i = 0; i < len; i++) {
-        skip_cbor(mrb, r, buf, sharedrefs); /* key */
-        skip_cbor(mrb, r, buf, sharedrefs); /* value */
+        skip_cbor(mrb, r, buf, sharedrefs);
+        skip_cbor(mrb, r, buf, sharedrefs);
       }
       break;
     }
@@ -1698,7 +1697,9 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     case 6: {
       mrb_value tag = read_cbor_uint(mrb, r, info);
 
-      if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
+      /* Only register Tag 28 if buf/sharedrefs provided (lazy mode) */
+      if (!mrb_undef_p(buf) && !mrb_undef_p(sharedrefs) &&
+          mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
         if (likely(mrb_array_p(sharedrefs))) {
           mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
           mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
@@ -1707,7 +1708,6 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
           mrb_raise(mrb, E_TYPE_ERROR, "sharedrefs is not a array");
         }
       }
-      /* tag 29: just skip the uint index, nothing to register */
 
       skip_cbor(mrb, r, buf, sharedrefs);
       break;
@@ -1734,6 +1734,192 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
   }
 
   r->depth--;
+}
+
+
+/*
+ * Variant of skip logic for doc_end: returns false on incomplete buffer,
+ * no exception flow control, raises only for invalid CBOR.
+ */
+static mrb_bool
+skip_cbor_try(mrb_state *mrb, Reader *r)
+{
+  /* Early check: can't read header byte → incomplete */
+  if (unlikely(r->p >= r->end))
+    return FALSE;
+
+  if (unlikely(r->depth >= CBOR_MAX_DEPTH))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+  r->depth++;
+
+  uint8_t b     = *r->p++;
+  uint8_t major = b >> 5;
+  uint8_t info  = b & 0x1F;
+
+  mrb_bool ok = TRUE;
+
+  switch (major) {
+
+    case 0: /* unsigned integer */
+    case 1: /* negative integer */
+      if (info >= 24) {
+        /* Check availability of length bytes before reading */
+        if (unlikely(info == 24 && r->p >= r->end)) ok = FALSE;
+        else if (unlikely(info == 25 && (r->end - r->p) < 2)) ok = FALSE;
+        else if (unlikely(info == 26 && (r->end - r->p) < 4)) ok = FALSE;
+        else if (unlikely(info == 27 && (r->end - r->p) < 8)) ok = FALSE;
+        else {
+          mrb_value len_v = read_cbor_uint(mrb, r, info);
+          if (unlikely(!mrb_integer_p(len_v))) ok = FALSE;
+        }
+      }
+      break;
+
+    case 2: /* byte string */
+    case 3: { /* text string */
+      if (unlikely(info == 24 && r->p >= r->end)) { ok = FALSE; break; }
+      if (unlikely(info == 25 && (r->end - r->p) < 2)) { ok = FALSE; break; }
+      if (unlikely(info == 26 && (r->end - r->p) < 4)) { ok = FALSE; break; }
+      if (unlikely(info == 27 && (r->end - r->p) < 8)) { ok = FALSE; break; }
+
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      if (unlikely(!mrb_integer_p(len_v))) { ok = FALSE; break; }
+
+      mrb_int len = mrb_integer(len_v);
+      if (unlikely(len < 0)) { ok = FALSE; break; }
+      if (unlikely((mrb_int)(r->end - r->p) < len)) { ok = FALSE; break; }
+
+      r->p += len;
+      break;
+    }
+
+    case 4: { /* array */
+      if (unlikely(info == 24 && r->p >= r->end)) { ok = FALSE; break; }
+      if (unlikely(info == 25 && (r->end - r->p) < 2)) { ok = FALSE; break; }
+      if (unlikely(info == 26 && (r->end - r->p) < 4)) { ok = FALSE; break; }
+      if (unlikely(info == 27 && (r->end - r->p) < 8)) { ok = FALSE; break; }
+
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      if (unlikely(!mrb_integer_p(len_v))) { ok = FALSE; break; }
+
+      mrb_int len = mrb_integer(len_v);
+      if (unlikely(len < 0)) { ok = FALSE; break; }
+
+      for (mrb_int i = 0; i < len; i++) {
+        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+      }
+      break;
+    }
+
+    case 5: { /* map */
+      if (unlikely(info == 24 && r->p >= r->end)) { ok = FALSE; break; }
+      if (unlikely(info == 25 && (r->end - r->p) < 2)) { ok = FALSE; break; }
+      if (unlikely(info == 26 && (r->end - r->p) < 4)) { ok = FALSE; break; }
+      if (unlikely(info == 27 && (r->end - r->p) < 8)) { ok = FALSE; break; }
+
+      mrb_value len_v = read_cbor_uint(mrb, r, info);
+      if (unlikely(!mrb_integer_p(len_v))) { ok = FALSE; break; }
+
+      mrb_int len = mrb_integer(len_v);
+      if (unlikely(len < 0)) { ok = FALSE; break; }
+
+      for (mrb_int i = 0; i < len; i++) {
+        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+      }
+      break;
+    }
+
+    case 6: {
+      if (unlikely(info == 24 && r->p >= r->end)) { ok = FALSE; break; }
+      if (unlikely(info == 25 && (r->end - r->p) < 2)) { ok = FALSE; break; }
+      if (unlikely(info == 26 && (r->end - r->p) < 4)) { ok = FALSE; break; }
+      if (unlikely(info == 27 && (r->end - r->p) < 8)) { ok = FALSE; break; }
+
+      mrb_value tag = read_cbor_uint(mrb, r, info);
+      if (unlikely(!mrb_integer_p(tag))) { ok = FALSE; break; }
+
+      if (!skip_cbor_try(mrb, r)) ok = FALSE;
+      break;
+    }
+
+    case 7: {
+      if (info < 24) break;
+      switch (info) {
+        case 24:
+          if (unlikely(r->p >= r->end)) ok = FALSE;
+          else r->p++;
+          break;
+        case 25:
+          if (unlikely((r->end - r->p) < 2)) ok = FALSE;
+          else r->p += 2;
+          break;
+        case 26:
+          if (unlikely((r->end - r->p) < 4)) ok = FALSE;
+          else r->p += 4;
+          break;
+        case 27:
+          if (unlikely((r->end - r->p) < 8)) ok = FALSE;
+          else r->p += 8;
+          break;
+        case 31:
+          mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+          ok = FALSE;
+          break;
+        default:
+          break;
+      }
+      break;
+    }
+
+    default:
+      mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented CBOR major type '%d'", major);
+      ok = FALSE;
+  }
+
+  r->depth--;
+  return ok;
+}
+
+/*
+ * Find the byte offset of the end of a complete CBOR document.
+ * Returns mrb_fixnum or mrb_nil_value() if incomplete.
+ */
+static mrb_value
+cbor_doc_end(mrb_state *mrb, const uint8_t *buf, size_t buf_len, mrb_int offset)
+{
+  if (unlikely(offset < 0 || (size_t)offset >= buf_len))
+    return mrb_nil_value();
+
+  Reader r;
+  r.base   = buf;
+  r.p      = buf + offset;
+  r.end    = buf + buf_len;
+  r.depth  = 0;
+
+  if (unlikely(r.p >= r.end))
+    return mrb_nil_value();
+
+  if (!skip_cbor_try(mrb, &r))
+    return mrb_nil_value();
+
+  return mrb_convert_ptrdiff(mrb, (r.p - buf));
+}
+
+/* Ruby binding for doc_end */
+static mrb_value
+mrb_cbor_doc_end(mrb_state *mrb, mrb_value self)
+{
+  mrb_value buf;
+  mrb_int offset = 0;
+  (void)self;
+
+  mrb_get_args(mrb, "S|i", &buf, &offset);
+
+  const uint8_t *data = (const uint8_t *)RSTRING_PTR(buf);
+  size_t len = (size_t)RSTRING_LEN(buf);
+
+  return cbor_doc_end(mrb, data, len, offset);
 }
 
 /* Lazy#value */
@@ -2124,6 +2310,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode), mrb_cbor_decode, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag), mrb_cbor_register_tag, MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode), mrb_cbor_encode, MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0, 1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end), mrb_cbor_doc_end, MRB_ARGS_ARG(1, 1));
 
   struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);

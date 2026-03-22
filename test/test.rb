@@ -1783,3 +1783,437 @@ end
 assert('CBOR.stream: type error on unknown io') do
   assert_raise(TypeError) { CBOR.stream(42) }
 end
+
+# ============================================================================
+# Class / Module encoding (tag 49999)
+# ============================================================================
+
+assert('CBOR class encoding: top-level class roundtrips') do
+  buf = CBOR.encode(String)
+  assert_equal String, CBOR.decode(buf)
+end
+
+assert('CBOR class encoding: nested class roundtrips') do
+  buf = CBOR.encode(CBOR::UnhandledTag)
+  assert_equal CBOR::UnhandledTag, CBOR.decode(buf)
+end
+
+assert('CBOR class encoding: module roundtrips') do
+  module TestMod; end
+  buf = CBOR.encode(TestMod)
+  assert_equal TestMod, CBOR.decode(buf)
+end
+
+assert('CBOR class encoding: class inside array roundtrips') do
+  buf = CBOR.encode([String, Integer, Float])
+  result = CBOR.decode(buf)
+  assert_equal String,  result[0]
+  assert_equal Integer, result[1]
+  assert_equal Float,   result[2]
+end
+
+assert('CBOR class encoding: class as hash value roundtrips') do
+  h = { "klass" => ArgumentError }
+  buf = CBOR.encode(h)
+  assert_equal ArgumentError, CBOR.decode(buf)["klass"]
+end
+
+assert('CBOR class encoding: class as hash key roundtrips') do
+  h = { String => "string_class" }
+  buf = CBOR.encode(h)
+  assert_equal "string_class", CBOR.decode(buf)[String]
+end
+
+assert('CBOR class encoding: lazy decode') do
+  buf = CBOR.encode(RuntimeError)
+  assert_equal RuntimeError, CBOR.decode_lazy(buf).value
+end
+
+assert('CBOR class encoding: class in nested lazy structure') do
+  h = { "klass" => StandardError, "msg" => "oops" }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+  assert_equal StandardError, lazy["klass"].value
+  assert_equal "oops",        lazy["msg"].value
+end
+
+assert('CBOR class encoding: anonymous class raises') do
+  anon = Class.new
+  assert_raise(ArgumentError) { CBOR.encode(anon) }
+end
+
+assert('CBOR class encoding: anonymous module raises') do
+  anon = Module.new
+  assert_raise(ArgumentError) { CBOR.encode(anon) }
+end
+
+assert('CBOR class encoding: tag 49999 reserved for register_tag') do
+  class DummyForReserved; end
+  assert_raise(ArgumentError) { CBOR.register_tag(49999, DummyForReserved) }
+end
+
+assert('CBOR class encoding: decode invalid payload raises TypeError') do
+  # tag 49999 = 0xD9 0xC3 0x4F, wrapping integer instead of string
+  buf = "\xD9\xC3\x4F\x01"
+  assert_raise(TypeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR class encoding: unknown constant raises NameError') do
+  tag_bytes = "\xD9\xC3\x4F"
+  name_cbor = CBOR.encode("NoSuchClassXyzAbc123")
+  assert_raise(NameError) { CBOR.decode(tag_bytes + name_cbor) }
+end
+
+assert('CBOR class encoding: multiple classes round-trip independently') do
+  [String, Integer, Array, Hash, Float, NilClass, TrueClass, FalseClass].each do |klass|
+    assert_equal klass, CBOR.decode(CBOR.encode(klass))
+  end
+end
+
+# ============================================================================
+# Proc-based tag registration (register_tag with block)
+# ============================================================================
+
+class ProcTagBox
+  def initialize(val); @val = val; end
+  def val; @val; end
+end
+
+assert('CBOR proc tag: basic encode and decode') do
+  CBOR.register_tag(60000) do
+    encode ProcTagBox do |b| b.val end
+    decode Integer    do |i| ProcTagBox.new(i * 2) end
+  end
+
+  buf = CBOR.encode(ProcTagBox.new(21))
+  result = CBOR.decode(buf)
+  assert_true result.is_a?(ProcTagBox)
+  assert_equal 42, result.val
+end
+
+assert('CBOR proc tag: encode proc called with correct value') do
+  received = nil
+  CBOR.register_tag(60001) do
+    encode ProcTagBox do |b|
+      received = b.val
+      b.val
+    end
+    decode Integer do |i| ProcTagBox.new(i) end
+  end
+
+  CBOR.encode(ProcTagBox.new(99))
+  assert_equal 99, received
+end
+
+assert('CBOR proc tag: decode proc called with decoded payload') do
+  received = nil
+  CBOR.register_tag(60002) do
+    encode ProcTagBox do |b| b.val end
+    decode Integer do |i|
+      received = i
+      ProcTagBox.new(i)
+    end
+  end
+
+  buf = CBOR.encode(ProcTagBox.new(77))
+  CBOR.decode(buf)
+  assert_equal 77, received
+end
+
+assert('CBOR proc tag: decode type mismatch raises TypeError') do
+  CBOR.register_tag(60003) do
+    encode ProcTagBox do |b| b.val.to_s end  # encodes as String, decode expects Integer
+    decode Integer    do |i| ProcTagBox.new(i) end
+  end
+
+  buf = CBOR.encode(ProcTagBox.new(5))
+  assert_raise(TypeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR proc tag: inheritance — subclass matches superclass encode type') do
+  class SubProcTagBox < ProcTagBox; end
+
+  CBOR.register_tag(60004) do
+    encode ProcTagBox do |b| b.val end
+    decode Integer    do |i| ProcTagBox.new(i) end
+  end
+
+  buf = CBOR.encode(SubProcTagBox.new(55))
+  result = CBOR.decode(buf)
+  assert_true result.is_a?(ProcTagBox)
+  assert_equal 55, result.val
+end
+
+assert('CBOR proc tag: encode and decode full exception roundtrip') do
+  CBOR.register_tag(60005) do
+    encode Exception do |e| [e.class, e.message, e.backtrace] end
+    decode Array     do |a|
+      exc = a[0].new(a[1])
+      exc.set_backtrace(a[2]) if a[2]
+      exc
+    end
+  end
+
+  buf = begin
+    raise ArgumentError, "bad argument"
+  rescue => e
+    CBOR.encode(e)
+  end
+
+  exc = CBOR.decode(buf)
+  assert_true exc.is_a?(ArgumentError)
+  assert_equal "bad argument", exc.message
+  assert_not_nil exc.backtrace
+end
+
+assert('CBOR proc tag: exception class preserved via tag 49999') do
+  CBOR.register_tag(60006) do
+    encode Exception do |e| [e.class, e.message] end
+    decode Array     do |a| a[0].new(a[1]) end
+  end
+
+  [ArgumentError, RuntimeError, TypeError, StandardError].each do |klass|
+    buf = CBOR.encode(klass.new("msg"))
+    exc = CBOR.decode(buf)
+    assert_equal klass, exc.class
+  end
+end
+
+assert('CBOR proc tag: lazy decode fires proc') do
+  CBOR.register_tag(60007) do
+    encode ProcTagBox do |b| b.val end
+    decode Integer    do |i| ProcTagBox.new(i + 1) end
+  end
+
+  buf = CBOR.encode(ProcTagBox.new(6))
+  result = CBOR.decode_lazy(buf).value
+  assert_true result.is_a?(ProcTagBox)
+  assert_equal 7, result.val
+end
+
+assert('CBOR proc tag: proc result containing class encoded via tag 49999') do
+  CBOR.register_tag(60008) do
+    encode Exception do |e| [e.class, e.message] end
+    decode Array     do |a| a[0].new(a[1]) end
+  end
+
+  buf = CBOR.encode(TypeError.new("wrong type"))
+  result = CBOR.decode(buf)
+  assert_equal TypeError, result.class
+  assert_equal "wrong type", result.message
+end
+
+assert('CBOR proc tag: reserved tags raise ArgumentError') do
+  [2, 3, 28, 29, 39, 49999].each do |reserved|
+    assert_raise(ArgumentError) do
+      CBOR.register_tag(reserved) do
+        encode ProcTagBox do |b| b.val end
+        decode Integer    do |i| ProcTagBox.new(i) end
+      end
+    end
+  end
+end
+
+assert('CBOR proc tag: unregistered object falls back to string') do
+  class UnregisteredThing
+    def to_s; "unregistered"; end
+  end
+  buf = CBOR.encode(UnregisteredThing.new)
+  assert_equal "unregistered", CBOR.decode(buf)
+end
+
+assert('CBOR proc tag: multiple proc tags coexist') do
+  class BoxA; def initialize(v); @v = v; end; def val; @v; end; end
+  class BoxB; def initialize(v); @v = v; end; def val; @v; end; end
+
+  CBOR.register_tag(60009) do
+    encode BoxA    do |b| b.val end
+    decode Integer do |i| BoxA.new(i) end
+  end
+
+  CBOR.register_tag(60010) do
+    encode BoxB    do |b| b.val * 10 end
+    decode Integer do |i| BoxB.new(i) end
+  end
+
+  buf_a = CBOR.encode(BoxA.new(3))
+  buf_b = CBOR.encode(BoxB.new(4))
+
+  assert_equal 3,  CBOR.decode(buf_a).val
+  assert_equal 40, CBOR.decode(buf_b).val
+end
+
+assert('CBOR proc tag: proc tag and class tag coexist') do
+  class ProcCoexist
+    native_ext_type :@v, Integer
+    def initialize(v = 0); @v = v; end
+  end
+  CBOR.register_tag(60011, ProcCoexist)
+
+  class BoxC; def initialize(v); @v = v; end; def val; @v; end; end
+  CBOR.register_tag(60012) do
+    encode BoxC    do |b| b.val end
+    decode Integer do |i| BoxC.new(i) end
+  end
+
+  obj_buf = CBOR.encode(ProcCoexist.new(42))
+  box_buf = CBOR.encode(BoxC.new(7))
+
+  obj_result = CBOR.decode(obj_buf)
+  box_result = CBOR.decode(box_buf)
+
+  assert_true obj_result.is_a?(ProcCoexist)
+  assert_equal 42, obj_result.instance_variable_get(:@v)
+  assert_true box_result.is_a?(BoxC)
+  assert_equal 7, box_result.val
+end
+
+assert('CBOR proc tag: encode proc exception propagates') do
+  class BoxD; def initialize(v); @v = v; end; end
+  CBOR.register_tag(60013) do
+    encode BoxD    do |b| raise "encode error" end
+    decode Integer do |i| BoxD.new(i) end
+  end
+
+  assert_raise(RuntimeError) { CBOR.encode(BoxD.new(1)) }
+end
+
+assert('CBOR proc tag: decode proc exception propagates') do
+  class BoxE; def initialize(v); @v = v; end; def val; @v; end; end
+  CBOR.register_tag(60014) do
+    encode BoxE    do |b| b.val end
+    decode Integer do |i| raise "decode error" end
+  end
+
+  buf = CBOR.encode(BoxE.new(1))
+  assert_raise(RuntimeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR proc tag: works with sharedrefs encoding') do
+  CBOR.register_tag(60015) do
+    encode Exception do |e| [e.class, e.message] end
+    decode Array     do |a| a[0].new(a[1]) end
+  end
+
+  exc1 = RuntimeError.new("one")
+  exc2 = ArgumentError.new("two")
+  buf = CBOR.encode([exc1, exc2], sharedrefs: true)
+  result = CBOR.decode(buf)
+  assert_equal RuntimeError,  result[0].class
+  assert_equal ArgumentError, result[1].class
+  assert_equal "one", result[0].message
+  assert_equal "two", result[1].message
+end
+
+# ============================================================================
+# Proc tag: natively-encoded encode_type rejected
+# ============================================================================
+
+assert('CBOR proc tag: cannot register String as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61000) do
+      encode String do |s| s end
+      decode String do |s| s end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Integer as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61001) do
+      encode Integer do |i| i end
+      decode Integer do |i| i end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Float as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61002) do
+      encode Float do |f| f end
+      decode Float do |f| f end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Array as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61003) do
+      encode Array do |a| a end
+      decode Array do |a| a end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Hash as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61004) do
+      encode Hash do |h| h end
+      decode Hash do |h| h end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register TrueClass as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61005) do
+      encode TrueClass do |b| b end
+      decode TrueClass do |b| b end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register FalseClass as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61006) do
+      encode FalseClass do |b| b end
+      decode FalseClass do |b| b end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register NilClass as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61007) do
+      encode NilClass do |n| n end
+      decode NilClass do |n| n end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Symbol as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61008) do
+      encode Symbol do |s| s.to_s end
+      decode String do |s| s.to_sym end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Class as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61009) do
+      encode Class  do |c| c.name end
+      decode String do |s| s end
+    end
+  end
+end
+
+assert('CBOR proc tag: cannot register Module as encode type') do
+  assert_raise(TypeError) do
+    CBOR.register_tag(61010) do
+      encode Module do |m| m.name end
+      decode String do |s| s end
+    end
+  end
+end
+
+assert('CBOR proc tag: Exception is allowed as encode type') do
+  CBOR.register_tag(61011) do
+    encode Exception do |e| e.message end
+    decode String    do |s| RuntimeError.new(s) end
+  end
+
+  buf = CBOR.encode(RuntimeError.new("ok"))
+  result = CBOR.decode(buf)
+  assert_equal "ok", result.message
+end

@@ -17,6 +17,8 @@
 | **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
 | **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with key and result caching |
 | **Streaming** | `CBOR.stream` for CBOR sequences from strings, files, and sockets |
+| **Class / Module Encoding** | Tag 49999 — classes and modules round-trip automatically |
+| **Proc-based Tag Registration** | Register encode/decode procs for any type, including builtins with C state |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
 
 ### ⚠️ Limitations & Design Decisions
@@ -213,6 +215,100 @@ Fields absent from a decoded payload are silently skipped — only declared ivar
 
 ---
 
+### Class and Module Encoding (Tag 49999)
+
+Classes and modules are encoded automatically using a private tag (49999) wrapping the constant path as a UTF-8 string. On decode, the string is resolved back to the constant via `String#constantize`.
+
+```ruby
+CBOR.encode(ArgumentError)         # encodes as tag(49999, "ArgumentError")
+CBOR.decode(buf)                   # => ArgumentError (the class itself)
+
+CBOR.encode(CBOR::UnhandledTag)    # => tag(49999, "CBOR::UnhandledTag")
+
+# Classes round-trip inside any structure
+h = { "type" => StandardError, "code" => 42 }
+CBOR.decode(CBOR.encode(h))["type"]  # => StandardError
+```
+
+Anonymous classes and modules raise `ArgumentError` on encode since they have no resolvable name.
+
+This is mruby-to-mruby only — the constant path syntax (`::` separator) is Ruby-specific and other runtimes will not know how to resolve it.
+
+---
+
+### Proc-based Tag Registration
+
+For types with internal C state that cannot be subclassed or have ivars added — such as `Exception`, `Time`, or any `MRB_TT_DATA` object — use `register_tag` with a block instead of a class. The block DSL declares an encode proc (extracts state into a plain CBOR-encodable value) and a decode proc (reconstructs the object from that value), each with a type constraint.
+
+```ruby
+CBOR.register_tag(tag_number) do
+  encode EncodeType do |obj|
+    # return any CBOR-encodable value
+  end
+
+  decode DecodeType do |payload|
+    # reconstruct and return the object
+    # payload is guaranteed to be a kind_of? DecodeType
+  end
+end
+```
+
+**Encode type matching uses `kind_of?`**, so registering `Exception` as the encode type will match `StandardError`, `ArgumentError`, and any other subclass.
+
+**Natively-encoded types are rejected** as encode types — `String`, `Integer`, `Float`, `Array`, `Hash`, `TrueClass`, `FalseClass`, `NilClass`, `Symbol`, `Class`, and `Module` are all handled by the encoder's core switch and cannot be overridden via the proc path. `Exception` and user-defined classes are allowed.
+
+#### Exception serialization
+
+```ruby
+CBOR.register_tag(50000) do
+  encode Exception do |e|
+    [e.class, e.message, e.backtrace]
+  end
+
+  decode Array do |a|
+    exc = a[0].new(a[1])
+    exc.set_backtrace(a[2]) if a[2]
+    exc
+  end
+end
+
+def encode_exception(exc)
+  CBOR.encode(exc)
+end
+
+buf = begin
+  raise ArgumentError, "something went wrong"
+rescue => e
+  encode_exception(e)
+end
+
+exc = CBOR.decode(buf)
+raise exc  # re-raises ArgumentError with original message and backtrace
+```
+
+Because `encode_exception` is a plain function, users can add filtering or logging around it however they like — the library imposes no policy.
+
+#### Time serialization (optional, requires mruby-time)
+
+```ruby
+CBOR.register_tag(1) do
+  encode Time do |t|
+    t.to_f
+  end
+
+  decode Float do |v|
+    Time.at(v)
+  end
+end
+
+CBOR.encode(Time.now)   # => tag(1, <float epoch>)
+CBOR.decode(buf)        # => Time object
+```
+
+Tag 1 is the official RFC 8949 epoch-based time tag. Since `mruby-time` is optional, users who need it wire it up themselves.
+
+---
+
 ### Symbol Handling
 
 Three strategies for encoding Ruby symbols:
@@ -341,12 +437,17 @@ rake test
 | Error | When | Example |
 |-------|------|---------|
 | `ArgumentError` | Invalid encode options | `CBOR.encode(obj, bad_option: true)` |
+| `ArgumentError` | Reserved tag number | `CBOR.register_tag(39, MyClass)` |
+| `ArgumentError` | Encoding anonymous class/module | `CBOR.encode(Class.new)` |
 | `RangeError` | Integer out of bounds | Encoding a Bigint larger than uint64 |
 | `RuntimeError` | Nesting depth exceeded | Deeply nested structures beyond `CBOR_MAX_DEPTH` |
 | `RuntimeError` | Truncated/invalid CBOR | `CBOR.decode(incomplete_buffer)` |
 | `TypeError` | Type mismatch in registered tags | Field declared as `String` receives an `Array` |
+| `TypeError` | Proc tag decode type mismatch | Decode proc received wrong payload type |
+| `TypeError` | Registering natively-encoded type as proc encode type | `encode String do ...` |
 | `TypeError` | Unknown stream source | `CBOR.stream(42)` |
 | `KeyError` | Lazy access to missing key | `lazy["nonexistent"]` (use `.dig` to get nil instead) |
+| `NameError` | Tag 49999 payload resolves to unknown constant | Decoding a class name not defined on this side |
 | `NotImplementedError` | Presym on non-presym mruby | `CBOR.symbols_as_uint32` on build without presym |
 
 ---

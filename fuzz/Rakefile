@@ -33,4 +33,28 @@ task :clean do
   end
 end
 
+desc "minimize corpus — deduplicates and keeps only coverage-contributing inputs"
+task :corpus_merge => :compile do
+  fuzzer   = File.expand_path("mruby/build/host/bin/mruby-cbor-fuzzer")
+  corpus   = File.expand_path("corpus")
+  findings = File.expand_path("findings")
+  merged   = File.expand_path("corpus_min")
+
+  FileUtils.mkdir_p(merged)
+  FileUtils.mkdir_p(corpus)
+
+  dirs = [corpus]
+  dirs << findings if File.directory?(findings)
+
+  sh fuzzer, "-merge=1", merged, *dirs
+
+  removed = Dir[File.join(corpus, "*")].count
+  kept    = Dir[File.join(merged, "*")].count
+
+  FileUtils.rm_rf(corpus)
+  FileUtils.mv(merged, corpus)
+
+  puts "Corpus minimized: #{removed} -> #{kept} inputs"
+end
+
 task :default => :test

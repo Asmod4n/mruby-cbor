@@ -105,6 +105,8 @@ typedef struct {
 /* Forward declarations */
 static mrb_value cbor_tag_registry(mrb_state *mrb);
 static mrb_value cbor_tag_rev_registry(mrb_state *mrb);
+static mrb_value cbor_proc_tag_registry(mrb_state *mrb);
+static mrb_value cbor_proc_tag_rev_registry(mrb_state *mrb);
 static void      encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num);
 static mrb_value decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value klass);
 
@@ -700,6 +702,22 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
         }
       }
 
+      {
+        mrb_value proc_reg = cbor_proc_tag_registry(mrb);
+        mrb_value entry    = mrb_hash_fetch(mrb, proc_reg, tag, mrb_undef_value());
+        if (likely(mrb_hash_p(entry))) {
+          mrb_value decode_type = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_type)), mrb_undef_value());
+          mrb_value decode_prc  = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_proc)), mrb_undef_value());
+          mrb_value payload     = decode_value(mrb, r, src, sharedrefs);
+          if (unlikely(!mrb_net_check_type(mrb, decode_type, payload)))
+            mrb_raisef(mrb, E_TYPE_ERROR,
+              "CBOR proc tag decode type mismatch for tag %v: got %C",
+              tag, mrb_class(mrb, payload));
+          result = mrb_funcall_argv(mrb, decode_prc, MRB_SYM(call), 1, &payload);
+          goto done;
+        }
+      }
+
       /* Unknown tag: wrap in UnhandledTag */
       mrb_value tagged_value = decode_value(mrb, r, src, sharedrefs);
       struct RClass *unhandled_tag = mrb_class_get_under_id(mrb,
@@ -1128,7 +1146,28 @@ encode_value(CborWriter* w, mrb_value obj)
       if (mrb_integer_p(tag_val)) {
         encode_registered_tag(w, obj, mrb_integer(tag_val));
       } else {
-        encode_string(w, mrb_obj_as_string(mrb, obj));
+        mrb_value proc_rev  = cbor_proc_tag_rev_registry(mrb);
+        mrb_value keys      = mrb_hash_keys(mrb, proc_rev);
+        mrb_int   nkeys     = RARRAY_LEN(keys);
+        mrb_value *keys_ptr = RARRAY_PTR(keys);
+        mrb_bool  found     = FALSE;
+        for (mrb_int i = 0; i < nkeys; i++) {
+          mrb_value enc_type = keys_ptr[i];
+          if ((mrb_class_p(enc_type) || mrb_module_p(enc_type)) &&
+              mrb_obj_is_kind_of(mrb, obj, mrb_class_ptr(enc_type))) {
+            mrb_value entry      = mrb_hash_fetch(mrb, proc_rev, enc_type, mrb_undef_value());
+            mrb_value tag_v      = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(tag)),         mrb_undef_value());
+            mrb_value encode_prc = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(encode_proc)), mrb_undef_value());
+            mrb_value encoded    = mrb_funcall_argv(mrb, encode_prc, MRB_SYM(call), 1, &obj);
+            encode_len(w, 6, (uint64_t)mrb_integer(tag_v));
+            encode_value(w, encoded);
+            found = TRUE;
+            break;
+          }
+        }
+        if (!found) {
+          encode_string(w, mrb_obj_as_string(mrb, obj));
+        }
       }
     } break;
   }
@@ -1192,6 +1231,28 @@ cbor_tag_rev_registry(mrb_state *mrb)
   if (likely(mrb_hash_p(reg))) return reg;
   reg = mrb_hash_new(mrb);
   mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_tag_rev_registry__), reg);
+  return reg;
+}
+
+static mrb_value
+cbor_proc_tag_registry(mrb_state *mrb)
+{
+  mrb_value cbor = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(CBOR)));
+  mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_proc_tag_registry__));
+  if (likely(mrb_hash_p(reg))) return reg;
+  reg = mrb_hash_new(mrb);
+  mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_proc_tag_registry__), reg);
+  return reg;
+}
+
+static mrb_value
+cbor_proc_tag_rev_registry(mrb_state *mrb)
+{
+  mrb_value cbor = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(CBOR)));
+  mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_proc_tag_rev_registry__));
+  if (likely(mrb_hash_p(reg))) return reg;
+  reg = mrb_hash_new(mrb);
+  mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_proc_tag_rev_registry__), reg);
   return reg;
 }
 
@@ -1887,6 +1948,66 @@ cbor_register_tag_rb(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
+/* Ruby binding: CBOR.register_tag_proc(tag, encode_type, encode_proc, decode_type, decode_proc) */
+static mrb_value
+cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value tag_v, encode_type, encode_prc, decode_type, decode_prc;
+  mrb_get_args(mrb, "ooooo", &tag_v, &encode_type, &encode_prc,
+                                     &decode_type, &decode_prc);
+  (void)self;
+
+  if (!mrb_integer_p(tag_v))
+    mrb_raise(mrb, E_TYPE_ERROR, "tag must be an integer");
+  if (!mrb_proc_p(encode_prc) || !mrb_proc_p(decode_prc))
+    mrb_raise(mrb, E_TYPE_ERROR, "encode and decode must be Procs");
+
+  static const int reserved[] = { 2, 3, 28, 29, 39 };
+  for (uint8_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    if (unlikely(mrb_cmp(mrb, tag_v, mrb_fixnum_value(reserved[i])) == 0))
+      mrb_raisef(mrb, E_ARGUMENT_ERROR,
+        "tag %v is reserved for internal CBOR use", tag_v);
+  }
+  if (unlikely((uint64_t)mrb_integer(tag_v) == CBOR_TAG_CLASS))
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "tag 49999 is reserved for internal CBOR use");
+
+  /* Reject encode_type classes handled natively by encode_value's switch —
+     registering them would silently do nothing since the switch fires before
+     the proc registry is consulted. Class and Module are also rejected since
+     they are handled by encode_class (tag 49999).
+     Exception and its subclasses are intentionally allowed — they fall
+     through to the default branch and are reachable by the proc path. */
+  if (mrb_class_p(encode_type)) {
+    struct RClass *ep = mrb_class_ptr(encode_type);
+    if (ep == mrb->string_class  || ep == mrb->array_class  ||
+        ep == mrb->hash_class    || ep == mrb->float_class  ||
+        ep == mrb->integer_class || ep == mrb->true_class   ||
+        ep == mrb->false_class   || ep == mrb->nil_class    ||
+        ep == mrb->symbol_class  || ep == mrb->class_class  ||
+        ep == mrb->module_class)
+      mrb_raise(mrb, E_TYPE_ERROR,
+        "cannot register proc tag for a natively-encoded type");
+  }
+
+  /* mrb_net_check_type expects an Array of types, same as native_ext_type stores */
+  mrb_value decode_type_ary = mrb_ary_new_from_values(mrb, 1, &decode_type);
+
+  /* forward registry: tag -> { decode_type: [Type], decode_proc: } */
+  mrb_value fwd_entry = mrb_hash_new_capa(mrb, 2);
+  mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_type)), decode_type_ary);
+  mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_proc)), decode_prc);
+  mrb_hash_set(mrb, cbor_proc_tag_registry(mrb), tag_v, fwd_entry);
+
+  /* reverse registry: encode_type -> { tag:, encode_proc: }
+     lookup uses kind_of? iteration at encode time */
+  mrb_value rev_entry = mrb_hash_new_capa(mrb, 2);
+  mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(tag)),         tag_v);
+  mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(encode_proc)), encode_prc);
+  mrb_hash_set(mrb, cbor_proc_tag_rev_registry(mrb), encode_type, rev_entry);
+
+  return mrb_nil_value();
+}
+
 /* ── Step 2: rename Ruby binding functions ──────────────────────────────── */
 
 /* CBOR.encode(obj, sharedrefs: false) — Ruby binding */
@@ -2024,7 +2145,8 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32),cbor_symbols_as_uint32,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string),cbor_symbols_as_string,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           cbor_decode_rb,       MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),     cbor_register_tag_rb, MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),      cbor_register_tag_rb,      MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag_proc), cbor_register_tag_proc_rb, MRB_ARGS_REQ(5));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           cbor_encode_rb,       MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          cbor_doc_end_rb,      MRB_ARGS_ARG(1,1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),      cbor_decode_rb_lazy,  MRB_ARGS_REQ(1));

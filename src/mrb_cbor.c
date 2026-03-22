@@ -14,6 +14,7 @@ MRB_END_DECL
 #include <mruby/variable.h>
 #include <mruby/error.h>
 #include <mruby/ned.h>
+#include <mruby/str_constantize.h>
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -32,6 +33,8 @@ MRB_END_DECL
     #define CBOR_MAX_DEPTH 32
   #endif
 #endif
+
+#define CBOR_TAG_CLASS UINT32_C(49999)
 
 typedef struct {
   const uint8_t* base;
@@ -627,6 +630,16 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   return mrb_nil_value();
 }
 
+static mrb_value
+decode_class(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs)
+{
+  mrb_value v = decode_value(mrb, r, src, sharedrefs);
+  if (likely(mrb_string_p(v)))
+    return mrb_str_constantize(mrb, v);
+  mrb_raise(mrb, E_TYPE_ERROR, "invalid payload for tag 49999 (expected text string)");
+  return mrb_undef_value();
+}
+
 // ============================================================================
 // Master decode with depth protection
 // ============================================================================
@@ -671,6 +684,10 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
       }
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
         result = decode_symbol(mrb, r, src, sharedrefs);
+        goto done;
+      }
+      if (mrb_integer_p(tag) && (uint64_t)mrb_integer(tag) == CBOR_TAG_CLASS) {
+        result = decode_class(mrb, r, src, sharedrefs);
         goto done;
       }
 
@@ -1000,6 +1017,20 @@ encode_string(CborWriter* w, mrb_value str)
 }
 
 static void
+encode_class(CborWriter *w, mrb_value obj)
+{
+  mrb_state *mrb = w->mrb;
+  mrb_value name = mrb_class_path(mrb, mrb_class_ptr(obj));
+
+  if (likely(mrb_string_p(name))) {
+    encode_len(w, 6, CBOR_TAG_CLASS);
+    encode_string(w, name);
+  } else {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "cannot encode anonymous class/module");
+  }
+}
+
+static void
 encode_simple(CborWriter* w, mrb_value obj)
 {
   uint8_t b;
@@ -1088,6 +1119,8 @@ encode_value(CborWriter* w, mrb_value obj)
 #ifdef MRB_USE_BIGINT
     case MRB_TT_BIGINT:  encode_bignum(w, obj); break;
 #endif
+    case MRB_TT_CLASS:
+    case MRB_TT_MODULE:  encode_class(w, obj); break;
     default: {
       mrb_value rev     = cbor_tag_rev_registry(mrb);
       mrb_value klass   = mrb_obj_value(mrb_class(mrb, obj));
@@ -1822,6 +1855,8 @@ cbor_register_tag_impl(mrb_state *mrb, mrb_value tag_v, mrb_value klass)
       mrb_raisef(mrb, E_ARGUMENT_ERROR,
         "tag %v is reserved for internal CBOR use", tag_v);
   }
+  if (unlikely(mrb_integer_p(tag_v) && (uint64_t)mrb_integer(tag_v) == CBOR_TAG_CLASS))
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "tag 49999 is reserved for internal CBOR use");
 
   {
     struct RClass *kp = mrb_class_ptr(klass);

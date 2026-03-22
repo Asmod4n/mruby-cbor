@@ -71,9 +71,9 @@ module CBOR
     end
 
     def stream_socket(io, &block)
-      return StreamDecoder.new(&block) unless block
+      return enum_for(:stream_socket, io) unless block
       buf = ""
-      while chunk = io.read(4095)
+      while chunk = io.recv(4095)
         buf << chunk
         while true
           len = doc_end(buf, 0)

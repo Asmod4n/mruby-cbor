@@ -1008,7 +1008,7 @@ encode_simple(CborWriter* w, mrb_value obj)
     case MRB_TT_TRUE:  b = 0xF5; break;
     default: {
       mrb_state *mrb = w->mrb;
-      mrb_raise(w->mrb, E_TYPE_ERROR, "unexpected simple value");
+      mrb_raise(mrb, E_TYPE_ERROR, "unexpected simple value");
     }
   }
   cbor_writer_write(w, &b, 1);
@@ -1370,8 +1370,7 @@ skip_cbor_try(mrb_state *mrb, Reader *r)
 {
   if (unlikely(r->p >= r->end)) return FALSE;
 
-  if (unlikely(r->depth >= CBOR_MAX_DEPTH))
-    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+  reader_check_depth(mrb, r);
   r->depth++;
 
   uint8_t b     = *r->p++;
@@ -1696,9 +1695,6 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 
   if (nkeys == 0) return self;
 
-  if (unlikely(nkeys > CBOR_MAX_DEPTH / 2))
-    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR#dig nesting too deep");
-
   mrb_value current = self;
 
   for (mrb_int ki = 0; ki < nkeys; ki++) {
@@ -1753,7 +1749,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 
       case 5: {
         mrb_int pairs    = cbor_value_to_len(mrb, read_cbor_uint(mrb, &r, r.info));
-        mrb_bool key_is_str = mrb_string_p(key);
+        const mrb_bool key_is_str = mrb_string_p(key);
         mrb_bool found      = FALSE;
 
         for (mrb_int i = 0; i < pairs; i++) {

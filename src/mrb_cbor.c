@@ -1012,13 +1012,13 @@ static void encode_value(CborWriter* w, mrb_value obj);
 static void
 encode_array(CborWriter* w, mrb_value ary)
 {
-  struct RBasic *basic_ptr = mrb_basic_ptr(ary);
-  unsigned int was_frozen = basic_ptr->frozen;
-  basic_ptr->frozen = TRUE;
+  struct RBasic *basic_ary = mrb_basic_ptr(ary);
+  unsigned int was_frozen = basic_ary->frozen;
+  basic_ary->frozen = TRUE;
   mrb_int len = RARRAY_LEN(ary);
   encode_len(w, 4, (uint64_t)len);
   for (mrb_int i = 0; i < len; i++) encode_value(w, mrb_ary_ref(w->mrb, ary, i));
-  basic_ptr->frozen = was_frozen;
+  basic_ary->frozen = was_frozen;
 }
 
 static int
@@ -1034,13 +1034,14 @@ static void
 encode_map(CborWriter* w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
-  struct RBasic *basic_ptr = mrb_basic_ptr(hash);
-  unsigned int was_frozen = basic_ptr->frozen;
-  basic_ptr->frozen = TRUE;
+  struct RBasic *basic_hash = mrb_basic_ptr(hash);
+  unsigned int was_frozen = basic_hash->frozen;
+  basic_hash->frozen = TRUE;
+  struct RHash *h = mrb_hash_ptr(hash);
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
-  mrb_hash_foreach(mrb, mrb_hash_ptr(hash), encode_map_foreach, w);
-  basic_ptr->frozen = was_frozen;
+  mrb_hash_foreach(mrb, h, encode_map_foreach, w);
+  basic_hash->frozen = was_frozen;
 }
 
 static void
@@ -1160,11 +1161,7 @@ encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
 {
   mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
   struct proc_tag_foreach_arg a = {w, obj, FALSE };
-  struct RBasic *basic_ptr = mrb_basic_ptr(proc_rev);
-  unsigned int was_frozen = basic_ptr->frozen;
-  basic_ptr->frozen = TRUE;
   mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev), proc_tag_foreach_cb, &a);
-  basic_ptr->frozen = was_frozen;
   return a.found;
 }
 

@@ -931,7 +931,7 @@ encode_check_shared(CborWriter *w, mrb_value obj)
   mrb_state *mrb = w->mrb;
 
   mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
-  mrb_value found  = mrb_hash_get(mrb, w->seen, id_key);
+  mrb_value found  = mrb_hash_fetch(mrb, w->seen, id_key, mrb_undef_value());
 
   if (mrb_integer_p(found)) {
     uint8_t tag29[2] = { 0xD8, 0x1D };
@@ -1012,14 +1012,13 @@ static void encode_value(CborWriter* w, mrb_value obj);
 static void
 encode_array(CborWriter* w, mrb_value ary)
 {
-  mrb_state *mrb = w->mrb;
-  struct RBasic *basic_ary = mrb_basic_ptr(ary);
-  unsigned int was_frozen = basic_ary->frozen;
-  basic_ary->frozen = TRUE;
+  struct RBasic *basic_ptr = mrb_basic_ptr(ary);
+  unsigned int was_frozen = basic_ptr->frozen;
+  basic_ptr->frozen = TRUE;
   mrb_int len = RARRAY_LEN(ary);
   encode_len(w, 4, (uint64_t)len);
-  for (mrb_int i = 0; i < len; i++) encode_value(w, mrb_ary_ref(mrb, ary, i));
-  basic_ary->frozen = was_frozen;
+  for (mrb_int i = 0; i < len; i++) encode_value(w, mrb_ary_ref(w->mrb, ary, i));
+  basic_ptr->frozen = was_frozen;
 }
 
 static int
@@ -1035,14 +1034,13 @@ static void
 encode_map(CborWriter* w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
-  struct RBasic *basic_hash = mrb_basic_ptr(hash);
-  unsigned int was_frozen = basic_hash->frozen;
-  basic_hash->frozen = TRUE;
-  struct RHash *h = mrb_hash_ptr(hash);
+  struct RBasic *basic_ptr = mrb_basic_ptr(hash);
+  unsigned int was_frozen = basic_ptr->frozen;
+  basic_ptr->frozen = TRUE;
   mrb_int len = mrb_hash_size(mrb, hash);
   encode_len(w, 5, (uint64_t)len);
-  mrb_hash_foreach(mrb, h, encode_map_foreach, w);
-  basic_hash->frozen = was_frozen;
+  mrb_hash_foreach(mrb, mrb_hash_ptr(hash), encode_map_foreach, w);
+  basic_ptr->frozen = was_frozen;
 }
 
 static void
@@ -1162,7 +1160,11 @@ encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
 {
   mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
   struct proc_tag_foreach_arg a = {w, obj, FALSE };
+  struct RBasic *basic_ptr = mrb_basic_ptr(proc_rev);
+  unsigned int was_frozen = basic_ptr->frozen;
+  basic_ptr->frozen = TRUE;
   mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev), proc_tag_foreach_cb, &a);
+  basic_ptr->frozen = was_frozen;
   return a.found;
 }
 
@@ -1349,7 +1351,11 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
     mrb_int n = mrb_hash_size(mrb, schema);
     encode_len(w, 5, (uint64_t)n);
     TagEncodeCtx ctx = { w, obj };
+    struct RBasic *basic_ptr = mrb_basic_ptr(schema);
+    unsigned int was_frozen = basic_ptr->frozen;
+    basic_ptr->frozen = TRUE;
     mrb_hash_foreach(mrb, mrb_hash_ptr(schema), encode_registered_tag_foreach, &ctx);
+    basic_ptr->frozen = was_frozen;
   } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "registered class has no net schema");
   }
@@ -1398,7 +1404,11 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
   if (likely(mrb_hash_p(payload))) {
     if (likely(mrb_hash_p(schema))) {
       decode_ctx ctx = { obj, payload };
+      struct RBasic *basic_ptr = mrb_basic_ptr(schema);
+      unsigned int was_frozen = basic_ptr->frozen;
+      basic_ptr->frozen = TRUE;
       mrb_hash_foreach(mrb, mrb_hash_ptr(schema), decode_registered_tag_foreach, &ctx);
+      basic_ptr->frozen = was_frozen;
 
       if (mrb_respond_to(mrb, obj, MRB_SYM(_after_decode))) {
         return mrb_funcall_argv(mrb, obj, MRB_SYM(_after_decode), 0, NULL);
@@ -2123,6 +2133,7 @@ mrb_cbor_encode_sharedrefs(mrb_state *mrb, mrb_value obj)
   CborWriter w;
   cbor_writer_init(&w, mrb);
   w.seen = mrb_hash_new(mrb);
+  mrb_gc_register(mrb, w.seen);
   encode_value(&w, obj);
   return cbor_writer_finish(&w);
 }

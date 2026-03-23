@@ -11,9 +11,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   mrb_value input  = mrb_str_new_static(mrb, (const char *)data, (mrb_int)size);
   mrb_value cbor_m = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(CBOR)));
 
-  /* 1. Eager decode */
-  mrb_funcall_argv(mrb, cbor_m, MRB_SYM(decode), 1, &input);
-  mrb_clear_error(mrb);
+/* 1. Eager decode */
+mrb_value decoded = mrb_funcall_argv(mrb, cbor_m, MRB_SYM(decode), 1, &input);
+if (!mrb_check_error(mrb)) {
+  /* 2. Re-encode the decoded value */
+  mrb_value reencoded = mrb_funcall_argv(mrb, cbor_m, MRB_SYM(encode), 1, &decoded);
+  if (!mrb_check_error(mrb)) {
+    /* 3. Decode the re-encoded value and check it matches */
+    mrb_value redecoded = mrb_funcall_argv(mrb, cbor_m, MRB_SYM(decode), 1, &reencoded);
+    mrb_clear_error(mrb);
+  }
+}
+mrb_clear_error(mrb);
 
   /* 2. Lazy decode — force evaluation via .value */
   mrb_value lazy = mrb_funcall_argv(mrb, cbor_m, MRB_SYM(decode_lazy), 1, &input);

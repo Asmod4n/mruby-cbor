@@ -14,8 +14,9 @@ assert('mruby-cbor-fuzzer: no crashes in fuzzing run') do
     "-dict=#{DICT_FILE}",
     "-jobs=7",
     "-artifact_prefix=#{findings_dir}/",
-    "-max_len=4096",
-     "-ignore_ooms=0"
+    "-max_len=65536",
+     "-ignore_ooms=0",
+     "-use_value_profile=1"
   ]
 
   Dir.chdir(findings_dir) do
@@ -30,9 +31,16 @@ assert('mruby-cbor-fuzzer: no crashes in fuzzing run') do
     end
   end
 
-  sleep 0.1 until (0..6).all? { |n| File.exist?(File.join(findings_dir, "fuzz-#{n}.log")) }
+  sleep 2
+  actual_workers = Dir[File.join(findings_dir, 'fuzz-*.log')].map { |f|
+    File.basename(f)[/\d+/].to_i
+  }.sort
 
-  threads = (0..6).map do |n|
+  $stderr.puts "Detected #{actual_workers.size} workers: #{actual_workers.inspect}"
+
+  sleep 0.1 until actual_workers.all? { |n| File.exist?(File.join(findings_dir, "fuzz-#{n}.log")) }
+
+  threads = actual_workers.map do |n|
     log = File.join(findings_dir, "fuzz-#{n}.log")
     Thread.new do
       File.open(log) do |f|
@@ -46,17 +54,17 @@ assert('mruby-cbor-fuzzer: no crashes in fuzzing run') do
   end
 
   loop do
-    done = (0..6).count do |n|
+    done = actual_workers.count do |n|
       log = File.join(findings_dir, "fuzz-#{n}.log")
       File.exist?(log) && File.read(log) =~ /Done \d+|SUMMARY:/
     end
-    break if done == 16
+    break if done == actual_workers.size
     sleep 5
   end
 
   threads.each(&:kill)
 
-  crashes = (0..6).select do |n|
+  crashes = actual_workers.select do |n|
     log = File.join(findings_dir, "fuzz-#{n}.log")
     File.exist?(log) && File.read(log).include?('SUMMARY:')
   end

@@ -808,6 +808,7 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
   if (likely(need <= SIZE_MAX - stack_len)) {
     size_t capa = next_pow2(stack_len + need);
     w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
+    mrb_gc_register(mrb, w->heap_str);
     w->arena_index = mrb_gc_arena_save(mrb);
     struct RString *s = RSTRING(w->heap_str);
     w->heap_ptr  = RSTR_PTR(s);
@@ -869,12 +870,14 @@ static mrb_value
 cbor_writer_finish(CborWriter *w)
 {
   mrb_state *mrb = w->mrb;
-  if (mrb_undef_p(w->heap_str)) {
+  if (mrb_hash_p(w->seen)) mrb_gc_unregister(mrb, w->seen);
+  if (likely(mrb_undef_p(w->heap_str))) {
     return mrb_str_new(mrb, (const char*)w->stack_buf, (mrb_int)w->stack_len);
   } else if (mrb_string_p(w->heap_str)) {
     struct RString *s = RSTRING(w->heap_str);
     RSTR_SET_LEN(s, (mrb_int)w->heap_len);
     w->heap_ptr[w->heap_len] = '\0';
+    mrb_gc_unregister(mrb, w->heap_str);   // release root
     return w->heap_str;
   } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: heap string is not a string");
@@ -967,6 +970,7 @@ encode_bignum(CborWriter *w, mrb_value obj)
   }
 
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
+  mrb_gc_register(mrb, hex);
   char *p = RSTRING_PTR(hex);
   mrb_int len = RSTRING_LEN(hex);
 
@@ -978,6 +982,7 @@ encode_bignum(CborWriter *w, mrb_value obj)
     encode_len(w, 2, 1);
     uint8_t zero = 0;
     cbor_writer_write(w, &zero, 1);
+    mrb_gc_unregister(mrb, hex);
     mrb_gc_arena_restore(mrb, idx);
     return;
   }
@@ -994,6 +999,7 @@ encode_bignum(CborWriter *w, mrb_value obj)
   uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
   hex_decode_scalar(out, p, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
+  mrb_gc_unregister(mrb, hex);
   mrb_gc_arena_restore(mrb, idx);
 }
 #endif
@@ -1006,14 +1012,13 @@ static void encode_value(CborWriter* w, mrb_value obj);
 static void
 encode_array(CborWriter* w, mrb_value ary)
 {
+  mrb_state *mrb = w->mrb;
   struct RBasic *basic_ary = mrb_basic_ptr(ary);
   unsigned int was_frozen = basic_ary->frozen;
   basic_ary->frozen = TRUE;
-  struct RArray *a = mrb_ary_ptr(ary);
-  mrb_int len = ARY_LEN(a);
+  mrb_int len = RARRAY_LEN(ary);
   encode_len(w, 4, (uint64_t)len);
-  mrb_value *ptr = ARY_PTR(a);
-  for (mrb_int i = 0; i < len; i++) encode_value(w, ptr[i]);
+  for (mrb_int i = 0; i < len; i++) encode_value(w, mrb_ary_ref(mrb, ary, i));
   basic_ary->frozen = was_frozen;
 }
 
@@ -2065,6 +2070,7 @@ cbor_encode_rb(mrb_state *mrb, mrb_value self)
 
   if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
     w.seen = mrb_hash_new(mrb);
+    mrb_gc_register(mrb, w.seen);
   }
 
   encode_value(&w, obj);

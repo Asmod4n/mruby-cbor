@@ -642,6 +642,48 @@ decode_class(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs)
   return mrb_undef_value();
 }
 
+static mrb_value
+decode_class_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value tag)
+{
+  mrb_value reg   = cbor_tag_registry(mrb);
+  mrb_value klass = mrb_hash_fetch(mrb, reg, tag, mrb_undef_value());
+  if (mrb_class_p(klass))
+    return decode_registered_tag(mrb, r, src, sharedrefs, klass);
+  return mrb_undef_value();
+}
+
+static mrb_value
+decode_proc_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value tag)
+{
+  mrb_value proc_reg = cbor_proc_tag_registry(mrb);
+  mrb_value entry    = mrb_hash_fetch(mrb, proc_reg, tag, mrb_undef_value());
+  if (mrb_hash_p(entry)) {
+    mrb_value decode_prc  = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_proc)), mrb_undef_value());
+    if (mrb_proc_p(decode_prc)) {
+      mrb_value decode_type = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_type)), mrb_undef_value());
+      mrb_value payload = decode_value(mrb, r, src, sharedrefs);
+      if (likely(mrb_net_check_type(mrb, decode_type, payload)))
+        return mrb_yield_argv(mrb, decode_prc, 1, &payload);
+      else
+        mrb_raisef(mrb, E_TYPE_ERROR,
+          "CBOR proc tag decode type mismatch for tag %v: got %C",
+          tag, mrb_class(mrb, payload));
+    }
+  }
+  return mrb_undef_value();
+}
+static mrb_value
+decode_unhandled_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value tag)
+{
+  mrb_value tagged_value = decode_value(mrb, r, src, sharedrefs);
+  struct RClass *unhandled_tag = mrb_class_get_under_id(mrb,
+    mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
+  mrb_value result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
+  mrb_iv_set(mrb, result, MRB_IVSYM(tag),   tag);
+  mrb_iv_set(mrb, result, MRB_IVSYM(value), tagged_value);
+  return result;
+}
+
 // ============================================================================
 // Master decode with depth protection
 // ============================================================================
@@ -688,45 +730,19 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
         result = decode_symbol(mrb, r, src, sharedrefs);
         goto done;
       }
-      if (mrb_integer_p(tag) && (uint64_t)mrb_integer(tag) == CBOR_TAG_CLASS) {
+      if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
         result = decode_class(mrb, r, src, sharedrefs);
         goto done;
       }
 
-      {
-        mrb_value reg   = cbor_tag_registry(mrb);
-        mrb_value klass = mrb_hash_fetch(mrb, reg, tag, mrb_undef_value());
-        if (mrb_class_p(klass)) {
-          result = decode_registered_tag(mrb, r, src, sharedrefs, klass);
-          goto done;
-        }
-      }
+      result = decode_class_tag(mrb, r, src, sharedrefs, tag);
+      if (!mrb_undef_p(result)) goto done;
 
-      {
-        mrb_value proc_reg = cbor_proc_tag_registry(mrb);
-        mrb_value entry    = mrb_hash_fetch(mrb, proc_reg, tag, mrb_undef_value());
-        if (likely(mrb_hash_p(entry))) {
-          mrb_value decode_type = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_type)), mrb_undef_value());
-          mrb_value decode_prc  = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_proc)), mrb_undef_value());
-          mrb_value payload     = decode_value(mrb, r, src, sharedrefs);
-          if (unlikely(!mrb_net_check_type(mrb, decode_type, payload)))
-            mrb_raisef(mrb, E_TYPE_ERROR,
-              "CBOR proc tag decode type mismatch for tag %v: got %C",
-              tag, mrb_class(mrb, payload));
-          result = mrb_funcall_argv(mrb, decode_prc, MRB_SYM(call), 1, &payload);
-          goto done;
-        }
-      }
+      result = decode_proc_tag(mrb, r, src, sharedrefs, tag);
+      if (!mrb_undef_p(result)) goto done;
 
-      /* Unknown tag: wrap in UnhandledTag */
-      mrb_value tagged_value = decode_value(mrb, r, src, sharedrefs);
-      struct RClass *unhandled_tag = mrb_class_get_under_id(mrb,
-        mrb_module_get_id(mrb, MRB_SYM(CBOR)), MRB_SYM(UnhandledTag));
-      result = mrb_obj_new(mrb, unhandled_tag, 0, NULL);
-      mrb_iv_set(mrb, result, MRB_IVSYM(tag),   tag);
-      mrb_iv_set(mrb, result, MRB_IVSYM(value), tagged_value);
-      goto done;
-    }
+      result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
+    } break;
 
     case 7:
       if (info < 20) { result = mrb_nil_value(); break; }
@@ -810,9 +826,9 @@ cbor_writer_init_heap(CborWriter *w, size_t need)
 static void
 cbor_writer_ensure_heap(CborWriter *w, size_t add)
 {
-  if (likely(add <= w->heap_capa - w->heap_len)) return;
+  if (add <= w->heap_capa - w->heap_len) return;
 
-  if (likely(add <= SIZE_MAX - w->heap_len)) {
+  if (add <= SIZE_MAX - w->heap_len) {
     size_t capa = next_pow2(w->heap_len + add);
     mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
     struct RString *s = RSTRING(w->heap_str);
@@ -829,7 +845,7 @@ cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
 {
   if (likely(len > 0)) {
     size_t stack_len = w->stack_len;
-    if (likely(mrb_undef_p(w->heap_str) && len <= CBOR_SBO_STACK_CAP - stack_len)) {
+    if (mrb_undef_p(w->heap_str) && len <= CBOR_SBO_STACK_CAP - stack_len) {
       memcpy(w->stack_buf + stack_len, buf, len);
       w->stack_len = stack_len + len;
     } else {
@@ -853,9 +869,9 @@ static mrb_value
 cbor_writer_finish(CborWriter *w)
 {
   mrb_state *mrb = w->mrb;
-  if (likely(mrb_undef_p(w->heap_str))) {
+  if (mrb_undef_p(w->heap_str)) {
     return mrb_str_new(mrb, (const char*)w->stack_buf, (mrb_int)w->stack_len);
-  } else if (likely(mrb_string_p(w->heap_str))) {
+  } else if (mrb_string_p(w->heap_str)) {
     struct RString *s = RSTRING(w->heap_str);
     RSTR_SET_LEN(s, (mrb_int)w->heap_len);
     w->heap_ptr[w->heap_len] = '\0';
@@ -1110,6 +1126,41 @@ encode_sym(CborWriter *w, mrb_value obj)
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy mode");
 }
 
+struct proc_tag_foreach_arg {
+  CborWriter *w;
+  mrb_value   obj;
+  mrb_bool    found;
+};
+
+static int
+proc_tag_foreach_cb(mrb_state *mrb, mrb_value enc_type, mrb_value entry, void *ud)
+{
+  struct proc_tag_foreach_arg *a = (struct proc_tag_foreach_arg *)ud;
+  if (mrb_hash_p(entry) &&
+      (mrb_class_p(enc_type) || mrb_module_p(enc_type)) &&
+      mrb_obj_is_kind_of(mrb, a->obj, mrb_class_ptr(enc_type))) {
+    mrb_value tag_v      = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(tag)),         mrb_undef_value());
+    mrb_value encode_prc = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(encode_proc)), mrb_undef_value());
+    if (mrb_integer_p(tag_v) && mrb_proc_p(encode_prc)) {
+      mrb_value encoded = mrb_yield_argv(mrb, encode_prc, 1, &a->obj);
+      encode_len(a->w, 6, (uint64_t)mrb_integer(tag_v));
+      encode_value(a->w, encoded);
+      a->found = TRUE;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static mrb_bool
+encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
+{
+  mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
+  struct proc_tag_foreach_arg a = {w, obj, FALSE };
+  mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev), proc_tag_foreach_cb, &a);
+  return a.found;
+}
+
 static void
 encode_value(CborWriter* w, mrb_value obj)
 {
@@ -1131,14 +1182,14 @@ encode_value(CborWriter* w, mrb_value obj)
     case MRB_TT_FLOAT:  encode_float(w, mrb_float(obj)); break;
 #endif
     case MRB_TT_INTEGER: encode_integer(w, mrb_integer(obj)); break;
+    case MRB_TT_CLASS:
+    case MRB_TT_MODULE:  encode_class(w, obj); break;
     case MRB_TT_HASH:    encode_map(w, obj); break;
     case MRB_TT_ARRAY:   encode_array(w, obj); break;
     case MRB_TT_STRING:  encode_string(w, obj); break;
 #ifdef MRB_USE_BIGINT
     case MRB_TT_BIGINT:  encode_bignum(w, obj); break;
 #endif
-    case MRB_TT_CLASS:
-    case MRB_TT_MODULE:  encode_class(w, obj); break;
     default: {
       mrb_value rev     = cbor_tag_rev_registry(mrb);
       mrb_value klass   = mrb_obj_value(mrb_class(mrb, obj));
@@ -1146,26 +1197,7 @@ encode_value(CborWriter* w, mrb_value obj)
       if (mrb_integer_p(tag_val)) {
         encode_registered_tag(w, obj, mrb_integer(tag_val));
       } else {
-        mrb_value proc_rev  = cbor_proc_tag_rev_registry(mrb);
-        mrb_value keys      = mrb_hash_keys(mrb, proc_rev);
-        mrb_int   nkeys     = RARRAY_LEN(keys);
-        mrb_value *keys_ptr = RARRAY_PTR(keys);
-        mrb_bool  found     = FALSE;
-        for (mrb_int i = 0; i < nkeys; i++) {
-          mrb_value enc_type = keys_ptr[i];
-          if ((mrb_class_p(enc_type) || mrb_module_p(enc_type)) &&
-              mrb_obj_is_kind_of(mrb, obj, mrb_class_ptr(enc_type))) {
-            mrb_value entry      = mrb_hash_fetch(mrb, proc_rev, enc_type, mrb_undef_value());
-            mrb_value tag_v      = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(tag)),         mrb_undef_value());
-            mrb_value encode_prc = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(encode_proc)), mrb_undef_value());
-            mrb_value encoded    = mrb_funcall_argv(mrb, encode_prc, MRB_SYM(call), 1, &obj);
-            encode_len(w, 6, (uint64_t)mrb_integer(tag_v));
-            encode_value(w, encoded);
-            found = TRUE;
-            break;
-          }
-        }
-        if (!found) {
+        if (!encode_proc_tag(mrb, w, obj)) {
           encode_string(w, mrb_obj_as_string(mrb, obj));
         }
       }

@@ -964,13 +964,15 @@ encode_bignum(CborWriter *w, mrb_value obj)
   }
 
   mrb_value mag = mrb_bint_abs(mrb, obj);
+  mrb_gc_protect(mrb, mag);
   if (sign < 0) {
     mrb_value one = mrb_fixnum_value(1);
     mag = mrb_bint_sub(mrb, mag, one);
   }
+  mrb_gc_protect(mrb, mag);
 
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
-  mrb_gc_register(mrb, hex);
+  mrb_gc_protect(mrb, hex);
   char *p = RSTRING_PTR(hex);
   mrb_int len = RSTRING_LEN(hex);
 
@@ -982,7 +984,6 @@ encode_bignum(CborWriter *w, mrb_value obj)
     encode_len(w, 2, 1);
     uint8_t zero = 0;
     cbor_writer_write(w, &zero, 1);
-    mrb_gc_unregister(mrb, hex);
     mrb_gc_arena_restore(mrb, idx);
     return;
   }
@@ -994,12 +995,19 @@ encode_bignum(CborWriter *w, mrb_value obj)
   cbor_writer_write(w, &tag, 1);
   encode_len(w, 2, (uint64_t)byte_len);
 
-  if (odd) { memmove(p + 1, p, len); p[0] = '0'; }
-
-  uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
-  hex_decode_scalar(out, p, byte_len);
+  mrb_value out_val = mrb_str_new_capa(mrb, byte_len);
+  mrb_str_modify(mrb, RSTRING(out_val));
+  mrb_gc_protect(mrb, out_val);
+  uint8_t *out = (uint8_t*)RSTRING_PTR(out_val);
+  char *buf = RSTRING_PTR(hex);
+  if (odd) {
+    memmove(buf + 1, buf, len);
+    buf[0] = '0';
+  } else {
+    buf = p; /* use the zero-stripped start */
+  }
+  hex_decode_scalar(out, buf, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
-  mrb_gc_unregister(mrb, hex);
   mrb_gc_arena_restore(mrb, idx);
 }
 #endif

@@ -26,7 +26,7 @@ MRB_END_DECL
 /* Configurable CBOR recursion depth limits */
 #ifndef CBOR_MAX_DEPTH
   #if defined(MRB_PROFILE_MAIN) || defined(MRB_PROFILE_HIGH)
-    #define CBOR_MAX_DEPTH 512
+    #define CBOR_MAX_DEPTH 128
   #elif defined(MRB_PROFILE_BASELINE)
     #define CBOR_MAX_DEPTH 64
   #else
@@ -964,16 +964,26 @@ encode_bignum(CborWriter *w, mrb_value obj)
   }
 
   mrb_value mag = mrb_bint_abs(mrb, obj);
+  mrb_gc_protect(mrb, mag);
   if (sign < 0) {
     mrb_value one = mrb_fixnum_value(1);
     mag = mrb_bint_sub(mrb, mag, one);
   }
+  mrb_gc_protect(mrb, mag);
 
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
-  mrb_gc_register(mrb, hex);
-  char *p = RSTRING_PTR(hex);
-  mrb_int len = RSTRING_LEN(hex);
+  mrb_gc_protect(mrb, hex);
 
+  mrb_int len = RSTRING_LEN(hex);
+  // Copy into a C buffer now, before any further mruby allocations
+  char *hbuf = (char*)mrb_malloc(mrb, len + 2); // +2 for odd-pad + NUL
+  memcpy(hbuf, RSTRING_PTR(hex), len);
+  hbuf[len] = '\0';
+
+  // hex no longer needed as a live mruby object
+  mrb_gc_arena_restore(mrb, idx);
+
+  char *p = hbuf;
   while (len > 0 && *p == '0') { p++; len--; }
 
   if (len == 0) {
@@ -982,8 +992,8 @@ encode_bignum(CborWriter *w, mrb_value obj)
     encode_len(w, 2, 1);
     uint8_t zero = 0;
     cbor_writer_write(w, &zero, 1);
-    mrb_gc_unregister(mrb, hex);
     mrb_gc_arena_restore(mrb, idx);
+    mrb_free(mrb, hbuf);
     return;
   }
 
@@ -996,10 +1006,11 @@ encode_bignum(CborWriter *w, mrb_value obj)
 
   if (odd) { memmove(p + 1, p, len); p[0] = '0'; }
 
-  uint8_t *out = (uint8_t*)mrb_alloca(mrb, byte_len);
+  uint8_t *out = (uint8_t*)mrb_malloc(mrb, byte_len);
   hex_decode_scalar(out, p, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
-  mrb_gc_unregister(mrb, hex);
+  mrb_free(mrb, hbuf);
+  mrb_free(mrb, out);
   mrb_gc_arena_restore(mrb, idx);
 }
 #endif

@@ -15,18 +15,18 @@ MRB_END_DECL
 #include <mruby/error.h>
 #include <mruby/ned.h>
 #include <mruby/str_constantize.h>
+#include <mruby/cbor.h>
 
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdbool.h>
-#include <mruby/cbor.h>
 
 /* Configurable CBOR recursion depth limits */
 #ifndef CBOR_MAX_DEPTH
   #if defined(MRB_PROFILE_MAIN) || defined(MRB_PROFILE_HIGH)
-    #define CBOR_MAX_DEPTH 512
+    #define CBOR_MAX_DEPTH 128
   #elif defined(MRB_PROFILE_BASELINE)
     #define CBOR_MAX_DEPTH 64
   #else
@@ -303,6 +303,7 @@ decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 
   if (likely(blen <= RSTRING_LEN(src) - off)) {
     mrb_value slice = mrb_str_byte_subseq(mrb, src, off, blen);
+    mrb_gc_protect(mrb, slice);
 
 #ifdef MRB_UTF8_STRING
     if (likely(mrb_str_is_utf8(slice))) {
@@ -341,14 +342,16 @@ decode_array(mrb_state* mrb, Reader* r, mrb_value src,
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value ary = mrb_ary_new(mrb);
+  mrb_gc_protect(mrb, ary);
+  int idx = mrb_gc_arena_save(mrb);
 
   if (reg) {
     mrb_ary_push(mrb, sharedrefs, ary);
   }
 
   for (mrb_int i = 0; i < len; i++) {
-    mrb_value v = decode_value(mrb, r, src, sharedrefs);
-    mrb_ary_push(mrb, ary, v);
+    mrb_ary_push(mrb, ary, decode_value(mrb, r, src, sharedrefs));
+    mrb_gc_arena_restore(mrb, idx);
   }
 
   return ary;
@@ -361,6 +364,8 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_value_to_len(mrb, len_v);
   mrb_value hash = mrb_hash_new(mrb);
+  mrb_gc_protect(mrb, hash);
+  int idx = mrb_gc_arena_save(mrb);
 
   if (reg) {
     mrb_ary_push(mrb, sharedrefs, hash);
@@ -368,8 +373,11 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
 
   for (mrb_int i = 0; i < len; i++) {
     mrb_value key = decode_value(mrb, r, src, sharedrefs);
+    mrb_gc_protect(mrb, key);
     mrb_value val = decode_value(mrb, r, src, sharedrefs);
+    mrb_gc_protect(mrb, val);
     mrb_hash_set(mrb, hash, key, val);
+    mrb_gc_arena_restore(mrb, idx);
   }
 
   return hash;
@@ -662,6 +670,7 @@ decode_proc_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, 
     if (mrb_proc_p(decode_prc)) {
       mrb_value decode_type = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(decode_type)), mrb_undef_value());
       mrb_value payload = decode_value(mrb, r, src, sharedrefs);
+
       if (likely(mrb_net_check_type(mrb, decode_type, payload)))
         return mrb_yield_argv(mrb, decode_prc, 1, &payload);
       else
@@ -771,6 +780,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 
 done:
   r->depth--;
+  mrb_gc_protect(mrb, result);
   return result;
 }
 
@@ -950,17 +960,28 @@ encode_check_shared(CborWriter *w, mrb_value obj)
 // BigInt encoding (Tag 2/3)
 // ============================================================================
 #ifdef MRB_USE_BIGINT
-static void
-encode_bignum(CborWriter *w, mrb_value obj)
+
+struct encode_bignum_ctx {
+  CborWriter *w;
+  mrb_value   obj;
+  char       *hbuf;
+  uint8_t    *out;
+};
+
+static mrb_value
+encode_bignum_body(mrb_state *mrb, void *ud)
 {
-  mrb_state *mrb = w->mrb;
-  mrb_int idx = mrb_gc_arena_save(mrb);
+  struct encode_bignum_ctx *ctx = (struct encode_bignum_ctx*) ud;
+  CborWriter *w  = ctx->w;
+  mrb_value   obj = ctx->obj;
+
+  mrb_int idx  = mrb_gc_arena_save(mrb);
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
   if (mrb_bint_size(mrb, obj) <= 8 && sign >= 0) {
     encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
     mrb_gc_arena_restore(mrb, idx);
-    return;
+    return mrb_nil_value();
   }
 
   mrb_value mag = mrb_bint_abs(mrb, obj);
@@ -968,14 +989,21 @@ encode_bignum(CborWriter *w, mrb_value obj)
   if (sign < 0) {
     mrb_value one = mrb_fixnum_value(1);
     mag = mrb_bint_sub(mrb, mag, one);
+    mrb_gc_protect(mrb, mag);
   }
-  mrb_gc_protect(mrb, mag);
 
   mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
   mrb_gc_protect(mrb, hex);
-  char *p = RSTRING_PTR(hex);
-  mrb_int len = RSTRING_LEN(hex);
 
+  mrb_int len  = RSTRING_LEN(hex);
+  char   *hbuf = (char*)mrb_malloc(mrb, len + 2);
+  ctx->hbuf    = hbuf;                          /* visible to cleanup */
+  memcpy(hbuf, RSTRING_PTR(hex), len);
+  hbuf[len] = '\0';
+
+  mrb_gc_arena_restore(mrb, idx);
+
+  char *p = hbuf;
   while (len > 0 && *p == '0') { p++; len--; }
 
   if (len == 0) {
@@ -984,32 +1012,48 @@ encode_bignum(CborWriter *w, mrb_value obj)
     encode_len(w, 2, 1);
     uint8_t zero = 0;
     cbor_writer_write(w, &zero, 1);
-    mrb_gc_arena_restore(mrb, idx);
-    return;
+    mrb_free(mrb, hbuf);
+    ctx->hbuf = NULL;
+    return mrb_nil_value();
   }
 
-  mrb_bool odd = (len & 1);
-  mrb_int byte_len = (odd ? len + 1 : len) / 2;
+  mrb_bool odd      = (len & 1);
+  mrb_int  byte_len = (odd ? len + 1 : len) / 2;
 
   uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
   cbor_writer_write(w, &tag, 1);
   encode_len(w, 2, (uint64_t)byte_len);
 
-  mrb_value out_val = mrb_str_new_capa(mrb, byte_len);
-  mrb_str_modify(mrb, RSTRING(out_val));
-  mrb_gc_protect(mrb, out_val);
-  uint8_t *out = (uint8_t*)RSTRING_PTR(out_val);
-  char *buf = RSTRING_PTR(hex);
-  if (odd) {
-    memmove(buf + 1, buf, len);
-    buf[0] = '0';
-  } else {
-    buf = p; /* use the zero-stripped start */
-  }
-  hex_decode_scalar(out, buf, byte_len);
+  if (odd) { memmove(p + 1, p, len); p[0] = '0'; }
+
+  uint8_t *out = (uint8_t*)mrb_malloc(mrb, byte_len);
+  ctx->out     = out;                           /* visible to cleanup */
+  hex_decode_scalar(out, p, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
-  mrb_gc_arena_restore(mrb, idx);
+
+  mrb_free(mrb, hbuf); ctx->hbuf = NULL;
+  mrb_free(mrb, out);  ctx->out  = NULL;
+
+  return mrb_nil_value();
 }
+
+static void
+encode_bignum(CborWriter *w, mrb_value obj)
+{
+  mrb_state *mrb = w->mrb;
+
+  struct encode_bignum_ctx ctx = { w, obj, NULL, NULL };
+  mrb_bool error = FALSE;
+  mrb_value exc = mrb_protect_error(mrb, encode_bignum_body, &ctx, &error);
+
+  /* Free any allocations that were live when the exception fired */
+  if (ctx.hbuf) { mrb_free(mrb, ctx.hbuf); }
+  if (ctx.out)  { mrb_free(mrb, ctx.out);  }
+
+  /* Re-raise so the encoder's caller sees the exception */
+  if (error) { mrb_exc_raise(mrb, exc); }
+}
+
 #endif
 
 // ============================================================================
@@ -1245,6 +1289,7 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedref
   p->buf    = buf;
   p->offset = offset;
   mrb_value obj = mrb_obj_value(data);
+  mrb_gc_protect(mrb, obj);
   mrb_iv_set(mrb, obj, MRB_SYM(buf),        buf);
   mrb_iv_set(mrb, obj, MRB_SYM(vcache),     mrb_undef_value());
   mrb_iv_set(mrb, obj, MRB_SYM(kcache),     mrb_hash_new(mrb));
@@ -1263,6 +1308,7 @@ cbor_tag_registry(mrb_state *mrb)
   mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_tag_registry__));
   if (likely(mrb_hash_p(reg))) return reg;
   reg = mrb_hash_new(mrb);
+  mrb_gc_protect(mrb, reg);
   mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_tag_registry__), reg);
   return reg;
 }
@@ -1274,6 +1320,7 @@ cbor_tag_rev_registry(mrb_state *mrb)
   mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_tag_rev_registry__));
   if (likely(mrb_hash_p(reg))) return reg;
   reg = mrb_hash_new(mrb);
+  mrb_gc_protect(mrb, reg);
   mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_tag_rev_registry__), reg);
   return reg;
 }
@@ -1285,6 +1332,7 @@ cbor_proc_tag_registry(mrb_state *mrb)
   mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_proc_tag_registry__));
   if (likely(mrb_hash_p(reg))) return reg;
   reg = mrb_hash_new(mrb);
+  mrb_gc_protect(mrb, reg);
   mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_proc_tag_registry__), reg);
   return reg;
 }
@@ -1296,6 +1344,7 @@ cbor_proc_tag_rev_registry(mrb_state *mrb)
   mrb_value reg  = mrb_iv_get(mrb, cbor, MRB_SYM(__cbor_proc_tag_rev_registry__));
   if (likely(mrb_hash_p(reg))) return reg;
   reg = mrb_hash_new(mrb);
+  mrb_gc_protect(mrb, reg);
   mrb_iv_set(mrb, cbor, MRB_SYM(__cbor_proc_tag_rev_registry__), reg);
   return reg;
 }
@@ -1381,6 +1430,7 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value schema_ty
   while (slen > 0 && sname[0] == '@') { sname++; slen--; }
 
   mrb_value map_key = mrb_str_new_static(mrb, sname, slen);
+  mrb_gc_protect(mrb, map_key);
   mrb_value val = mrb_hash_fetch(mrb, ctx->payload, map_key, mrb_undef_value());
 
   if (!mrb_undef_p(val)) {
@@ -1404,6 +1454,7 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
   struct RClass *kp = mrb_class_ptr(klass);
   mrb_value schema  = mrb_net_schema(mrb, kp);
   mrb_value obj     = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
+  mrb_gc_protect(mrb, obj);
 
   mrb_value payload = decode_value(mrb, r, src, sharedrefs);
   if (likely(mrb_hash_p(payload))) {
@@ -1657,8 +1708,9 @@ cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
     r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = depth;
 
     mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
-    if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type))
+    if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) {
       value = cbor_lazy_value_r(mrb, value, r.depth + 1);
+    }
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
@@ -1828,7 +1880,9 @@ cbor_decode_rb_lazy(mrb_state *mrb, mrb_value self)
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
   mrb_value owned_buf   = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+  mrb_gc_protect(mrb, owned_buf);
   mrb_value sharedrefs  = mrb_ary_new(mrb);
+  mrb_gc_protect(mrb, sharedrefs);
   return cbor_lazy_new(mrb, owned_buf, 0, sharedrefs);
 }
 
@@ -2043,9 +2097,11 @@ cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
 
   /* mrb_net_check_type expects an Array of types, same as native_ext_type stores */
   mrb_value decode_type_ary = mrb_ary_new_from_values(mrb, 1, &decode_type);
+  mrb_gc_protect(mrb, decode_type_ary);
 
   /* forward registry: tag -> { decode_type: [Type], decode_proc: } */
   mrb_value fwd_entry = mrb_hash_new_capa(mrb, 2);
+  mrb_gc_protect(mrb, fwd_entry);
   mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_type)), decode_type_ary);
   mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_proc)), decode_prc);
   mrb_hash_set(mrb, cbor_proc_tag_registry(mrb), tag_v, fwd_entry);
@@ -2053,6 +2109,7 @@ cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
   /* reverse registry: encode_type -> { tag:, encode_proc: }
      lookup uses kind_of? iteration at encode time */
   mrb_value rev_entry = mrb_hash_new_capa(mrb, 2);
+  mrb_gc_protect(mrb, rev_entry);
   mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(tag)),         tag_v);
   mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(encode_proc)), encode_prc);
   mrb_hash_set(mrb, cbor_proc_tag_rev_registry(mrb), encode_type, rev_entry);
@@ -2102,8 +2159,11 @@ cbor_decode_rb(mrb_state *mrb, mrb_value self)
 
   mrb_get_args(mrb, "S", &src);
   src = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
+  mrb_gc_protect(mrb, src);
   reader_init(&r, (const uint8_t*)RSTRING_PTR(src), (size_t)RSTRING_LEN(src));
-  return decode_value(mrb, &r, src, mrb_ary_new(mrb));
+  mrb_value sharedrefs = mrb_ary_new(mrb);
+  mrb_gc_protect(mrb, sharedrefs);
+  return decode_value(mrb, &r, src, sharedrefs);
 }
 
 /* CBOR.doc_end(buf, offset=0) — Ruby binding */
@@ -2148,9 +2208,12 @@ mrb_cbor_decode(mrb_state *mrb, mrb_value buf)
 {
   if (likely(mrb_string_p(buf))) {
     mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+    mrb_gc_protect(mrb, owned);
     Reader r;
     reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-    return decode_value(mrb, &r, owned, mrb_ary_new(mrb));
+    mrb_value sharedrefs = mrb_ary_new(mrb);
+    mrb_gc_protect(mrb, sharedrefs);
+    return decode_value(mrb, &r, owned, sharedrefs);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
 }
@@ -2160,7 +2223,9 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value buf)
 {
   if (likely(mrb_string_p(buf))) {
     mrb_value owned      = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+    mrb_gc_protect(mrb, owned);
     mrb_value sharedrefs = mrb_ary_new(mrb);
+    mrb_gc_protect(mrb, sharedrefs);
     return cbor_lazy_new(mrb, owned, 0, sharedrefs);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");

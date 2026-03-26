@@ -17,6 +17,7 @@
 | **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
 | **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with key and result caching |
 | **Streaming** | `CBOR.stream` for CBOR sequences from strings, files, and sockets |
+| **Diagnostic Notation** | `CBOR.diagnose` for RFC 8949 §8.1 human-readable output |
 | **Class / Module Encoding** | Tag 49999 — classes and modules round-trip automatically |
 | **Proc-based Tag Registration** | Register encode/decode procs for any type, including builtins with C state |
 | **Performance** | ~30% faster than msgpack; 1.3–3× faster than simdjson for selective access |
@@ -172,6 +173,55 @@ result = CBOR.decode(buf)
 
 result.equal?(result[0])  # => true (self-referential)
 ```
+
+---
+
+### Diagnostic Notation
+
+`CBOR.diagnose` renders any CBOR buffer as RFC 8949 §8.1 diagnostic notation — a human-readable text format useful for debugging, logging, and test output.
+
+```ruby
+CBOR.diagnose(CBOR.encode(1))                        # => "1"
+CBOR.diagnose(CBOR.encode("hello"))                  # => '"hello"'
+CBOR.diagnose(CBOR.encode([1, [2, 3]]))              # => "[1,[2,3]]"
+CBOR.diagnose(CBOR.encode({ "a" => 1 }))             # => '{"a":1}'
+CBOR.diagnose(CBOR.encode(true))                     # => "true"
+CBOR.diagnose(CBOR.encode(nil))                      # => "null"
+
+# Tags are rendered as tag(value)
+CBOR.diagnose("\xc1\x1a\x51\x4b\x67\xb0")           # => "1(1363896240)"
+
+# Byte strings use hex notation
+CBOR.diagnose(CBOR.encode("\x01\x02\x03".b))         # => "h'010203'"
+```
+
+**Float width suffixes** follow RFC 8610 §8.1: `_1` = f16, `_2` = f32, `_3` = f64. The suffix reflects the wire encoding, not the Ruby type.
+
+```ruby
+CBOR.diagnose(CBOR.encode(1.0))                      # => "1.0_1"   (f16)
+CBOR.diagnose(CBOR.encode(1.0e10))                   # => "10000000000.0_2"  (f32)
+CBOR.diagnose(CBOR.encode(3.14))                     # => "3.14_3"  (f64)
+CBOR.diagnose(CBOR.encode(Float::NAN))               # => "NaN_1"   (canonical f16)
+CBOR.diagnose(CBOR.encode(Float::INFINITY))          # => "Infinity_1"
+CBOR.diagnose(CBOR.encode(-Float::INFINITY))         # => "-Infinity_1"
+```
+
+**Indefinite-length items** (produced by other encoders) are rendered in diagnostic notation with the `_` prefix per spec:
+
+```ruby
+# Indefinite-length array from an external encoder
+CBOR.diagnose("\x9f\x01\x02\xff")                    # => "[_ 1,2]"
+
+# Indefinite-length map
+CBOR.diagnose("\xbf\x61a\x01\xff")                   # => "{_ \"a\":1}"
+
+# Indefinite-length byte string chunks
+CBOR.diagnose("\x5f\x41\x01\x41\x02\xff")            # => "(_ h'01',h'02')"
+```
+
+Note: `CBOR.encode` never produces indefinite-length items. `CBOR.diagnose` can read them from external sources for inspection purposes.
+
+**`MRB_NO_FLOAT` builds** render f16 and f32 values using exact rational arithmetic (no floating-point operations). f64 values use hex-float notation (e.g. `0x1.0p0_3`) as specified in RFC 8610 Appendix G.
 
 ---
 

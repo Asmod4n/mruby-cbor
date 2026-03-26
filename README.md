@@ -12,7 +12,7 @@
 |---------|---------|
 | **Core Types** | Integers, floats, strings, byte strings, arrays, maps, booleans, nil |
 | **BigInt Support** | Tags 2/3 (RFC 8949) when compiled with `MRB_USE_BIGINT` |
-| **Float Precision** | Float16/32/64 with subnormals, Inf, and NaN |
+| **Float Precision** | Preferred serialization: f16→f32→f64 (smallest lossless width). NaN canonicalized to `0xF97E00`. Pure bit-pattern arithmetic, zero FP ops. |
 | **Shared References** | Tags 28/29 for deduplication, including cyclic structures |
 | **Zero-Copy Decoding** | Both eager and lazy decoding operate directly on the input buffer without copying |
 | **Lazy Decoding** | `CBOR::Lazy` for on-demand nested access with key and result caching |
@@ -30,13 +30,15 @@
 **Determinism Guarantees:**
 - Encoding is deterministic *within a single mruby build*
 - Hash field order follows insertion order (per mruby hash impl)
-- Float width is compile-time fixed via `MRB_USE_FLOAT32` (f32 build) or defaults to f64
+- Float preferred width (f16/f32/f64) is determined entirely by the value's bit pattern — same value always produces the same wire bytes
+- `MRB_USE_FLOAT32` builds cap at f32; f16 preferred serialization still applies within that cap
+- NaN always encodes as canonical `0xF97E00` (quiet NaN, f16), matching RFC 8949 Appendix B and the cbor2 reference implementation
 - Symbol encoding strategy is global; don't mix `no_symbols` / `symbols_as_string` / `symbols_as_uint32` in the same program
 - **Not deterministic across builds** if you rebuild mruby with different CFLAGS or config
 
 **Recursion Depth Limits:**
 Default `CBOR_MAX_DEPTH` depends on mruby profile:
-- `MRB_PROFILE_MAIN` / `MRB_PROFILE_HIGH`: 512
+- `MRB_PROFILE_MAIN` / `MRB_PROFILE_HIGH`: 128
 - `MRB_PROFILE_BASELINE`: 64
 - Constrained / other: 32
 
@@ -48,7 +50,7 @@ Exceeding this raises `RuntimeError: "CBOR nesting depth exceeded"`. Override by
 
 - **Encoding:** ~30% faster than msgpack (SBO + incremental writes)
 - **Lazy decoding:** 1.3–3× faster than simdjson for selective access
-- **Float encoding:** Width is fixed at compile time; no runtime overhead
+- **Float encoding:** Preferred serialization (f16→f32→f64) uses pure bit-pattern arithmetic — a handful of integer comparisons and masks. Zero floating-point operations. Negligible overhead compared to the buffer write itself.
 
 **When to use lazy decoding:**
 - Decoding large payloads where you only access a subset of fields
@@ -81,6 +83,37 @@ lazy["hello"][1].value  # => 2 (constant-time after first access)
 ---
 
 ## 📖 Usage Guide
+
+### Float Encoding
+
+Floats use **preferred serialization** (RFC 8949 §4.1): the smallest CBOR float width that represents the value losslessly. Width is chosen by pure bit-pattern arithmetic with zero floating-point operations.
+
+```ruby
+CBOR.encode(0.0).bytesize      # => 3  (f16: F9 00 00)
+CBOR.encode(1.0).bytesize      # => 3  (f16: F9 3C 00)
+CBOR.encode(1.5).bytesize      # => 3  (f16: F9 3E 00)
+CBOR.encode(1.0e10).bytesize   # => 5  (f32)
+CBOR.encode(3.14).bytesize     # => 9  (f64)
+
+CBOR.encode(Float::INFINITY)   # => "\xF9\x7C\x00"  (f16)
+CBOR.encode(-Float::INFINITY)  # => "\xF9\xFC\x00"  (f16)
+CBOR.encode(Float::NAN)        # => "\xF9\x7E\x00"  (canonical quiet NaN, always)
+```
+
+Width selection rules:
+
+| Value category | Encoding | Condition |
+|----------------|----------|-----------|
+| NaN (any payload/sign) | f16 `0x7E00` | Canonicalized per RFC 8949 App. B |
+| ±Inf, ±0 | f16 | Always |
+| f16 normal | f16 | f32 exp ∈ [113..142] and low 13 f32 mant bits = 0 |
+| f16 subnormal | f16 | f32 exp ∈ [103..112] and bit fit is exact |
+| Fits losslessly in f32 | f32 | Low 29 f64 mant bits = 0 and exp in f32 range |
+| Everything else | f64 | |
+
+`MRB_USE_FLOAT32` builds start at f32 and still try f16 first.
+
+---
 
 ### CBOR::Lazy – On-Demand Access
 
@@ -158,7 +191,7 @@ class Person
   native_ext_type :@name,    String
   native_ext_type :@age,     Integer
   native_ext_type :@address, Address   # nested registered class
-  native_ext_type :@has_kids, TrueClass, FalseClass # you could also add NilClass here to make a value be present but not set.
+  native_ext_type :@has_kids, TrueClass, FalseClass
 
   # Called after decoding (optional)
   def _after_decode
@@ -209,7 +242,6 @@ decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Be
 | Any registered class | Instances of that class (or subclasses) |
 
 Type checking uses `is_a?`, so inheritance works: a schema of `Numeric` accepts both `Integer` and `Float`, and a schema of `Animal` accepts any subclass of `Animal`.
-You can mix and match any number of classes to represent whatever you need.
 
 Fields absent from a decoded payload are silently skipped — only declared ivars are populated (allowlist model). Extra fields in the payload are ignored.
 
@@ -272,21 +304,15 @@ CBOR.register_tag(50000) do
   end
 end
 
-def encode_exception(exc)
-  CBOR.encode(exc)
-end
-
 buf = begin
   raise ArgumentError, "something went wrong"
 rescue => e
-  encode_exception(e)
+  CBOR.encode(e)
 end
 
 exc = CBOR.decode(buf)
 raise exc  # re-raises ArgumentError with original message and backtrace
 ```
-
-Because `encode_exception` is a plain function, users can add filtering or logging around it however they like — the library imposes no policy.
 
 #### Time serialization (optional, requires mruby-time)
 
@@ -301,7 +327,7 @@ CBOR.register_tag(1) do
   end
 end
 
-CBOR.encode(Time.now)   # => tag(1, <float epoch>)
+CBOR.encode(Time.now)   # => tag(1, <f16/f32/f64 epoch float>)
 CBOR.decode(buf)        # => Time object
 ```
 

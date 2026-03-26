@@ -481,7 +481,14 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
     mrb_value len_v = read_cbor_uint(mrb, r, info2);
     mrb_int len = cbor_value_to_len(mrb, len_v);
 
-    if (likely(len > 0)) {
+    if (likely(len >= 0)) {
+      /* RFC 8949 §3.4.3: zero-length payload is valid.
+       * tag(2, h'') = 0,  tag(3, h'') = -1 */
+      if (len == 0) {
+        mrb_gc_arena_restore(mrb, idx);
+        const mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
+        return mrb_fixnum_value(negative ? -1 : 0);
+      }
       ptrdiff_t off = r->p - r->base;
       if (likely(off >= 0)) {
         ensure_slice_bounds(mrb, src, (mrb_int)off, len);
@@ -528,7 +535,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
         mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
       }
     } else {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum: zero length");
+      mrb_raise(mrb, E_RANGE_ERROR, "bignum payload length out of range");
     }
   } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
@@ -984,6 +991,20 @@ encode_bignum_body(mrb_state *mrb, void *ud)
     return mrb_nil_value();
   }
 
+  if (mrb_bint_size(mrb, obj) <= 8 && sign < 0) {
+    /* Negative bigint whose magnitude fits in 8 bytes.
+     * mrb_bint_as_uint64 raises on negative values, so abs first.
+     * CBOR negative integer encodes -1-n, so n = |obj| - 1.
+     * For |obj| = 2^64 as_uint64 truncates to 0; 0-1 wraps to
+     * 0xffffffffffffffff — the correct encoding for -2^64. */
+    mrb_value abs_obj = mrb_bint_abs(mrb, obj);
+    mrb_gc_protect(mrb, abs_obj);
+    uint64_t n = mrb_bint_as_uint64(mrb, abs_obj) - UINT64_C(1);
+    encode_len(w, 1, n);
+    mrb_gc_arena_restore(mrb, idx);
+    return mrb_nil_value();
+  }
+
   mrb_value mag = mrb_bint_abs(mrb, obj);
   mrb_gc_protect(mrb, mag);
   if (sign < 0) {
@@ -1019,6 +1040,22 @@ encode_bignum_body(mrb_state *mrb, void *ud)
 
   mrb_bool odd      = (len & 1);
   mrb_int  byte_len = (odd ? len + 1 : len) / 2;
+
+  /* Negative bigints whose magnitude-1 fits in 8 bytes must encode as a
+   * plain CBOR negative integer (major type 1), not Tag 3.  This covers
+   * values like -2^64 whose magnitude (2^64) exceeds uint64 but whose
+   * magnitude-1 (0xffffffffffffffff) does not.  At this point mag already
+   * holds |obj|-1 and p points to its (possibly odd-padded) hex digits. */
+  if (sign < 0 && byte_len <= 8) {
+    uint64_t n = 0;
+    const char *q = p;
+    for (mrb_int i = 0; i < len; i++)
+      n = (n << 4) | hex_nibble((uint8_t)q[i]);
+    encode_len(w, 1, n);
+    mrb_free(mrb, hbuf);
+    ctx->hbuf = NULL;
+    return mrb_nil_value();
+  }
 
   uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
   cbor_writer_write(w, &tag, 1);
@@ -1136,28 +1173,210 @@ encode_simple(CborWriter* w, mrb_value obj)
 }
 
 #ifndef MRB_NO_FLOAT
+
+/*
+ * cbor_write_f16:
+ * Write a CBOR float16 (major 7, info 25 = 0xF9) from a f32 bit-pattern.
+ *
+ * Caller has already verified the value fits losslessly in f16.
+ * NaN is always canonicalized to 0xF97E00 (quiet NaN, RFC 8949 App. B).
+ *
+ * f16 layout:  sign(1) | exp5(5) | mant10(10)  bias=15
+ * f32 layout:  sign(1) | exp8(8) | mant23(23)  bias=127
+ *
+ * Exponent remapping for normals: exp16 = exp32 - 112  (127 - 15 = 112)
+ * Subnormal range: f32 exp in [103..112] maps to f16 exp=0 with implicit-1
+ *   shifted into the mantissa field.
+ */
+static void
+cbor_write_f16(CborWriter *w, uint32_t u32)
+{
+  uint32_t sign32  = u32 >> 31;
+  uint32_t exp32   = (u32 >> 23) & 0xFF;
+  uint32_t mant32  = u32 & 0x7FFFFF;
+  uint32_t exp16, mant16;
+
+  if (exp32 == 0xFF) {
+    if (mant32 != 0) {
+      /* Canonical CBOR quiet NaN — matches RFC 8949 Appendix B */
+      uint8_t buf[3] = { 0xF9, 0x7E, 0x00 };
+      cbor_writer_write(w, buf, 3);
+      return;
+    }
+    /* Inf */
+    exp16  = 0x1F;
+    mant16 = 0;
+  } else if (exp32 == 0) {
+    /* f32 zero → f16 zero (sign preserved) */
+    exp16  = 0;
+    mant16 = 0;
+  } else if (exp32 >= 113) {
+    /* f32 normal → f16 normal  (exp32 ∈ [113..142])
+       exp16 = exp32 - 112,  mant16 = high 10 bits of mant32 */
+    exp16  = exp32 - 112;
+    mant16 = mant32 >> 13;
+  } else {
+    /* f32 normal → f16 subnormal  (exp32 ∈ [103..112])
+       The f16 subnormal value = mant16 * 2^-24.
+       The f32 value           = (1 + mant32/2^23) * 2^(exp32-127).
+       Setting equal: mant16 = (0x800000 | mant32) >> (126 - exp32).
+       The implicit-1 bit (0x800000) is above the shift mask for exp32≤112,
+       so it never appears in the discarded bits — the shift is exact. */
+    mant16 = (0x800000u | mant32) >> (126 - exp32);
+    exp16  = 0;
+  }
+
+  uint16_t h = (uint16_t)((sign32 << 15) | (exp16 << 10) | mant16);
+  uint8_t buf[3] = { 0xF9, (uint8_t)(h >> 8), (uint8_t)h };
+  cbor_writer_write(w, buf, 3);
+}
+
+#ifdef MRB_USE_FLOAT32
+
+/*
+ * encode_float (MRB_USE_FLOAT32 build — mrb_float is 32-bit):
+ *
+ * Preferred serialization: f16 if lossless, else f32.
+ * Pure bit-pattern arithmetic — zero floating-point operations.
+ */
 static void
 encode_float(CborWriter *w, mrb_float f)
 {
-#ifdef MRB_USE_FLOAT32
   mrb_static_assert(sizeof(mrb_float) == sizeof(uint32_t));
-  uint8_t buf[5]; buf[0] = 0xFA;
-  uint32_t u; memcpy(&u, &f, sizeof(uint32_t));
-  buf[1]=(uint8_t)(u>>24); buf[2]=(uint8_t)(u>>16);
-  buf[3]=(uint8_t)(u>>8);  buf[4]=(uint8_t)(u);
-  cbor_writer_write(w, buf, 5);
-#else
-  mrb_static_assert(sizeof(mrb_float) == sizeof(uint64_t));
-  uint8_t buf[9]; buf[0] = 0xFB;
-  uint64_t u; memcpy(&u, &f, sizeof(uint64_t));
-  buf[1]=(uint8_t)(u>>56); buf[2]=(uint8_t)(u>>48);
-  buf[3]=(uint8_t)(u>>40); buf[4]=(uint8_t)(u>>32);
-  buf[5]=(uint8_t)(u>>24); buf[6]=(uint8_t)(u>>16);
-  buf[7]=(uint8_t)(u>>8);  buf[8]=(uint8_t)(u);
-  cbor_writer_write(w, buf, 9);
-#endif
+  uint32_t u32;
+  memcpy(&u32, &f, 4);
+
+  uint32_t exp32  = (u32 >> 23) & 0xFF;
+  uint32_t mant32 = u32 & 0x7FFFFF;
+
+  /* NaN → canonical f16 quiet NaN */
+  if (exp32 == 0xFF && mant32 != 0) { cbor_write_f16(w, u32); return; }
+
+  mrb_bool fits_f16;
+  if (exp32 == 0xFF || exp32 == 0) {
+    /* Inf or zero — always representable in f16 */
+    fits_f16 = TRUE;
+  } else if (exp32 >= 113 && exp32 <= 142) {
+    /* f16 normal range: low 13 mantissa bits must be zero */
+    fits_f16 = ((mant32 & 0x1FFFu) == 0);
+  } else if (exp32 >= 103 && exp32 <= 112) {
+    /* f16 subnormal range: low (126-exp32) bits of mantissa must be zero */
+    fits_f16 = ((mant32 & ((1u << (126 - exp32)) - 1u)) == 0);
+  } else {
+    /* exp32 < 103 (too small for f16) or > 142 (too large for f16) */
+    fits_f16 = FALSE;
+  }
+
+  if (fits_f16) {
+    cbor_write_f16(w, u32);
+  } else {
+    uint8_t buf[5] = {
+      0xFA,
+      (uint8_t)(u32 >> 24), (uint8_t)(u32 >> 16),
+      (uint8_t)(u32 >>  8), (uint8_t)(u32)
+    };
+    cbor_writer_write(w, buf, 5);
+  }
 }
-#endif
+
+#else /* f64 build — mrb_float is 64-bit */
+
+/*
+ * encode_float (f64 build):
+ *
+ * Preferred serialization: f16 if lossless, else f32 if lossless, else f64.
+ * Pure bit-pattern arithmetic — zero floating-point operations.
+ *
+ * Key exponent relationships:
+ *   f64 bias=1023, f32 bias=127  → delta=896  (f32 exp = f64 exp - 896)
+ *   f32 bias=127,  f16 bias=15   → delta=112  (f16 exp = f32 exp - 112)
+ *   f32 normal → f16 normal:    f32 exp ∈ [113..142]
+ *   f32 normal → f16 subnormal: f32 exp ∈ [103..112]
+ *   f64 normal → f32 normal:    f64 exp ∈ [897..1150]
+ */
+static void
+encode_float(CborWriter *w, mrb_float f)
+{
+  mrb_static_assert(sizeof(mrb_float) == sizeof(uint64_t));
+  uint64_t u64;
+  memcpy(&u64, &f, 8);
+
+  uint32_t exp64  = (uint32_t)((u64 >> 52) & 0x7FF);
+  uint64_t mant64 = u64 & UINT64_C(0x000FFFFFFFFFFFFF);
+
+  /* NaN → canonical f16 quiet NaN (0xF97E00, RFC 8949 App. B) */
+  if (exp64 == 0x7FF && mant64 != 0) {
+    cbor_write_f16(w, 0x7FC00000u); /* any f32 NaN payload works */
+    return;
+  }
+
+  /* ── Try f32 ─────────────────────────────────────────────────── */
+  /* Low 29 mantissa bits must be zero: 52 f64 bits → 23 f32 bits  */
+  if ((mant64 & UINT64_C(0x1FFFFFFF)) != 0) goto emit_f64;
+
+  {
+    uint32_t mant32 = (uint32_t)(mant64 >> 29);
+    uint32_t sign32 = (uint32_t)(u64 >> 63);
+    uint32_t exp32;
+
+    if (exp64 == 0x7FF) {
+      /* Inf — representable in f32 and f16 */
+      exp32 = 0xFF;
+    } else if (exp64 == 0) {
+      if (mant64 != 0) goto emit_f64; /* f64 subnormal — no lossless f32 */
+      exp32 = 0;                       /* zero */
+    } else {
+      /* Normal: remap exponent bias_64=1023 → bias_32=127, delta=896 */
+      if (exp64 < 897 || exp64 > 1150) goto emit_f64;
+      exp32 = exp64 - 896;
+    }
+
+    uint32_t u32 = (sign32 << 31) | (exp32 << 23) | mant32;
+
+    /* ── Try f16 ─────────────────────────────────────────────── */
+    mrb_bool fits_f16;
+    if (exp32 == 0xFF || exp32 == 0) {
+      /* Inf or zero — always representable in f16 */
+      fits_f16 = TRUE;
+    } else if (exp32 >= 113 && exp32 <= 142) {
+      /* f16 normal range: low 13 mantissa bits must be zero */
+      fits_f16 = ((mant32 & 0x1FFFu) == 0);
+    } else if (exp32 >= 103 && exp32 <= 112) {
+      /* f16 subnormal range: low (126-exp32) bits must be zero */
+      fits_f16 = ((mant32 & ((1u << (126 - exp32)) - 1u)) == 0);
+    } else {
+      /* exp32 < 103 (underflows f16) or > 142 (overflows f16) */
+      fits_f16 = FALSE;
+    }
+
+    if (fits_f16) {
+      cbor_write_f16(w, u32);
+      return;
+    }
+
+    /* Emit f32 */
+    uint8_t buf[5] = {
+      0xFA,
+      (uint8_t)(u32 >> 24), (uint8_t)(u32 >> 16),
+      (uint8_t)(u32 >>  8), (uint8_t)(u32)
+    };
+    cbor_writer_write(w, buf, 5);
+    return;
+  }
+
+emit_f64:;
+  uint8_t buf[9] = {
+    0xFB,
+    (uint8_t)(u64 >> 56), (uint8_t)(u64 >> 48),
+    (uint8_t)(u64 >> 40), (uint8_t)(u64 >> 32),
+    (uint8_t)(u64 >> 24), (uint8_t)(u64 >> 16),
+    (uint8_t)(u64 >>  8), (uint8_t)(u64)
+  };
+  cbor_writer_write(w, buf, 9);
+}
+
+#endif /* MRB_USE_FLOAT32 */
+#endif /* MRB_NO_FLOAT */
 
 static void
 encode_sym(CborWriter *w, mrb_value obj)

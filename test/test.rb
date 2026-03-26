@@ -2217,3 +2217,20 @@ assert('CBOR proc tag: Exception is allowed as encode type') do
   result = CBOR.decode(buf)
   assert_equal "ok", result.message
 end
+
+assert('RFC 8949 §3.4.3: zero-length bignum payload') do
+  # tag(2, h'') = 0   — positive bignum with empty byte string
+  # tag(3, h'') = -1  — negative bignum with empty byte string
+  # RFC 8949 §3.4.3: decoders MUST accept bignums with leading zeroes,
+  # and a zero-length payload represents n=0.
+
+  tag2_empty = "\xC2\x40"
+  tag3_empty = "\xC3\x40"
+
+  assert_equal 0,  CBOR.decode(tag2_empty)
+  assert_equal(-1, CBOR.decode(tag3_empty))
+
+  # Round-trip: encoding 0 and -1 produces plain integers, not bignums
+  assert_equal "\x00", CBOR.encode(0)
+  assert_equal "\x20", CBOR.encode(-1)
+end

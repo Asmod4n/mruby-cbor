@@ -30,15 +30,13 @@ mrb_clear_error(mrb);
     mrb_funcall_argv(mrb, lazy, MRB_SYM(value), 0, NULL);
   mrb_clear_error(mrb);
 
-  counter++;
-
   mrb_gc_arena_restore(mrb, 0);
   mrb_incremental_gc(mrb);
 
-  if (counter > 10000) {
-    mrb_close(mrb);
-    mrb = NULL;
-    counter = 0;
+  if (++counter > 10000) {
+  mrb_close(mrb);
+  mrb = NULL;
+  counter = 0;
   }
 
   return 0;

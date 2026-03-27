@@ -7,13 +7,14 @@ MRuby::Gem::Specification.new('mruby-cbor') do |spec|
   spec.summary = 'CBOR implementation for mruby'
   spec.version = CBOR::VERSION
   spec.add_dependency 'mruby-c-ext-helpers'
-  spec.add_dependency 'mruby-time'
   spec.add_dependency 'mruby-string-is-utf8'
   spec.add_dependency 'mruby-native-ext-type', github: 'Asmod4n/mruby-native-ext-type', branch: 'main'
   spec.add_dependency 'mruby-str-constantize', github: 'Asmod4n/mruby-str-constantize', branch: 'main'
-  spec.add_dependency 'mruby-bigint'
+  spec.add_test_dependency 'mruby-bigint'
   spec.add_test_dependency 'mruby-random'
   spec.add_test_dependency 'mruby-io'
   spec.add_test_dependency 'mruby-b64'
+  spec.add_test_dependency 'mruby-metaprog'
+  spec.add_test_dependency 'mruby-string-ext'
   spec.add_test_dependency 'mruby-fast-json'
 end

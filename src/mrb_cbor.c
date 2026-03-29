@@ -1371,7 +1371,11 @@ encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
 {
   mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
   struct proc_tag_foreach_arg a = {w, obj, FALSE };
+  struct RBasic *basic_ptr = mrb_basic_ptr(proc_rev);
+  unsigned int was_frozen = basic_ptr->frozen;
+  basic_ptr->frozen = TRUE;
   mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev), proc_tag_foreach_cb, &a);
+  basic_ptr->frozen = was_frozen;
   return a.found;
 }
 

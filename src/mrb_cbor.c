@@ -1371,11 +1371,7 @@ encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
 {
   mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
   struct proc_tag_foreach_arg a = {w, obj, FALSE };
-  struct RBasic *basic_ptr = mrb_basic_ptr(proc_rev);
-  unsigned int was_frozen = basic_ptr->frozen;
-  basic_ptr->frozen = TRUE;
   mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev), proc_tag_foreach_cb, &a);
-  basic_ptr->frozen = was_frozen;
   return a.found;
 }
 
@@ -1629,7 +1625,7 @@ encode_value_fast(CborWriter *w, mrb_value obj)
 // Fast decoder
 // ============================================================================
 
-static mrb_value decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src);
+static mrb_value decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src);
 
 static mrb_value
 decode_uint_fast(mrb_state *mrb, Reader *r)
@@ -1745,7 +1741,7 @@ decode_float_fast(mrb_state *mrb, Reader *r)
 #endif
 
 static mrb_value
-decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src)
+decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
 {
   reader_check_depth(mrb, r);
   r->depth++;
@@ -1788,7 +1784,7 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
         mrb_value ary = mrb_ary_new(mrb);
         int idx = mrb_gc_arena_save(mrb);
         for (mrb_int i = 0; i < len; i++) {
-          mrb_ary_push(mrb, ary, decode_value_fast(mrb, r, sharedrefs, src));
+          mrb_ary_push(mrb, ary, decode_value_fast(mrb, r, src));
           mrb_gc_arena_restore(mrb, idx);
         }
         result = ary;
@@ -1799,8 +1795,8 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
         mrb_value hash = mrb_hash_new(mrb);
         int idx = mrb_gc_arena_save(mrb);
         for (mrb_int i = 0; i < len; i++) {
-          mrb_value key = decode_value_fast(mrb, r, sharedrefs, src);
-          mrb_value val = decode_value_fast(mrb, r, sharedrefs, src);
+          mrb_value key = decode_value_fast(mrb, r, src);
+          mrb_value val = decode_value_fast(mrb, r, src);
           mrb_hash_set(mrb, hash, key, val);
           mrb_gc_arena_restore(mrb, idx);
         }
@@ -1814,7 +1810,7 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
 
         if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
           /* symbol — always encoded as tag 39 + string in fast path */
-          mrb_value v = decode_value_fast(mrb, r, sharedrefs, src);
+          mrb_value v = decode_value_fast(mrb, r, src);
           if (likely(mrb_string_p(v))) {
             result = mrb_symbol_value(mrb_intern_str(mrb, v));
           } else {
@@ -1823,20 +1819,20 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
         }
         else if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
           /* class/module — tag 49999 + string */
-          mrb_value v = decode_value_fast(mrb, r, sharedrefs,src);
+          mrb_value v = decode_value_fast(mrb, r ,src);
           if (likely(mrb_string_p(v))) {
             result = mrb_str_constantize(mrb, v);
           } else {
             mrb_raise(mrb, E_TYPE_ERROR, "fast: tag 49999 payload must be string");
           }
         } else {
-          result = decode_class_tag(mrb, r, src, sharedrefs, tag);
+          result = decode_class_tag(mrb, r, src, mrb_undef_value(), tag);
           if (!mrb_undef_p(result))break;
 
-          result = decode_proc_tag(mrb, r, src, sharedrefs, tag);
+          result = decode_proc_tag(mrb, r, src, mrb_undef_value(), tag);
           if (!mrb_undef_p(result))break;
 
-          result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
+          result = decode_unhandled_tag(mrb, r, src, mrb_undef_value(), tag);
         }
       } break;
       case 7:
@@ -1888,7 +1884,7 @@ cbor_decode_fast_rb(mrb_state *mrb, mrb_value self)
   mrb_value owned = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
   Reader r;
   reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-  return decode_value_fast(mrb, &r, mrb_undef_value(), owned);
+  return decode_value_fast(mrb, &r, owned);
 }
 
 // ============================================================================
@@ -2935,7 +2931,7 @@ mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf)
     mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
     Reader r;
     reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-    return decode_value_fast(mrb, &r, mrb_undef_value(), owned);
+    return decode_value_fast(mrb, &r, owned);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
 }

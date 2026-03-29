@@ -550,6 +550,7 @@ static mrb_value
 decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
                      mrb_value src, mrb_value sharedrefs)
 {
+
   uint8_t nb = reader_read8(mrb, r);
   uint8_t major = nb >> 5;
   uint8_t info  = nb & 0x1F;
@@ -561,7 +562,9 @@ decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
 
   r->p--;
   mrb_value v = decode_value(mrb, r, src, sharedrefs);
-  mrb_ary_push(mrb, sharedrefs, v);
+  if (mrb_array_p(sharedrefs)) {
+    mrb_ary_push(mrb, sharedrefs, v);
+  }
   return v;
 }
 

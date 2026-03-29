@@ -25,12 +25,14 @@ MRB_END_DECL
 
 /* Configurable CBOR recursion depth limits */
 #ifndef CBOR_MAX_DEPTH
-  #if defined(MRB_PROFILE_MAIN) || defined(MRB_PROFILE_HIGH)
+  #ifdef MRB_HIGH_PROFILE
     #define CBOR_MAX_DEPTH 128
-  #elif defined(MRB_PROFILE_BASELINE)
+  #elif defined(MRB_MAIN_PROFILE)
     #define CBOR_MAX_DEPTH 64
-  #else
+  #elif defined(MRB_BASELINE_PROFILE)
     #define CBOR_MAX_DEPTH 32
+  #else
+    #define CBOR_MAX_DEPTH 16
   #endif
 #endif
 
@@ -1426,13 +1428,13 @@ encode_value(CborWriter* w, mrb_value obj)
 //
 //   MRB_INT_BIT == 16  → integers always uint16 (info=25, 3 bytes total)
 //   MRB_INT_BIT == 32  → integers always uint32 (info=26, 5 bytes total)
-//   default (64)       → integers always uint64 (info=27, 9 bytes total)
+//   MRB_INT_BIT == 64  → integers always uint64 (info=27, 9 bytes total)
 //
 //   MRB_USE_FLOAT32    → floats always f32 (0xFA, 5 bytes total)
 //   default            → floats always f64 (0xFB, 9 bytes total)
 //
-// Strings always encode as major 3 — no UTF-8 scan.
-// Arrays/maps encode their count at the same fixed integer width.
+// Strings always encode as major 3 when mruby was compuiled with UTF8 Support, else major 2 — no UTF-8 scan.
+// Arrays/maps encode their count the canonical way.
 // true/false/nil encode as standard 1-byte simples (unchanged).
 //
 // decode_fast only handles buffers produced by encode_fast.
@@ -1466,7 +1468,7 @@ encode_value(CborWriter* w, mrb_value obj)
     };
     cbor_writer_write(w, buf, 5);
   }
-#else
+#elif MRB_INT_BIT == 64
   #define CBOR_FAST_INT_INFO  27
   #define CBOR_FAST_INT_BYTES  8
   typedef uint64_t cbor_fast_uint_t;
@@ -1482,8 +1484,11 @@ encode_value(CborWriter* w, mrb_value obj)
     };
     cbor_writer_write(w, buf, 9);
   }
+#else
+#error "unknown mruby int bit"
 #endif
 
+#ifndef MRB_NO_FLOAT
 #ifdef MRB_USE_FLOAT32
   #define CBOR_FAST_FLOAT_INFO  26
   #define CBOR_FAST_FLOAT_BYTES  4
@@ -1516,6 +1521,7 @@ encode_value(CborWriter* w, mrb_value obj)
     };
     cbor_writer_write(w, buf, 9);
   }
+#endif
 #endif
 
 static void encode_value_fast(CborWriter *w, mrb_value obj);
@@ -1641,7 +1647,7 @@ decode_uint_fast(mrb_state *mrb, Reader *r)
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
   }
-#else
+#elif MRB_INT_BIT == 64
   if (likely(r->end - p >= 8)) {
     r->p += 8;
     return mrb_convert_uint64(mrb,
@@ -1652,6 +1658,8 @@ decode_uint_fast(mrb_state *mrb, Reader *r)
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
   }
+#else
+#error "unknown mruby int bit"
 #endif
   return mrb_undef_value();
 }
@@ -1680,7 +1688,7 @@ decode_int_fast(mrb_state *mrb, Reader *r)
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
   }
-#else
+#elif MRB_INT_BIT == 64
   if (likely(r->end - p >= 8)) {
     r->p += 8;
     uint64_t u =
@@ -1692,6 +1700,8 @@ decode_int_fast(mrb_state *mrb, Reader *r)
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
   }
+#else
+#error "unknown mrb int bit"
 #endif
   return mrb_undef_value();
 }
@@ -1830,7 +1840,8 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
         switch (info) {
           case 20: result = mrb_false_value(); break;
           case 21: result = mrb_true_value(); break;
-          case 22: result = mrb_nil_value(); break;
+          case 22:
+          case 23: result = mrb_nil_value(); break;
 #ifndef MRB_NO_FLOAT
           case CBOR_FAST_FLOAT_INFO: result = decode_float_fast(mrb, r); break;
 #endif

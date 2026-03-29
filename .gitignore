@@ -60,3 +60,4 @@ build-iPhoneSimulator/
 build_config.rb.lock
 compile_commands.json
 findings
+benchmark/bench_simdjson

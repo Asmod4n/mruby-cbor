@@ -18,5 +18,6 @@ MRuby::Build.new do |conf|
     conf.gem github: 'Asmod4n/mruby-benchmark-plus', branch: "main"
     conf.gem mgem: 'mruby-simplemsgpack'
     conf.gem mgem: 'mruby-fast-json'
+    conf.gem mgem: 'mruby-proc-irep-ext'
     conf.gem File.expand_path(File.dirname(__FILE__))
 end

@@ -51,7 +51,7 @@ static uint8_t
 reader_read8(mrb_state* mrb, Reader* r)
 {
   if (likely(r->p < r->end)) return *r->p++;
-  mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
+  else mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
   return 0;
 }
 
@@ -116,7 +116,9 @@ cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
   mrb_int i = mrb_integer(mrb_to_int(mrb, mrb_convert_ptrdiff(mrb, p - base)));
   if (likely(i >= 0))
     return i;
-  mrb_raise(mrb, E_RANGE_ERROR, "ptrdiff was negative");
+  else
+    mrb_raise(mrb, E_RANGE_ERROR, "ptrdiff was negative");
+  return 0;
 }
 
 static uint8_t hex_nibble(uint8_t c)
@@ -155,12 +157,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     #ifndef MRB_USE_BIGINT
         if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
           return mrb_convert_uint8(mrb, u);
-        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+        else
+          mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
     #else
         return mrb_convert_uint8(mrb, u);
     #endif
+      } else {
+        mrb_raise(mrb, E_RANGE_ERROR, "invalid uint8");
       }
-      mrb_raise(mrb, E_RANGE_ERROR, "invalid uint8");
       break;
 
     case 25:
@@ -170,12 +174,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     #ifndef MRB_USE_BIGINT
         if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
           return mrb_convert_uint16(mrb, u);
-        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+        else
+          mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
     #else
         return mrb_convert_uint16(mrb, u);
     #endif
+      } else {
+        mrb_raise(mrb, E_RANGE_ERROR, "invalid uint16");
       }
-      mrb_raise(mrb, E_RANGE_ERROR, "invalid uint16");
       break;
 
     case 26:
@@ -189,12 +195,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     #ifndef MRB_USE_BIGINT
         if (likely((uint64_t)u <= (uint64_t)MRB_INT_MAX + 1))
           return mrb_convert_uint32(mrb, u);
-        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+        else
+          mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
     #else
         return mrb_convert_uint32(mrb, u);
     #endif
+      } else {
+        mrb_raise(mrb, E_RANGE_ERROR, "invalid uint32");
       }
-      mrb_raise(mrb, E_RANGE_ERROR, "invalid uint32");
       break;
 
     case 27:
@@ -208,12 +216,14 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
     #ifndef MRB_USE_BIGINT
         if (likely(u <= (uint64_t)MRB_INT_MAX + 1))
           return mrb_convert_uint64(mrb, u);
-        mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
+        else
+          mrb_raise(mrb, E_RANGE_ERROR, "integer out of range");
     #else
         return mrb_convert_uint64(mrb, u);
     #endif
+      } else {
+        mrb_raise(mrb, E_RANGE_ERROR, "invalid uint64");
       }
-      mrb_raise(mrb, E_RANGE_ERROR, "invalid uint64");
       break;
 
     case 31:
@@ -482,8 +492,6 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
     mrb_int len = cbor_value_to_len(mrb, len_v);
 
     if (likely(len >= 0)) {
-      /* RFC 8949 §3.4.3: zero-length payload is valid.
-       * tag(2, h'') = 0,  tag(3, h'') = -1 */
       if (len == 0) {
         mrb_gc_arena_restore(mrb, idx);
         const mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
@@ -686,6 +694,7 @@ decode_proc_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, 
   }
   return mrb_undef_value();
 }
+
 static mrb_value
 decode_unhandled_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value tag)
 {
@@ -891,7 +900,7 @@ cbor_writer_finish(CborWriter *w)
     struct RString *s = RSTRING(w->heap_str);
     RSTR_SET_LEN(s, (mrb_int)w->heap_len);
     w->heap_ptr[w->heap_len] = '\0';
-    mrb_gc_unregister(mrb, w->heap_str);   // release root
+    mrb_gc_unregister(mrb, w->heap_str);
     return w->heap_str;
   } else {
     mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: heap string is not a string");
@@ -989,11 +998,6 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   }
 
   if (mrb_bint_size(mrb, obj) <= 8 && sign < 0) {
-    /* Negative bigint whose magnitude fits in 8 bytes.
-     * mrb_bint_as_uint64 raises on negative values, so abs first.
-     * CBOR negative integer encodes -1-n, so n = |obj| - 1.
-     * For |obj| = 2^64 as_uint64 truncates to 0; 0-1 wraps to
-     * 0xffffffffffffffff — the correct encoding for -2^64. */
     mrb_value abs_obj = mrb_bint_abs(mrb, obj);
     mrb_gc_protect(mrb, abs_obj);
     uint64_t n = mrb_bint_as_uint64(mrb, abs_obj) - UINT64_C(1);
@@ -1015,7 +1019,7 @@ encode_bignum_body(mrb_state *mrb, void *ud)
 
   mrb_int len  = RSTRING_LEN(hex);
   char   *hbuf = (char*)mrb_malloc(mrb, len + 2);
-  ctx->hbuf    = hbuf;                          /* visible to cleanup */
+  ctx->hbuf    = hbuf;
   memcpy(hbuf, RSTRING_PTR(hex), len);
   hbuf[len] = '\0';
 
@@ -1038,11 +1042,6 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   mrb_bool odd      = (len & 1);
   mrb_int  byte_len = (odd ? len + 1 : len) / 2;
 
-  /* Negative bigints whose magnitude-1 fits in 8 bytes must encode as a
-   * plain CBOR negative integer (major type 1), not Tag 3.  This covers
-   * values like -2^64 whose magnitude (2^64) exceeds uint64 but whose
-   * magnitude-1 (0xffffffffffffffff) does not.  At this point mag already
-   * holds |obj|-1 and p points to its (possibly odd-padded) hex digits. */
   if (sign < 0 && byte_len <= 8) {
     uint64_t n = 0;
     const char *q = p;
@@ -1061,7 +1060,7 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   if (odd) { memmove(p + 1, p, len); p[0] = '0'; }
 
   uint8_t *out = (uint8_t*)mrb_malloc(mrb, byte_len);
-  ctx->out     = out;                           /* visible to cleanup */
+  ctx->out     = out;
   hex_decode_scalar(out, p, byte_len);
   cbor_writer_write(w, out, (size_t)byte_len);
 
@@ -1080,11 +1079,9 @@ encode_bignum(CborWriter *w, mrb_value obj)
   mrb_bool error = FALSE;
   mrb_value exc = mrb_protect_error(mrb, encode_bignum_body, &ctx, &error);
 
-  /* Free any allocations that were live when the exception fired */
   if (ctx.hbuf) { mrb_free(mrb, ctx.hbuf); }
   if (ctx.out)  { mrb_free(mrb, ctx.out);  }
 
-  /* Re-raise so the encoder's caller sees the exception */
   if (error) { mrb_exc_raise(mrb, exc); }
 }
 
@@ -1171,20 +1168,6 @@ encode_simple(CborWriter* w, mrb_value obj)
 
 #ifndef MRB_NO_FLOAT
 
-/*
- * cbor_write_f16:
- * Write a CBOR float16 (major 7, info 25 = 0xF9) from a f32 bit-pattern.
- *
- * Caller has already verified the value fits losslessly in f16.
- * NaN is always canonicalized to 0xF97E00 (quiet NaN, RFC 8949 App. B).
- *
- * f16 layout:  sign(1) | exp5(5) | mant10(10)  bias=15
- * f32 layout:  sign(1) | exp8(8) | mant23(23)  bias=127
- *
- * Exponent remapping for normals: exp16 = exp32 - 112  (127 - 15 = 112)
- * Subnormal range: f32 exp in [103..112] maps to f16 exp=0 with implicit-1
- *   shifted into the mantissa field.
- */
 static void
 cbor_write_f16(CborWriter *w, uint32_t u32)
 {
@@ -1195,30 +1178,19 @@ cbor_write_f16(CborWriter *w, uint32_t u32)
 
   if (exp32 == 0xFF) {
     if (mant32 != 0) {
-      /* Canonical CBOR quiet NaN — matches RFC 8949 Appendix B */
       uint8_t buf[3] = { 0xF9, 0x7E, 0x00 };
       cbor_writer_write(w, buf, 3);
       return;
     }
-    /* Inf */
     exp16  = 0x1F;
     mant16 = 0;
   } else if (exp32 == 0) {
-    /* f32 zero → f16 zero (sign preserved) */
     exp16  = 0;
     mant16 = 0;
   } else if (exp32 >= 113) {
-    /* f32 normal → f16 normal  (exp32 ∈ [113..142])
-       exp16 = exp32 - 112,  mant16 = high 10 bits of mant32 */
     exp16  = exp32 - 112;
     mant16 = mant32 >> 13;
   } else {
-    /* f32 normal → f16 subnormal  (exp32 ∈ [103..112])
-       The f16 subnormal value = mant16 * 2^-24.
-       The f32 value           = (1 + mant32/2^23) * 2^(exp32-127).
-       Setting equal: mant16 = (0x800000 | mant32) >> (126 - exp32).
-       The implicit-1 bit (0x800000) is above the shift mask for exp32≤112,
-       so it never appears in the discarded bits — the shift is exact. */
     mant16 = (0x800000u | mant32) >> (126 - exp32);
     exp16  = 0;
   }
@@ -1230,12 +1202,6 @@ cbor_write_f16(CborWriter *w, uint32_t u32)
 
 #ifdef MRB_USE_FLOAT32
 
-/*
- * encode_float (MRB_USE_FLOAT32 build — mrb_float is 32-bit):
- *
- * Preferred serialization: f16 if lossless, else f32.
- * Pure bit-pattern arithmetic — zero floating-point operations.
- */
 static void
 encode_float(CborWriter *w, mrb_float f)
 {
@@ -1246,21 +1212,16 @@ encode_float(CborWriter *w, mrb_float f)
   uint32_t exp32  = (u32 >> 23) & 0xFF;
   uint32_t mant32 = u32 & 0x7FFFFF;
 
-  /* NaN → canonical f16 quiet NaN */
   if (exp32 == 0xFF && mant32 != 0) { cbor_write_f16(w, u32); return; }
 
   mrb_bool fits_f16;
   if (exp32 == 0xFF || exp32 == 0) {
-    /* Inf or zero — always representable in f16 */
     fits_f16 = TRUE;
   } else if (exp32 >= 113 && exp32 <= 142) {
-    /* f16 normal range: low 13 mantissa bits must be zero */
     fits_f16 = ((mant32 & 0x1FFFu) == 0);
   } else if (exp32 >= 103 && exp32 <= 112) {
-    /* f16 subnormal range: low (126-exp32) bits of mantissa must be zero */
     fits_f16 = ((mant32 & ((1u << (126 - exp32)) - 1u)) == 0);
   } else {
-    /* exp32 < 103 (too small for f16) or > 142 (too large for f16) */
     fits_f16 = FALSE;
   }
 
@@ -1276,21 +1237,8 @@ encode_float(CborWriter *w, mrb_float f)
   }
 }
 
-#else /* f64 build — mrb_float is 64-bit */
+#else /* f64 build */
 
-/*
- * encode_float (f64 build):
- *
- * Preferred serialization: f16 if lossless, else f32 if lossless, else f64.
- * Pure bit-pattern arithmetic — zero floating-point operations.
- *
- * Key exponent relationships:
- *   f64 bias=1023, f32 bias=127  → delta=896  (f32 exp = f64 exp - 896)
- *   f32 bias=127,  f16 bias=15   → delta=112  (f16 exp = f32 exp - 112)
- *   f32 normal → f16 normal:    f32 exp ∈ [113..142]
- *   f32 normal → f16 subnormal: f32 exp ∈ [103..112]
- *   f64 normal → f32 normal:    f64 exp ∈ [897..1150]
- */
 static void
 encode_float(CborWriter *w, mrb_float f)
 {
@@ -1301,14 +1249,11 @@ encode_float(CborWriter *w, mrb_float f)
   uint32_t exp64  = (uint32_t)((u64 >> 52) & 0x7FF);
   uint64_t mant64 = u64 & UINT64_C(0x000FFFFFFFFFFFFF);
 
-  /* NaN → canonical f16 quiet NaN (0xF97E00, RFC 8949 App. B) */
   if (exp64 == 0x7FF && mant64 != 0) {
-    cbor_write_f16(w, 0x7FC00000u); /* any f32 NaN payload works */
+    cbor_write_f16(w, 0x7FC00000u);
     return;
   }
 
-  /* ── Try f32 ─────────────────────────────────────────────────── */
-  /* Low 29 mantissa bits must be zero: 52 f64 bits → 23 f32 bits  */
   if ((mant64 & UINT64_C(0x1FFFFFFF)) != 0) goto emit_f64;
 
   {
@@ -1317,32 +1262,25 @@ encode_float(CborWriter *w, mrb_float f)
     uint32_t exp32;
 
     if (exp64 == 0x7FF) {
-      /* Inf — representable in f32 and f16 */
       exp32 = 0xFF;
     } else if (exp64 == 0) {
-      if (mant64 != 0) goto emit_f64; /* f64 subnormal — no lossless f32 */
-      exp32 = 0;                       /* zero */
+      if (mant64 != 0) goto emit_f64;
+      exp32 = 0;
     } else {
-      /* Normal: remap exponent bias_64=1023 → bias_32=127, delta=896 */
       if (exp64 < 897 || exp64 > 1150) goto emit_f64;
       exp32 = exp64 - 896;
     }
 
     uint32_t u32 = (sign32 << 31) | (exp32 << 23) | mant32;
 
-    /* ── Try f16 ─────────────────────────────────────────────── */
     mrb_bool fits_f16;
     if (exp32 == 0xFF || exp32 == 0) {
-      /* Inf or zero — always representable in f16 */
       fits_f16 = TRUE;
     } else if (exp32 >= 113 && exp32 <= 142) {
-      /* f16 normal range: low 13 mantissa bits must be zero */
       fits_f16 = ((mant32 & 0x1FFFu) == 0);
     } else if (exp32 >= 103 && exp32 <= 112) {
-      /* f16 subnormal range: low (126-exp32) bits must be zero */
       fits_f16 = ((mant32 & ((1u << (126 - exp32)) - 1u)) == 0);
     } else {
-      /* exp32 < 103 (underflows f16) or > 142 (overflows f16) */
       fits_f16 = FALSE;
     }
 
@@ -1351,7 +1289,6 @@ encode_float(CborWriter *w, mrb_float f)
       return;
     }
 
-    /* Emit f32 */
     uint8_t buf[5] = {
       0xFA,
       (uint8_t)(u32 >> 24), (uint8_t)(u32 >> 16),
@@ -1480,6 +1417,443 @@ encode_value(CborWriter* w, mrb_value obj)
 }
 
 // ============================================================================
+// Fast encode/decode — fixed-width, no branching on value ranges.
+//
+// Wire format determined entirely at compile time from mruby's build config:
+//
+//   MRB_INT_BIT == 16  → integers always uint16 (info=25, 3 bytes total)
+//   MRB_INT_BIT == 32  → integers always uint32 (info=26, 5 bytes total)
+//   default (64)       → integers always uint64 (info=27, 9 bytes total)
+//
+//   MRB_USE_FLOAT32    → floats always f32 (0xFA, 5 bytes total)
+//   default            → floats always f64 (0xFB, 9 bytes total)
+//
+// Strings always encode as major 3 — no UTF-8 scan.
+// Arrays/maps encode their count at the same fixed integer width.
+// true/false/nil encode as standard 1-byte simples (unchanged).
+//
+// decode_fast only handles buffers produced by encode_fast.
+// Do NOT mix fast and canonical buffers.
+// ============================================================================
+
+#if MRB_INT_BIT == 16
+  #define CBOR_FAST_INT_INFO  25
+  #define CBOR_FAST_INT_BYTES  2
+  typedef uint16_t cbor_fast_uint_t;
+  static void
+  cbor_fast_write_uint(CborWriter *w, uint8_t major, uint16_t v)
+  {
+    uint8_t buf[3] = {
+      (uint8_t)((major << 5) | 25),
+      (uint8_t)(v >> 8), (uint8_t)(v)
+    };
+    cbor_writer_write(w, buf, 3);
+  }
+#elif MRB_INT_BIT == 32
+  #define CBOR_FAST_INT_INFO  26
+  #define CBOR_FAST_INT_BYTES  4
+  typedef uint32_t cbor_fast_uint_t;
+  static void
+  cbor_fast_write_uint(CborWriter *w, uint8_t major, uint32_t v)
+  {
+    uint8_t buf[5] = {
+      (uint8_t)((major << 5) | 26),
+      (uint8_t)(v >> 24), (uint8_t)(v >> 16),
+      (uint8_t)(v >>  8), (uint8_t)(v)
+    };
+    cbor_writer_write(w, buf, 5);
+  }
+#else
+  #define CBOR_FAST_INT_INFO  27
+  #define CBOR_FAST_INT_BYTES  8
+  typedef uint64_t cbor_fast_uint_t;
+  static void
+  cbor_fast_write_uint(CborWriter *w, uint8_t major, uint64_t v)
+  {
+    uint8_t buf[9] = {
+      (uint8_t)((major << 5) | 27),
+      (uint8_t)(v >> 56), (uint8_t)(v >> 48),
+      (uint8_t)(v >> 40), (uint8_t)(v >> 32),
+      (uint8_t)(v >> 24), (uint8_t)(v >> 16),
+      (uint8_t)(v >>  8), (uint8_t)(v)
+    };
+    cbor_writer_write(w, buf, 9);
+  }
+#endif
+
+#ifdef MRB_USE_FLOAT32
+  #define CBOR_FAST_FLOAT_INFO  26
+  #define CBOR_FAST_FLOAT_BYTES  4
+  static void
+  cbor_fast_write_float(CborWriter *w, mrb_float f)
+  {
+    mrb_static_assert(sizeof(mrb_float) == sizeof(uint32_t));
+    uint32_t u; memcpy(&u, &f, 4);
+    uint8_t buf[5] = {
+      0xFA,
+      (uint8_t)(u >> 24), (uint8_t)(u >> 16),
+      (uint8_t)(u >>  8), (uint8_t)(u)
+    };
+    cbor_writer_write(w, buf, 5);
+  }
+#else
+  #define CBOR_FAST_FLOAT_INFO  27
+  #define CBOR_FAST_FLOAT_BYTES  8
+  static void
+  cbor_fast_write_float(CborWriter *w, mrb_float f)
+  {
+    mrb_static_assert(sizeof(mrb_float) == sizeof(uint64_t));
+    uint64_t u; memcpy(&u, &f, 8);
+    uint8_t buf[9] = {
+      0xFB,
+      (uint8_t)(u >> 56), (uint8_t)(u >> 48),
+      (uint8_t)(u >> 40), (uint8_t)(u >> 32),
+      (uint8_t)(u >> 24), (uint8_t)(u >> 16),
+      (uint8_t)(u >>  8), (uint8_t)(u)
+    };
+    cbor_writer_write(w, buf, 9);
+  }
+#endif
+
+static void encode_value_fast(CborWriter *w, mrb_value obj);
+
+static void
+encode_array_fast(CborWriter *w, mrb_value ary)
+{
+  mrb_int len = RARRAY_LEN(ary);
+  encode_len(w, 4, (uint64_t)len);          /* canonical shortest-form length */
+  for (mrb_int i = 0; i < len; i++)
+    encode_value_fast(w, mrb_ary_ref(w->mrb, ary, i));
+}
+
+static int
+encode_map_fast_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
+{
+  encode_value_fast((CborWriter*)data, key);
+  encode_value_fast((CborWriter*)data, val);
+  return 0;
+}
+
+static void
+encode_map_fast(CborWriter *w, mrb_value hash)
+{
+  mrb_state *mrb = w->mrb;
+  encode_len(w, 5, (uint64_t)mrb_hash_size(mrb, hash)); /* canonical shortest-form length */
+  mrb_hash_foreach(mrb, mrb_hash_ptr(hash), encode_map_fast_foreach, w);
+}
+
+static void
+encode_value_fast(CborWriter *w, mrb_value obj)
+{
+  mrb_state *mrb = w->mrb;
+  if (likely(w->depth < CBOR_MAX_DEPTH)) w->depth++;
+  else mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
+
+  switch (mrb_type(obj)) {
+    case MRB_TT_FALSE:
+    case MRB_TT_TRUE:
+      encode_simple(w, obj);
+      break;
+    case MRB_TT_INTEGER: {
+      mrb_int n = mrb_integer(obj);
+      if (n >= 0) cbor_fast_write_uint(w, 0, (cbor_fast_uint_t)n);
+      else        cbor_fast_write_uint(w, 1, (cbor_fast_uint_t)(-1 - n));
+      break;
+    }
+#ifndef MRB_NO_FLOAT
+    case MRB_TT_FLOAT:
+      cbor_fast_write_float(w, mrb_float(obj));
+      break;
+#endif
+    case MRB_TT_STRING: {
+      mrb_int blen = RSTRING_LEN(obj);
+      encode_len(w, 3, (uint64_t)blen);     /* canonical shortest-form length */
+      cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(obj), (size_t)blen);
+      break;
+    }
+    case MRB_TT_ARRAY: encode_array_fast(w, obj); break;
+    case MRB_TT_HASH:  encode_map_fast(w, obj);   break;
+    case MRB_TT_SYMBOL: {
+      /* always tag 39 + string — no strategy config, same build both ends */
+      encode_len(w, 6, 39);
+      mrb_value s = mrb_sym2str(mrb, mrb_symbol(obj));
+      mrb_int blen = RSTRING_LEN(s);
+      encode_len(w, 3, (uint64_t)blen);
+      cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(s), (size_t)blen);
+      break;
+    }
+    case MRB_TT_CLASS:
+    case MRB_TT_MODULE: {
+      mrb_value name = mrb_class_path(mrb, mrb_class_ptr(obj));
+      if (likely(mrb_string_p(name))) {
+        encode_len(w, 6, CBOR_TAG_CLASS);
+        mrb_int blen = RSTRING_LEN(name);
+        encode_len(w, 3, (uint64_t)blen);
+        cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(name), (size_t)blen);
+      } else {
+        mrb_raise(mrb, E_ARGUMENT_ERROR, "cannot encode anonymous class/module");
+      }
+      break;
+    }
+    default:
+      /* Registered classes, bigints, UnhandledTag, proc-tag types —
+       * fall back to canonical encoder so fast path is always correct */
+      encode_value(w, obj);
+      break;
+  }
+  w->depth--;
+}
+
+// ============================================================================
+// Fast decoder
+// ============================================================================
+
+static mrb_value decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src);
+
+static mrb_value
+decode_uint_fast(mrb_state *mrb, Reader *r)
+{
+  const uint8_t *p = r->p;
+#if MRB_INT_BIT == 16
+  if (likely(r->end - p >= 2)) {
+    r->p += 2;
+    return mrb_convert_uint16(mrb, ((uint16_t)p[0] << 8) | p[1]);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint16");
+  }
+#elif MRB_INT_BIT == 32
+  if (likely(r->end - p >= 4)) {
+    r->p += 4;
+    return mrb_convert_uint32(mrb,
+      ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+      ((uint32_t)p[2] <<  8) |  (uint32_t)p[3]);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
+  }
+#else
+  if (likely(r->end - p >= 8)) {
+    r->p += 8;
+    return mrb_convert_uint64(mrb,
+      ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+      ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+      ((uint64_t)p[6] <<  8) |  (uint64_t)p[7]);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
+  }
+#endif
+  return mrb_undef_value();
+}
+
+#ifndef MRB_NO_FLOAT
+static mrb_value
+decode_float_fast(mrb_state *mrb, Reader *r)
+{
+  const uint8_t *p = r->p;
+#ifdef MRB_USE_FLOAT32
+  if (likely(r->end - p >= 4)) {
+    r->p += 4;
+    uint32_t u =
+      ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+      ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+    float f32; memcpy(&f32, &u, 4);
+    return mrb_convert_float(mrb, f32);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated float32");
+  }
+#else
+  if (likely(r->end - p >= 8)) {
+    r->p += 8;
+    uint64_t u =
+      ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+      ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+      ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+    double f64; memcpy(&f64, &u, 8);
+    return mrb_convert_double(mrb, f64);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated float64");
+  }
+#endif
+  return mrb_undef_value();
+}
+#endif
+
+static mrb_value
+decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
+{
+  reader_check_depth(mrb, r);
+  r->depth++;
+
+  mrb_value result = mrb_undef_value();
+  if (likely(r->p < r->end)) {
+    uint8_t b     = *r->p++;
+    uint8_t major = b >> 5;
+    uint8_t info  = b & 0x1F;
+
+    switch (major) {
+      case 0: {
+        if (likely(info == CBOR_FAST_INT_INFO)) {
+          result = decode_uint_fast(mrb, r);
+        } else {
+          mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unexpected int info %d", info);
+        }
+      } break;
+      case 1: {
+        if (likely(info == CBOR_FAST_INT_INFO)) {
+          /* Read magnitude as unsigned, negate without intermediate mrb_value
+           * to avoid signed overflow on e.g. -(MRB_INT_MIN) */
+          const uint8_t *p = r->p;
+#if MRB_INT_BIT == 16
+          if (likely(r->end - p >= 2)) {
+            r->p += 2;
+            uint16_t u = ((uint16_t)p[0] << 8) | p[1];
+            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
+          } else {
+            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint16");
+          }
+#elif MRB_INT_BIT == 32
+          if (likely(r->end - p >= 4)) {
+            r->p += 4;
+            uint32_t u =
+              ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+              ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
+          } else {
+            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
+          }
+#else
+          if (likely(r->end - p >= 8)) {
+            r->p += 8;
+            uint64_t u =
+              ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+              ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+              ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+              ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
+          } else {
+            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
+          }
+#endif
+        } else {
+          mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unexpected neg info %d", info);
+        }
+      } break;
+      case 3: {
+        /* length canonical shortest-form */
+        mrb_int blen = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_int off  = cbor_pdiff(mrb, r->p, r->base);
+        if (likely(blen >= 0 && blen <= RSTRING_LEN(src) - off)) {
+          r->p += blen;
+          result = mrb_str_byte_subseq(mrb, src, off, blen);
+        } else {
+          mrb_raise(mrb, E_RANGE_ERROR, "fast: string out of bounds");
+        }
+      } break;
+      case 4: {
+        /* length canonical shortest-form */
+        mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_value ary = mrb_ary_new(mrb);
+        int idx = mrb_gc_arena_save(mrb);
+        for (mrb_int i = 0; i < len; i++) {
+          mrb_ary_push(mrb, ary, decode_value_fast(mrb, r, src));
+          mrb_gc_arena_restore(mrb, idx);
+        }
+        result = ary;
+      } break;
+      case 5: {
+        /* length canonical shortest-form */
+        mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_value hash = mrb_hash_new(mrb);
+        int idx = mrb_gc_arena_save(mrb);
+        for (mrb_int i = 0; i < len; i++) {
+          mrb_value key = decode_value_fast(mrb, r, src);
+          mrb_value val = decode_value_fast(mrb, r, src);
+          mrb_hash_set(mrb, hash, key, val);
+          mrb_gc_arena_restore(mrb, idx);
+        }
+        result = hash;
+      } break;
+      case 6: {
+        /* tags: handle symbol (39) and class (49999), fall back to
+         * canonical decode_value for everything else (registered tags,
+         * bigints, sharedrefs, UnhandledTag) */
+        mrb_value tag = read_cbor_uint(mrb, r, info);
+        if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
+          /* symbol — always encoded as tag 39 + string in fast path */
+          mrb_value v = decode_value_fast(mrb, r, src);
+          if (likely(mrb_string_p(v))) {
+            result = mrb_symbol_value(mrb_intern_str(mrb, v));
+          } else {
+            mrb_raise(mrb, E_TYPE_ERROR, "fast: tag 39 payload must be string");
+          }
+        }
+        else if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
+          /* class/module — tag 49999 + string */
+          mrb_value v = decode_value_fast(mrb, r, src);
+          if (likely(mrb_string_p(v))) {
+            result = mrb_str_constantize(mrb, v);
+          } else {
+            mrb_raise(mrb, E_TYPE_ERROR, "fast: tag 49999 payload must be string");
+          }
+        } else {
+          mrb_value sharedrefs = mrb_ary_new(mrb);
+          result = decode_class_tag(mrb, r, src, sharedrefs, tag);
+          if (!mrb_undef_p(result))break;
+
+          result = decode_proc_tag(mrb, r, src, sharedrefs, tag);
+          if (!mrb_undef_p(result))break;
+
+          result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
+        }
+      } break;
+      case 7:
+        if (info < 20) { result = mrb_nil_value(); break; }
+        switch (info) {
+          case 20: result = mrb_false_value(); break;
+          case 21: result = mrb_true_value(); break;
+          case 22: result = mrb_nil_value(); break;
+#ifndef MRB_NO_FLOAT
+          case CBOR_FAST_FLOAT_INFO: result = decode_float_fast(mrb, r); break;
+#endif
+          default:
+            mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unexpected simple info %d", info);
+        } break;
+      default:
+        mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unsupported major type %d", major);
+    }
+  } else {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "fast: unexpected end of buffer");
+  }
+  r->depth--;
+  return result;
+}
+
+static mrb_value
+cbor_encode_fast_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value obj;
+  (void)self;
+  mrb_get_args(mrb, "o", &obj);
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
+  encode_value_fast(&w, obj);
+  return cbor_writer_finish(&w);
+}
+
+static mrb_value
+cbor_decode_fast_rb(mrb_state *mrb, mrb_value self)
+{
+  mrb_value src;
+  (void)self;
+  mrb_get_args(mrb, "S", &src);
+  mrb_value owned = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
+  Reader r;
+  reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
+  return decode_value_fast(mrb, &r, owned);
+}
+
+// ============================================================================
 // CBOR::Lazy
 // ============================================================================
 
@@ -1560,14 +1934,10 @@ cbor_proc_tag_rev_registry(mrb_state *mrb)
   return reg;
 }
 
-
 static void encode_value(CborWriter *w, mrb_value obj); /* forward */
 
 // ============================================================================
 // Registered tag encode/decode
-//
-// The schema value stored by native_ext_type is now a Class (or Module).
-// mrb_net_check_type handles the is_a? check via mrb_obj_is_kind_of.
 // ============================================================================
 
 typedef struct {
@@ -1652,7 +2022,6 @@ decode_registered_tag_foreach(mrb_state *mrb, mrb_value sym, mrb_value schema_ty
         sym, schema_type, mrb_obj_value(mrb_class(mrb, val)));
     }
   }
-  /* Fields absent from the payload are silently skipped (security: allowlist). */
 
   return 0;
 }
@@ -1752,13 +2121,13 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
       if (info < 24) break;
       switch (info) {
         case 24: if (likely(r->p < r->end)) { r->p++; break; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
+                 else mrb_raise(mrb, E_RANGE_ERROR, "simple value out of bounds");
         case 25: if (likely((r->end - r->p) >= 2)) { r->p += 2; break; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
+                 else mrb_raise(mrb, E_RANGE_ERROR, "float16 out of bounds");
         case 26: if (likely((r->end - r->p) >= 4)) { r->p += 4; break; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
+                 else mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
         case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; break; }
-                 mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
+                 else mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
         case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       }
       break;
@@ -2249,7 +2618,6 @@ cbor_register_tag_impl(mrb_state *mrb, mrb_value tag_v, mrb_value klass)
   mrb_hash_set(mrb, cbor_tag_rev_registry(mrb), klass, tag_v);
 }
 
-/* Ruby binding: CBOR.register_tag(tag, klass) */
 static mrb_value
 cbor_register_tag_rb(mrb_state *mrb, mrb_value self)
 {
@@ -2261,7 +2629,6 @@ cbor_register_tag_rb(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
-/* Ruby binding: CBOR.register_tag_proc(tag, encode_type, encode_proc, decode_type, decode_proc) */
 static mrb_value
 cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
 {
@@ -2284,12 +2651,6 @@ cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
   if (unlikely((uint64_t)mrb_integer(tag_v) == CBOR_TAG_CLASS))
     mrb_raise(mrb, E_ARGUMENT_ERROR, "tag 49999 is reserved for internal CBOR use");
 
-  /* Reject encode_type classes handled natively by encode_value's switch —
-     registering them would silently do nothing since the switch fires before
-     the proc registry is consulted. Class and Module are also rejected since
-     they are handled by encode_class (tag 49999).
-     Exception and its subclasses are intentionally allowed — they fall
-     through to the default branch and are reachable by the proc path. */
   if (mrb_class_p(encode_type)) {
     struct RClass *ep = mrb_class_ptr(encode_type);
     if (ep == mrb->string_class  || ep == mrb->array_class  ||
@@ -2302,17 +2663,13 @@ cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
         "cannot register proc tag for a natively-encoded type");
   }
 
-  /* mrb_net_check_type expects an Array of types, same as native_ext_type stores */
   mrb_value decode_type_ary = mrb_ary_new_from_values(mrb, 1, &decode_type);
 
-  /* forward registry: tag -> { decode_type: [Type], decode_proc: } */
   mrb_value fwd_entry = mrb_hash_new_capa(mrb, 2);
   mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_type)), decode_type_ary);
   mrb_hash_set(mrb, fwd_entry, mrb_symbol_value(MRB_SYM(decode_proc)), decode_prc);
   mrb_hash_set(mrb, cbor_proc_tag_registry(mrb), tag_v, fwd_entry);
 
-  /* reverse registry: encode_type -> { tag:, encode_proc: }
-     lookup uses kind_of? iteration at encode time */
   mrb_value rev_entry = mrb_hash_new_capa(mrb, 2);
   mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(tag)),         tag_v);
   mrb_hash_set(mrb, rev_entry, mrb_symbol_value(MRB_SYM(encode_proc)), encode_prc);
@@ -2321,9 +2678,6 @@ cbor_register_tag_proc_rb(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
-/* ── Step 2: rename Ruby binding functions ──────────────────────────────── */
-
-/* CBOR.encode(obj, sharedrefs: false) — Ruby binding */
 static mrb_value
 cbor_encode_rb(mrb_state *mrb, mrb_value self)
 {
@@ -2353,7 +2707,6 @@ cbor_encode_rb(mrb_state *mrb, mrb_value self)
   return cbor_writer_finish(&w);
 }
 
-/* CBOR.decode(buf) — Ruby binding */
 static mrb_value
 cbor_decode_rb(mrb_state *mrb, mrb_value self)
 {
@@ -2368,7 +2721,6 @@ cbor_decode_rb(mrb_state *mrb, mrb_value self)
   return decode_value(mrb, &r, src, sharedrefs);
 }
 
-/* CBOR.doc_end(buf, offset=0) — Ruby binding */
 static mrb_value
 cbor_doc_end_rb(mrb_state *mrb, mrb_value self)
 {
@@ -2448,6 +2800,27 @@ mrb_cbor_doc_end(mrb_state *mrb, mrb_value buf, mrb_int offset)
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
 }
 
+MRB_API mrb_value
+mrb_cbor_encode_fast(mrb_state *mrb, mrb_value obj)
+{
+  CborWriter w;
+  cbor_writer_init(&w, mrb);
+  encode_value_fast(&w, obj);
+  return cbor_writer_finish(&w);
+}
+
+MRB_API mrb_value
+mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf)
+{
+  if (likely(mrb_string_p(buf))) {
+    mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
+    Reader r;
+    reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
+    return decode_value_fast(mrb, &r, owned);
+  }
+  mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
+}
+
 MRB_API void
 mrb_cbor_register_tag(mrb_state *mrb, uint64_t tag_num, struct RClass *klass)
 {
@@ -2461,12 +2834,14 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(no_symbols),       cbor_no_symbols,       MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32),cbor_symbols_as_uint32,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string),cbor_symbols_as_string,MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           cbor_decode_rb,       MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           cbor_decode_rb,        MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),      cbor_register_tag_rb,      MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag_proc), cbor_register_tag_proc_rb, MRB_ARGS_REQ(5));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           cbor_encode_rb,       MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          cbor_doc_end_rb,      MRB_ARGS_ARG(1,1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),      cbor_decode_rb_lazy,  MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           cbor_encode_rb,        MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          cbor_doc_end_rb,       MRB_ARGS_ARG(1,1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_lazy),      cbor_decode_rb_lazy,   MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode_fast),      cbor_encode_fast_rb,   MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode_fast),      cbor_decode_fast_rb,   MRB_ARGS_REQ(1));
 
   struct RClass *lazy = mrb_define_class_under_id(mrb, cbor, MRB_SYM(Lazy), mrb->object_class);
   MRB_SET_INSTANCE_TT(lazy, MRB_TT_CDATA);

@@ -27,6 +27,7 @@ This gem gives you **~30% faster encoding than msgpack**, **1.3–3× faster sel
 3. [Core Features](#core-features)
 4. [Usage Examples](#usage-examples)
    - [Basic Encoding/Decoding](#basic-encodingdecoding)
+   - [Fast Encoding/Decoding](#fast-encodingdecoding)
    - [On-Demand Decoding (Lazy)](#on-demand-decoding-lazy)
    - [Shared References & Cyclic Structures](#shared-references--cyclic-structures)
    - [Custom Types with `native_ext_type`](#custom-types-with-native_ext_type)
@@ -58,6 +59,10 @@ p result  # => {"users"=>[{"id"=>1, "name"=>"Alice"}], "count"=>1}
 lazy = CBOR.decode_lazy(buffer)
 first_user_name = lazy["users"][0]["name"].value
 puts "First user: #{first_user_name}"
+
+# Fast encode/decode (same-build internal use only — see below)
+buf = CBOR.encode_fast(data)
+result = CBOR.decode_fast(buf)
 
 # Shared references (deduplication + cyclic structures)
 shared = [1, 2, 3]
@@ -195,6 +200,57 @@ CBOR.decode(CBOR.encode(data)) == data  # => true
 # Maps
 h = { "x" => 10, "y" => { "nested" => true } }
 CBOR.decode(CBOR.encode(h)) == h        # => true
+```
+
+### Fast Encoding/Decoding
+
+For high-throughput internal use where both encoder and decoder are the **same mruby build**, `encode_fast` and `decode_fast` provide a significantly faster path (~30% faster encode, ~20% faster decode on typical structured message payloads).
+
+```ruby
+buf = CBOR.encode_fast(obj)
+obj = CBOR.decode_fast(buf)
+```
+
+**What differs from canonical encoding:**
+
+- Integers always encode at the full native width (`MRB_INT_BIT` bits), never shortest-form
+- Floats always encode at the full native width (`MRB_USE_FLOAT32` → f32, else → f64)
+- Strings, arrays, and maps use canonical shortest-form length prefixes (same as canonical)
+- No UTF-8 validation on strings
+- Symbols always encode as tag 39 + string (ignores the global symbol strategy setting)
+- Classes and modules encode as tag 49999 + name string (same as canonical)
+- Registered tags, bigints, UnhandledTag, and proc-tag types fall back to canonical encoding transparently — `encode_fast` never raises on an unsupported type
+
+**When to use:**
+
+| | `encode` / `decode` | `encode_fast` / `decode_fast` |
+|---|---|---|
+| External data / interop | ✅ | ❌ |
+| Cross-network, mixed builds | ✅ | ❌ |
+| Actor groups, same build | ✅ | ✅ faster |
+| Shared refs, bigints | ✅ | fallback to canonical |
+
+**⚠️ Critical constraint — build compatibility:**
+
+The fast wire format depends on the mruby build configuration:
+
+- `MRB_INT_BIT` (16 / 32 / 64) determines integer wire width
+- `MRB_USE_FLOAT32` determines float wire width
+
+**Buffers produced by `encode_fast` must only be decoded by `decode_fast` on a mruby binary compiled with identical settings.** Decoding a fast buffer on a different build produces silent data corruption — no error is raised, values are simply wrong.
+
+Never use `encode_fast` / `decode_fast` for:
+- Data sent across a network to nodes that may differ in build config
+- Data written to disk and read back by a different binary
+- Any context where you do not fully control both encoder and decoder
+
+For actor groups that span multiple machines, all nodes in the group must be compiled from the same mruby configuration. The group join handshake should verify `MRB_INT_BIT` and `MRB_USE_FLOAT32` explicitly before admitting a node.
+
+**C API:**
+
+```c
+mrb_value mrb_cbor_encode_fast(mrb_state *mrb, mrb_value obj);
+mrb_value mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf);
 ```
 
 ### On-Demand Decoding (Lazy)
@@ -420,6 +476,8 @@ decoded[:name]  # => "Alice"
 | `symbols_as_string` | Tag 39 + string | ✅ All | ✅ Yes | Good |
 | `symbols_as_uint32` | Tag 39 + uint32 | ❌ mruby only | ✅ Yes | Fastest |
 
+**Note:** `encode_fast` always encodes symbols as tag 39 + string regardless of the global strategy setting.
+
 **⚠️ `symbols_as_uint32` requires:**
 - Same mruby build (encoder and decoder must use identical `libmruby.a`)
 - Compile-time symbols (presym enabled)
@@ -522,6 +580,8 @@ CBOR.encode(3.14).bytesize     # => 9 bytes (f64)
 
 **`MRB_USE_FLOAT32` builds:** Start at f32 and try f16, skipping f64 entirely.
 
+**`encode_fast` floats:** Always emit at full native width (f32 or f64) with no bit-pattern analysis — faster but larger on wire.
+
 ### Unhandled Tags
 
 CBOR documents may contain tags your code doesn't recognize. Rather than failing, unknown tags decode as `CBOR::UnhandledTag` objects:
@@ -602,8 +662,9 @@ This section answers: **Will the same input always produce the same output?**
 | **mruby build config** | Symbols, float width range | `MRB_USE_FLOAT32`, presym settings affect encoding choices |
 | **Compile flags** | Might affect numeric representation | Different `CFLAGS` *could* theoretically affect float behavior (though unlikely in practice) |
 | **Symbol IDs** | Non-portable across mruby binaries | Presym IDs differ between mruby builds; use `symbols_as_string` for portability |
+| **`encode_fast` integer width** | Non-portable across builds with different `MRB_INT_BIT` | Fast buffers must never cross build boundaries |
 
-**Practical: Same mruby binary + same input = same output, forever.** For cross-machine reproducibility, use `symbols_as_string` (portable) instead of `symbols_as_uint32` (binary-specific).
+**Practical: Same mruby binary + same input = same output, forever.** For cross-machine reproducibility, use `symbols_as_string` (portable) instead of `symbols_as_uint32` (binary-specific), and use `encode` / `decode` instead of `encode_fast` / `decode_fast` unless all peers share the same build.
 
 ### RFC 8949 Compliance
 
@@ -624,16 +685,20 @@ This implementation strictly follows RFC 8949:
 
 ## Performance & Tuning
 
-### Benchmarks (Relative)
+### Benchmarks (Relative, 100k iterations, `-O3 -march=native`)
 
-| Operation | Time | vs. msgpack | vs. simdjson |
-|-----------|------|------------|--------------|
-| Encode small struct | 1× | ~30% faster | N/A |
-| Encode large array | 1× | ~25% faster | N/A |
-| Decode (eager) full | 1× | ~20% faster | N/A |
-| Decode (lazy) selective access | 1× | N/A | 1.3–3× faster |
+| Operation | Canonical | Fast | Notes |
+|-----------|-----------|------|-------|
+| Encode small map | 1× | ~1.4× faster | Typical actor message |
+| Encode nested structure | 1× | ~1.3× faster | Maps + arrays |
+| Encode int array [100] | 1× | ~0.9× slower | Fixed-width integers = more bytes |
+| Decode small map | 1× | ~1.3× faster | |
+| Decode nested structure | 1× | ~1.2× faster | |
+| Decode int array [100] | 1× | ~1.1× faster | Fixed-width reads |
 
 **Lazy decoding shines:** When you only need a few fields from a 10 MB payload, lazy is 10–100× faster than eager.
+
+**`encode_fast` trade-off:** Fixed-width integers produce larger wire output for small values (e.g. `1` encodes as 9 bytes instead of 1). For integer-heavy payloads (large arrays of small numbers) the canonical encoder is actually faster due to lower `memcpy` volume. The fast path wins on rich structured messages with string keys and mixed scalar values — the typical actor message shape.
 
 ### Recursion Depth Tuning
 
@@ -672,11 +737,6 @@ File streaming uses **adaptive readahead with doubling strategy:**
 4. If not complete: double the read size, re-read from the same offset, retry
 5. Continue doubling until the full document is buffered
 6. Then read exactly the remaining bytes needed (if any) to avoid over-reading
-
-**Why doubling?** CBOR documents can be arbitrarily nested (arrays, maps, tags wrapping each other). Finding the document boundary requires parsing the structure, not just reading a length header. The doubling strategy balances:
-- Most documents (< 16 KB) fit in 1–2 reads
-- Large documents don't require excessive seeks
-- No fixed buffer size that wastes memory or fails on edge cases
 
 ---
 
@@ -752,6 +812,23 @@ Issues, PRs, and bug reports welcome. See `interop.py` for testing against other
 Key insight: No float rounding—entire algorithm is integer bit manipulation.
 ```
 
+### Fast Encoding Algorithm
+
+```
+For each value:
+  integer  → fixed-width (MRB_INT_BIT / 8 bytes), major 0 or 1
+  float    → fixed-width (sizeof(mrb_float) bytes), 0xFA or 0xFB
+  string   → canonical length prefix + bytes, no UTF-8 check
+  array    → canonical length prefix + fast-encoded elements
+  map      → canonical length prefix + fast-encoded pairs
+  symbol   → tag 39 + canonical length + name bytes (always string, no strategy)
+  class    → tag 49999 + canonical length + name bytes
+  other    → fall back to canonical encode_value
+
+Key insight: Only scalars are fixed-width. Structural lengths remain shortest-form
+so container overhead is identical to canonical.
+```
+
 ### Shared Reference Algorithm (Tag 28/29)
 
 **Encoding:** When `sharedrefs: true`, maintain a hash of seen objects by `mrb_obj_id`:
@@ -801,6 +878,7 @@ Example: `(1 << 200) + 1` → Tag 2 wrapping 26-byte hex string
 | `no_symbols` | Plain string | N/A | Universal, loses type |
 | `symbols_as_string` | Tag 39 + string | O(string compare) | RFC 8949 compatible |
 | `symbols_as_uint32` | Tag 39 + uint32 | O(array index) | mruby-only, requires presym |
+| `encode_fast` (any mode) | Tag 39 + string | O(string compare) | RFC 8949 compatible |
 
 **Presym IDs are non-portable:** Symbol ID 42 on your mruby might be ID 100 on another mruby built with different `--enable-presym-inline` settings.
 
@@ -832,9 +910,7 @@ The encoder checks each string's UTF-8 validity at encode time and chooses the a
 
 When **decoding**, text strings (major type 3) are validated as UTF-8 **when mruby is compiled with `MRB_UTF8_STRING`**. If mruby was compiled without UTF-8 string support, the validation is skipped (the strings are still decoded, just not validated).
 
-Byte strings (major type 2) are never validated or touched—they're uninterpreted binary, regardless of compile flags.
-
-This matches RFC 8949 (which requires UTF-8 for text strings) and prevents UTF-8 injection attacks when validation is enabled.
+`encode_fast` always emits strings as major type 3 without UTF-8 validation — faster but trusts the caller to provide valid UTF-8.
 
 ---
 

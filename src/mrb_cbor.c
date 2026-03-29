@@ -36,6 +36,12 @@ MRB_END_DECL
 
 #define CBOR_TAG_CLASS UINT32_C(49999)
 
+#ifdef MRB_UTF8_STRING
+#define CBOR_FAST_STRING_TYPE 3
+#else
+#define CBOR_FAST_STRING_TYPE 2
+#endif
+
 typedef struct {
   const uint8_t *base;
   const uint8_t *p;
@@ -219,10 +225,7 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
       } else {
         mrb_raise(mrb, E_RANGE_ERROR, "invalid uint64");
       }
-      break;
-
-    case 31:
-      mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
+    case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       break;
   }
 
@@ -718,6 +721,12 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   uint8_t b     = reader_read8(mrb, r);
   uint8_t major = (uint8_t)(b >> 5);
   uint8_t info  = (uint8_t)(b & 0x1F);
+  if (unlikely(info == 31)) {
+    mrb_raise(mrb,
+      (major == 7) ? E_RUNTIME_ERROR : E_NOTIMP_ERROR,
+      (major == 7) ? "unexpected break"
+                  : "indefinite-length items not supported");
+  }
   mrb_value result = mrb_undef_value();
 
   switch (major) {
@@ -774,8 +783,6 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
         case 26:
         case 27: result = decode_float(mrb, r, info); break;
 #endif
-        case 31:
-          mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       } break;
       if (unlikely(mrb_undef_p(result)))
         mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
@@ -1571,7 +1578,7 @@ encode_value_fast(CborWriter *w, mrb_value obj)
 #endif
     case MRB_TT_STRING: {
       mrb_int blen = RSTRING_LEN(obj);
-      encode_len(w, 3, (uint64_t)blen);     /* canonical shortest-form length */
+      encode_len(w, CBOR_FAST_STRING_TYPE, (uint64_t)blen);     /* canonical shortest-form length */
       cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(obj), (size_t)blen);
       break;
     }
@@ -1582,7 +1589,7 @@ encode_value_fast(CborWriter *w, mrb_value obj)
       encode_len(w, 6, 39);
       mrb_value s = mrb_sym2str(mrb, mrb_symbol(obj));
       mrb_int blen = RSTRING_LEN(s);
-      encode_len(w, 3, (uint64_t)blen);
+      encode_len(w, CBOR_FAST_STRING_TYPE, (uint64_t)blen);
       cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(s), (size_t)blen);
       break;
     }
@@ -1592,7 +1599,7 @@ encode_value_fast(CborWriter *w, mrb_value obj)
       if (likely(mrb_string_p(name))) {
         encode_len(w, 6, CBOR_TAG_CLASS);
         mrb_int blen = RSTRING_LEN(name);
-        encode_len(w, 3, (uint64_t)blen);
+        encode_len(w, CBOR_FAST_STRING_TYPE, (uint64_t)blen);
         cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(name), (size_t)blen);
       } else {
         mrb_raise(mrb, E_ARGUMENT_ERROR, "cannot encode anonymous class/module");
@@ -1750,7 +1757,7 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
           mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unexpected neg info %d", info);
         }
       } break;
-      case 3: {
+      case CBOR_FAST_STRING_TYPE: {
         /* length canonical shortest-form */
         mrb_int blen = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
         mrb_int off  = cbor_pdiff(mrb, r->p, r->base);
@@ -1837,7 +1844,12 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src
     mrb_raise(mrb, E_RUNTIME_ERROR, "fast: unexpected end of buffer");
   }
   r->depth--;
-  return result;
+
+  if (likely(!mrb_undef_p(result))) {
+    return result;
+  } else {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: decode_fast failed");
+  }
 }
 
 static mrb_value
@@ -2041,30 +2053,35 @@ static mrb_value
 decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
                       mrb_value sharedrefs, mrb_value klass)
 {
-  struct RClass *kp = mrb_class_ptr(klass);
-  mrb_value schema  = mrb_net_schema(mrb, kp);
-  mrb_value obj     = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
+  struct RClass *kp     = mrb_class_ptr(klass);
+  enum mrb_vtype ttype  = MRB_INSTANCE_TT(kp);
 
-  mrb_value payload = decode_value(mrb, r, src, sharedrefs);
-  if (likely(mrb_hash_p(payload))) {
+  if (likely(ttype == MRB_TT_OBJECT)) {
+    mrb_value schema = mrb_net_schema(mrb, kp);
     if (likely(mrb_hash_p(schema))) {
-      decode_ctx ctx = { obj, payload };
-      struct RBasic *basic_ptr = mrb_basic_ptr(schema);
-      unsigned int was_frozen = basic_ptr->frozen;
-      basic_ptr->frozen = TRUE;
-      mrb_hash_foreach(mrb, mrb_hash_ptr(schema), decode_registered_tag_foreach, &ctx);
-      basic_ptr->frozen = was_frozen;
+      mrb_value payload = decode_value(mrb, r, src, sharedrefs);
+      if (likely(mrb_hash_p(payload))) {
+        mrb_value obj = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
+        decode_ctx ctx = { obj, payload };
+        struct RBasic *basic_ptr = mrb_basic_ptr(schema);
+        unsigned int was_frozen = basic_ptr->frozen;
+        basic_ptr->frozen = TRUE;
+        mrb_hash_foreach(mrb, mrb_hash_ptr(schema), decode_registered_tag_foreach, &ctx);
+        basic_ptr->frozen = was_frozen;
 
-      if (mrb_respond_to(mrb, obj, MRB_SYM(_after_decode))) {
-        return mrb_funcall_argv(mrb, obj, MRB_SYM(_after_decode), 0, NULL);
+        if (mrb_respond_to(mrb, obj, MRB_SYM(_after_decode))) {
+          return mrb_funcall_argv(mrb, obj, MRB_SYM(_after_decode), 0, NULL);
+        } else {
+          return obj;
+        }
       } else {
-        return obj;
+        mrb_raise(mrb, E_TYPE_ERROR, "registered tag payload must be a map");
       }
     } else {
       mrb_raise(mrb, E_RUNTIME_ERROR, "no schema found for registered class");
     }
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "registered tag payload must be a map");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: non Object Class registered");
   }
 
   return mrb_undef_value();
@@ -2082,6 +2099,12 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
   uint8_t b     = reader_read8(mrb, r);
   uint8_t major = b >> 5;
   uint8_t info  = b & 0x1F;
+  if (unlikely(info == 31)) {
+    mrb_raise(mrb,
+      (major == 7) ? E_RUNTIME_ERROR : E_NOTIMP_ERROR,
+      (major == 7) ? "unexpected break"
+                  : "indefinite-length items not supported");
+  }
 
   switch (major) {
     case 0:
@@ -2139,7 +2162,6 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
                  else mrb_raise(mrb, E_RANGE_ERROR, "float32 out of bounds");
         case 27: if (likely((r->end - r->p) >= 8)) { r->p += 8; break; }
                  else mrb_raise(mrb, E_RANGE_ERROR, "float64 out of bounds");
-        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
       }
       break;
     }
@@ -2162,83 +2184,154 @@ skip_cbor_try(mrb_state *mrb, Reader *r)
   uint8_t b     = *r->p++;
   uint8_t major = b >> 5;
   uint8_t info  = b & 0x1F;
+  if (unlikely(info == 31)) {
+    mrb_raise(mrb,
+      (major == 7) ? E_RUNTIME_ERROR : E_NOTIMP_ERROR,
+      (major == 7) ? "unexpected break"
+                  : "indefinite-length items not supported");
+  }
+
   mrb_bool ok   = TRUE;
 
   switch (major) {
+
     case 0: case 1:
-      if (info >= 24) {
-        if      (unlikely(info == 24 && r->p >= r->end))          ok = FALSE;
-        else if (unlikely(info == 25 && (r->end - r->p) < 2))     ok = FALSE;
-        else if (unlikely(info == 26 && (r->end - r->p) < 4))     ok = FALSE;
-        else if (unlikely(info == 27 && (r->end - r->p) < 8))     ok = FALSE;
-        else { mrb_value lv = read_cbor_uint(mrb, r, info); if (!mrb_integer_p(lv)) ok = FALSE; }
+      if (likely(info < 24)) {
+        /* small int, nothing to skip */
+      } else {
+        if (likely(info == 24 && r->p < r->end)) {
+          mrb_value lv = read_cbor_uint(mrb, r, info);
+          if (!mrb_integer_p(lv)) ok = FALSE;
+        }
+        else if (likely(info == 25 && (r->end - r->p) >= 2)) {
+          mrb_value lv = read_cbor_uint(mrb, r, info);
+          if (!mrb_integer_p(lv)) ok = FALSE;
+        }
+        else if (likely(info == 26 && (r->end - r->p) >= 4)) {
+          mrb_value lv = read_cbor_uint(mrb, r, info);
+          if (!mrb_integer_p(lv)) ok = FALSE;
+        }
+        else if (likely(info == 27 && (r->end - r->p) >= 8)) {
+          mrb_value lv = read_cbor_uint(mrb, r, info);
+          if (!mrb_integer_p(lv)) ok = FALSE;
+        }
+        else {
+          ok = FALSE;
+        }
       }
       break;
 
     case 2: case 3: {
-      if      (unlikely(info == 24 && r->p >= r->end))          { ok = FALSE; break; }
-      if      (unlikely(info == 25 && (r->end - r->p) < 2))     { ok = FALSE; break; }
-      if      (unlikely(info == 26 && (r->end - r->p) < 4))     { ok = FALSE; break; }
-      if      (unlikely(info == 27 && (r->end - r->p) < 8))     { ok = FALSE; break; }
-      mrb_value lv = read_cbor_uint(mrb, r, info);
-      if (!mrb_integer_p(lv)) { ok = FALSE; break; }
-      mrb_int len = mrb_integer(lv);
-      if (unlikely(len < 0 || (mrb_int)(r->end - r->p) < len)) { ok = FALSE; break; }
-      r->p += len;
+      if (likely(
+            (info == 24 && r->p < r->end) ||
+            (info == 25 && (r->end - r->p) >= 2) ||
+            (info == 26 && (r->end - r->p) >= 4) ||
+            (info == 27 && (r->end - r->p) >= 8) ||
+            (info < 24)
+          )) {
+
+        mrb_value lv = read_cbor_uint(mrb, r, info);
+        if (likely(mrb_integer_p(lv))) {
+          mrb_int len = mrb_integer(lv);
+          if (likely(len >= 0 && (mrb_int)(r->end - r->p) >= len)) {
+            r->p += len;
+          } else ok = FALSE;
+        } else ok = FALSE;
+
+      } else ok = FALSE;
       break;
     }
 
     case 4: {
-      if      (unlikely(info == 24 && r->p >= r->end))          { ok = FALSE; break; }
-      if      (unlikely(info == 25 && (r->end - r->p) < 2))     { ok = FALSE; break; }
-      if      (unlikely(info == 26 && (r->end - r->p) < 4))     { ok = FALSE; break; }
-      if      (unlikely(info == 27 && (r->end - r->p) < 8))     { ok = FALSE; break; }
-      mrb_value lv = read_cbor_uint(mrb, r, info);
-      if (!mrb_integer_p(lv)) { ok = FALSE; break; }
-      mrb_int len = mrb_integer(lv);
-      if (unlikely(len < 0)) { ok = FALSE; break; }
-      for (mrb_int i = 0; i < len; i++) {
-        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
-      }
+      if (likely(
+            (info == 24 && r->p < r->end) ||
+            (info == 25 && (r->end - r->p) >= 2) ||
+            (info == 26 && (r->end - r->p) >= 4) ||
+            (info == 27 && (r->end - r->p) >= 8) ||
+            (info < 24)
+          )) {
+
+        mrb_value lv = read_cbor_uint(mrb, r, info);
+        if (likely(mrb_integer_p(lv))) {
+          mrb_int len = mrb_integer(lv);
+          if (likely(len >= 0)) {
+            for (mrb_int i = 0; i < len; i++) {
+              if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+            }
+          } else ok = FALSE;
+        } else ok = FALSE;
+
+      } else ok = FALSE;
       break;
     }
 
     case 5: {
-      if      (unlikely(info == 24 && r->p >= r->end))          { ok = FALSE; break; }
-      if      (unlikely(info == 25 && (r->end - r->p) < 2))     { ok = FALSE; break; }
-      if      (unlikely(info == 26 && (r->end - r->p) < 4))     { ok = FALSE; break; }
-      if      (unlikely(info == 27 && (r->end - r->p) < 8))     { ok = FALSE; break; }
-      mrb_value lv = read_cbor_uint(mrb, r, info);
-      if (!mrb_integer_p(lv)) { ok = FALSE; break; }
-      mrb_int len = mrb_integer(lv);
-      if (unlikely(len < 0)) { ok = FALSE; break; }
-      for (mrb_int i = 0; i < len; i++) {
-        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
-        if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
-      }
+      if (likely(
+            (info == 24 && r->p < r->end) ||
+            (info == 25 && (r->end - r->p) >= 2) ||
+            (info == 26 && (r->end - r->p) >= 4) ||
+            (info == 27 && (r->end - r->p) >= 8) ||
+            (info < 24)
+          )) {
+
+        mrb_value lv = read_cbor_uint(mrb, r, info);
+        if (likely(mrb_integer_p(lv))) {
+          mrb_int len = mrb_integer(lv);
+          if (likely(len >= 0)) {
+            for (mrb_int i = 0; i < len; i++) {
+              if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+              if (!skip_cbor_try(mrb, r)) { ok = FALSE; break; }
+            }
+          } else ok = FALSE;
+        } else ok = FALSE;
+
+      } else ok = FALSE;
       break;
     }
 
     case 6: {
-      if      (unlikely(info == 24 && r->p >= r->end))          { ok = FALSE; break; }
-      if      (unlikely(info == 25 && (r->end - r->p) < 2))     { ok = FALSE; break; }
-      if      (unlikely(info == 26 && (r->end - r->p) < 4))     { ok = FALSE; break; }
-      if      (unlikely(info == 27 && (r->end - r->p) < 8))     { ok = FALSE; break; }
-      mrb_value tag = read_cbor_uint(mrb, r, info);
-      if (!mrb_integer_p(tag)) { ok = FALSE; break; }
-      if (!skip_cbor_try(mrb, r)) ok = FALSE;
+      if (likely(
+            (info == 24 && r->p < r->end) ||
+            (info == 25 && (r->end - r->p) >= 2) ||
+            (info == 26 && (r->end - r->p) >= 4) ||
+            (info == 27 && (r->end - r->p) >= 8) ||
+            (info < 24)
+          )) {
+
+        mrb_value tag = read_cbor_uint(mrb, r, info);
+        if (likely(mrb_integer_p(tag))) {
+          if (!skip_cbor_try(mrb, r)) ok = FALSE;
+        } else ok = FALSE;
+
+      } else ok = FALSE;
       break;
     }
 
     case 7: {
-      if (info < 24) break;
-      switch (info) {
-        case 24: if (unlikely(r->p >= r->end)) ok = FALSE; else r->p++; break;
-        case 25: if (unlikely((r->end-r->p)<2)) ok = FALSE; else r->p+=2; break;
-        case 26: if (unlikely((r->end-r->p)<4)) ok = FALSE; else r->p+=4; break;
-        case 27: if (unlikely((r->end-r->p)<8)) ok = FALSE; else r->p+=8; break;
-        case 31: mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported"); ok = FALSE; break;
-        default: break;
+      if (likely(info < 24)) {
+        /* simple values */
+      } else {
+        switch (info) {
+          case 24:
+            if (likely(r->p < r->end)) r->p++;
+            else ok = FALSE;
+            break;
+          case 25:
+            if (likely((r->end - r->p) >= 2)) r->p += 2;
+            else ok = FALSE;
+            break;
+          case 26:
+            if (likely((r->end - r->p) >= 4)) r->p += 4;
+            else ok = FALSE;
+            break;
+          case 27:
+            if (likely((r->end - r->p) >= 8)) r->p += 8;
+            else ok = FALSE;
+            break;
+          default:
+            ok = FALSE;
+            break;
+        }
       }
       break;
     }

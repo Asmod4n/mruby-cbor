@@ -37,14 +37,12 @@ MRB_END_DECL
 #define CBOR_TAG_CLASS UINT32_C(49999)
 
 typedef struct {
-  const uint8_t* base;
-  const uint8_t* p;
-  const uint8_t* end;
-
-  uint8_t major;
-  uint8_t info;
-
-  mrb_int depth;
+  const uint8_t *base;
+  const uint8_t *p;
+  const uint8_t *end;
+  mrb_int        depth;
+  uint8_t        major;
+  uint8_t        info;
 } Reader;
 
 static uint8_t
@@ -66,12 +64,12 @@ reader_read_header(mrb_state *mrb, Reader *r)
 static void
 reader_init(Reader* r, const uint8_t* buf, size_t len)
 {
-  r->base   = buf;
-  r->p      = buf;
-  r->end    = buf + len;
-  r->major  = 0;
-  r->info   = 0;
-  r->depth  = 0;
+  r->base  = buf;
+  r->p     = buf;
+  r->end   = buf + len;
+  r->depth = 0;
+  r->major = 0;
+  r->info  = 0;
 }
 
 static void
@@ -86,20 +84,17 @@ reader_check_depth(mrb_state *mrb, Reader *r)
 #define CBOR_SBO_STACK_CAP (16 * 1024)
 
 typedef struct {
-  mrb_state *mrb;
-
   uint8_t stack_buf[CBOR_SBO_STACK_CAP];
-  size_t  stack_len;
 
-  mrb_value heap_str;
-  char    *heap_ptr;
-  size_t   heap_len;
-  size_t   heap_capa;
-  mrb_int  arena_index;
-
-  mrb_value seen;
-
-  mrb_int depth;
+  mrb_state *mrb;
+  char      *heap_ptr;
+  mrb_value  heap_str;
+  mrb_value  seen;
+  size_t     stack_len;
+  size_t     heap_len;
+  size_t     heap_capa;
+  mrb_int    arena_index;
+  mrb_int    depth;
 } CborWriter;
 
 /* Forward declarations */
@@ -236,7 +231,7 @@ read_cbor_uint(mrb_state* mrb, Reader* r, uint8_t info)
 }
 
 static mrb_int
-cbor_value_to_len(mrb_state *mrb, mrb_value v)
+cbor_len_to_mrb_int(mrb_state *mrb, mrb_value v)
 {
   if (likely(mrb_integer_p(v))) {
     mrb_int n = mrb_integer(v);
@@ -313,7 +308,7 @@ static mrb_value
 decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   mrb_value blen_v = read_cbor_uint(mrb, r, info);
-  mrb_int blen = cbor_value_to_len(mrb, blen_v);
+  mrb_int blen = cbor_len_to_mrb_int(mrb, blen_v);
   mrb_int off = cbor_pdiff(mrb, r->p, r->base);
 
   if (likely(blen <= RSTRING_LEN(src) - off)) {
@@ -338,7 +333,7 @@ static mrb_value
 decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
   mrb_value blen_v = read_cbor_uint(mrb, r, info);
-  mrb_int blen = cbor_value_to_len(mrb, blen_v);
+  mrb_int blen = cbor_len_to_mrb_int(mrb, blen_v);
   mrb_int off = cbor_pdiff(mrb, r->p, r->base);
 
   if (likely(blen <= RSTRING_LEN(src) - off)) {
@@ -354,11 +349,11 @@ decode_array(mrb_state* mrb, Reader* r, mrb_value src,
              uint8_t info, mrb_value sharedrefs, bool reg)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
-  mrb_int len = cbor_value_to_len(mrb, len_v);
+  mrb_int len = cbor_len_to_mrb_int(mrb, len_v);
   mrb_value ary = mrb_ary_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
-  if (reg) {
+  if (reg && mrb_array_p(sharedrefs)) {
     mrb_ary_push(mrb, sharedrefs, ary);
   }
 
@@ -375,11 +370,11 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
            uint8_t info, mrb_value sharedrefs, bool reg)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
-  mrb_int len = cbor_value_to_len(mrb, len_v);
+  mrb_int len = cbor_len_to_mrb_int(mrb, len_v);
   mrb_value hash = mrb_hash_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
-  if (reg) {
+  if (reg && mrb_array_p(sharedrefs)) {
     mrb_ary_push(mrb, sharedrefs, hash);
   }
 
@@ -489,7 +484,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 
   if (likely(major2 == 2)) {
     mrb_value len_v = read_cbor_uint(mrb, r, info2);
-    mrb_int len = cbor_value_to_len(mrb, len_v);
+    mrb_int len = cbor_len_to_mrb_int(mrb, len_v);
 
     if (likely(len >= 0)) {
       if (len == 0) {
@@ -580,7 +575,7 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
 
     if (likely(ref_major == 0)) {
       mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
-      mrb_int idx = cbor_value_to_len(mrb, idx_v);
+      mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
       mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
 
       if (likely(!mrb_nil_p(found))) {
@@ -716,11 +711,10 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   reader_check_depth(mrb, r);
   r->depth++;
 
-  mrb_value result = mrb_undef_value();
-
-  uint8_t b = reader_read8(mrb, r);
+  uint8_t b     = reader_read8(mrb, r);
   uint8_t major = (uint8_t)(b >> 5);
-  uint8_t info = (uint8_t)(b & 0x1F);
+  uint8_t info  = (uint8_t)(b & 0x1F);
+  mrb_value result = mrb_undef_value();
 
   switch (major) {
     case 0: result = decode_unsigned(mrb, r, info); break;
@@ -737,34 +731,30 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(2)) == 0 ||
           mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0) {
         result = decode_tagged_bignum(mrb, r, src, tag);
-        goto done;
+        break;
       }
 #endif
-
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
         result = decode_tag_sharedrefs(mrb, r, src, sharedrefs);
-        goto done;
+        break;
       }
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0) {
         result = decode_tag_sharedref(mrb, r, sharedrefs);
-        goto done;
+        break;
       }
       if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
         result = decode_symbol(mrb, r, src, sharedrefs);
-        goto done;
+        break;
       }
       if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
         result = decode_class(mrb, r, src, sharedrefs);
-        goto done;
+        break;
       }
-
       result = decode_class_tag(mrb, r, src, sharedrefs, tag);
-      if (!mrb_undef_p(result)) goto done;
-
-      result = decode_proc_tag(mrb, r, src, sharedrefs, tag);
-      if (!mrb_undef_p(result)) goto done;
-
-      result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
+      if (mrb_undef_p(result))
+        result = decode_proc_tag(mrb, r, src, sharedrefs, tag);
+      if (mrb_undef_p(result))
+        result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
     } break;
 
     case 7:
@@ -782,8 +772,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 #endif
         case 31:
           mrb_raise(mrb, E_NOTIMP_ERROR, "indefinite-length items not supported");
-          break;
-      }
+      } break;
       if (unlikely(mrb_undef_p(result)))
         mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
       break;
@@ -792,7 +781,6 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
       mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type %d", major);
   }
 
-done:
   r->depth--;
   return result;
 }
@@ -800,15 +788,15 @@ done:
 static void
 cbor_writer_init(CborWriter *w, mrb_state *mrb)
 {
-  w->mrb       = mrb;
-  w->stack_len = 0;
-  w->heap_str  = mrb_undef_value();
-  w->heap_ptr  = NULL;
-  w->heap_len  = 0;
-  w->heap_capa = 0;
+  w->stack_len   = 0;
+  w->mrb         = mrb;
+  w->heap_ptr    = NULL;
+  w->heap_str    = mrb_undef_value();
+  w->seen        = mrb_undef_value();
+  w->heap_len    = 0;
+  w->heap_capa   = 0;
   w->arena_index = mrb_gc_arena_save(mrb);
-  w->seen       = mrb_undef_value();
-  w->depth      = 0;
+  w->depth       = 0;
 }
 
 static size_t next_pow2(size_t x)
@@ -852,7 +840,7 @@ cbor_writer_ensure_heap(CborWriter *w, size_t add)
 {
   if (add <= w->heap_capa - w->heap_len) return;
 
-  if (add <= SIZE_MAX - w->heap_len) {
+  if (likely(add <= SIZE_MAX - w->heap_len)) {
     size_t capa = next_pow2(w->heap_len + add);
     mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
     struct RString *s = RSTRING(w->heap_str);
@@ -950,7 +938,7 @@ static void encode_uint64(CborWriter *w, uint64_t v) { encode_len(w, 0, v); }
 static mrb_bool
 encode_check_shared(CborWriter *w, mrb_value obj)
 {
-  if (mrb_undef_p(w->seen)) return FALSE;
+  if (!mrb_hash_p(w->seen)) return FALSE;
   mrb_state *mrb = w->mrb;
 
   mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
@@ -1520,10 +1508,14 @@ static void encode_value_fast(CborWriter *w, mrb_value obj);
 static void
 encode_array_fast(CborWriter *w, mrb_value ary)
 {
+  struct RBasic *basic_ary = mrb_basic_ptr(ary);
+  unsigned int was_frozen = basic_ary->frozen;
+  basic_ary->frozen = TRUE;
   mrb_int len = RARRAY_LEN(ary);
   encode_len(w, 4, (uint64_t)len);          /* canonical shortest-form length */
   for (mrb_int i = 0; i < len; i++)
     encode_value_fast(w, mrb_ary_ref(w->mrb, ary, i));
+  basic_ary->frozen = was_frozen;
 }
 
 static int
@@ -1538,8 +1530,12 @@ static void
 encode_map_fast(CborWriter *w, mrb_value hash)
 {
   mrb_state *mrb = w->mrb;
+  struct RBasic *basic_hash = mrb_basic_ptr(hash);
+  unsigned int was_frozen = basic_hash->frozen;
+  basic_hash->frozen = TRUE;
   encode_len(w, 5, (uint64_t)mrb_hash_size(mrb, hash)); /* canonical shortest-form length */
   mrb_hash_foreach(mrb, mrb_hash_ptr(hash), encode_map_fast_foreach, w);
+  basic_hash->frozen = was_frozen;
 }
 
 static void
@@ -1608,7 +1604,7 @@ encode_value_fast(CborWriter *w, mrb_value obj)
 // Fast decoder
 // ============================================================================
 
-static mrb_value decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src);
+static mrb_value decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src);
 
 static mrb_value
 decode_uint_fast(mrb_state *mrb, Reader *r)
@@ -1638,6 +1634,46 @@ decode_uint_fast(mrb_state *mrb, Reader *r)
       ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
       ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
       ((uint64_t)p[6] <<  8) |  (uint64_t)p[7]);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
+  }
+#endif
+  return mrb_undef_value();
+}
+
+static mrb_value
+decode_int_fast(mrb_state *mrb, Reader *r)
+{
+  /* Read magnitude as unsigned, negate without intermediate mrb_value
+   * to avoid signed overflow on e.g. -(MRB_INT_MIN) */
+  const uint8_t *p = r->p;
+#if MRB_INT_BIT == 16
+  if (likely(r->end - p >= 2)) {
+    r->p += 2;
+    uint16_t u = ((uint16_t)p[0] << 8) | p[1];
+    return mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint16");
+  }
+#elif MRB_INT_BIT == 32
+  if (likely(r->end - p >= 4)) {
+    r->p += 4;
+    uint32_t u =
+      ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+      ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+    return mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
+  } else {
+    mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
+  }
+#else
+  if (likely(r->end - p >= 8)) {
+    r->p += 8;
+    uint64_t u =
+      ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+      ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+      ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+    return mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
   }
@@ -1680,7 +1716,7 @@ decode_float_fast(mrb_state *mrb, Reader *r)
 #endif
 
 static mrb_value
-decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
+decode_value_fast(mrb_state *mrb, Reader *r, mrb_value sharedrefs, mrb_value src)
 {
   reader_check_depth(mrb, r);
   r->depth++;
@@ -1701,47 +1737,14 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
       } break;
       case 1: {
         if (likely(info == CBOR_FAST_INT_INFO)) {
-          /* Read magnitude as unsigned, negate without intermediate mrb_value
-           * to avoid signed overflow on e.g. -(MRB_INT_MIN) */
-          const uint8_t *p = r->p;
-#if MRB_INT_BIT == 16
-          if (likely(r->end - p >= 2)) {
-            r->p += 2;
-            uint16_t u = ((uint16_t)p[0] << 8) | p[1];
-            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
-          } else {
-            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint16");
-          }
-#elif MRB_INT_BIT == 32
-          if (likely(r->end - p >= 4)) {
-            r->p += 4;
-            uint32_t u =
-              ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-              ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
-            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
-          } else {
-            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint32");
-          }
-#else
-          if (likely(r->end - p >= 8)) {
-            r->p += 8;
-            uint64_t u =
-              ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-              ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-              ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-              ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
-            result = mrb_convert_mrb_int(mrb, -1 - (mrb_int)u);
-          } else {
-            mrb_raise(mrb, E_RANGE_ERROR, "fast: truncated uint64");
-          }
-#endif
+          result = decode_int_fast(mrb, r);
         } else {
           mrb_raisef(mrb, E_RUNTIME_ERROR, "fast: unexpected neg info %d", info);
         }
       } break;
       case 3: {
         /* length canonical shortest-form */
-        mrb_int blen = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_int blen = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
         mrb_int off  = cbor_pdiff(mrb, r->p, r->base);
         if (likely(blen >= 0 && blen <= RSTRING_LEN(src) - off)) {
           r->p += blen;
@@ -1752,23 +1755,23 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
       } break;
       case 4: {
         /* length canonical shortest-form */
-        mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
         mrb_value ary = mrb_ary_new(mrb);
         int idx = mrb_gc_arena_save(mrb);
         for (mrb_int i = 0; i < len; i++) {
-          mrb_ary_push(mrb, ary, decode_value_fast(mrb, r, src));
+          mrb_ary_push(mrb, ary, decode_value_fast(mrb, r, sharedrefs, src));
           mrb_gc_arena_restore(mrb, idx);
         }
         result = ary;
       } break;
       case 5: {
         /* length canonical shortest-form */
-        mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+        mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
         mrb_value hash = mrb_hash_new(mrb);
         int idx = mrb_gc_arena_save(mrb);
         for (mrb_int i = 0; i < len; i++) {
-          mrb_value key = decode_value_fast(mrb, r, src);
-          mrb_value val = decode_value_fast(mrb, r, src);
+          mrb_value key = decode_value_fast(mrb, r, sharedrefs, src);
+          mrb_value val = decode_value_fast(mrb, r, sharedrefs, src);
           mrb_hash_set(mrb, hash, key, val);
           mrb_gc_arena_restore(mrb, idx);
         }
@@ -1779,9 +1782,10 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
          * canonical decode_value for everything else (registered tags,
          * bigints, sharedrefs, UnhandledTag) */
         mrb_value tag = read_cbor_uint(mrb, r, info);
+
         if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
           /* symbol — always encoded as tag 39 + string in fast path */
-          mrb_value v = decode_value_fast(mrb, r, src);
+          mrb_value v = decode_value_fast(mrb, r, sharedrefs, src);
           if (likely(mrb_string_p(v))) {
             result = mrb_symbol_value(mrb_intern_str(mrb, v));
           } else {
@@ -1790,14 +1794,13 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
         }
         else if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
           /* class/module — tag 49999 + string */
-          mrb_value v = decode_value_fast(mrb, r, src);
+          mrb_value v = decode_value_fast(mrb, r, sharedrefs,src);
           if (likely(mrb_string_p(v))) {
             result = mrb_str_constantize(mrb, v);
           } else {
             mrb_raise(mrb, E_TYPE_ERROR, "fast: tag 49999 payload must be string");
           }
         } else {
-          mrb_value sharedrefs = mrb_ary_new(mrb);
           result = decode_class_tag(mrb, r, src, sharedrefs, tag);
           if (!mrb_undef_p(result))break;
 
@@ -1850,7 +1853,7 @@ cbor_decode_fast_rb(mrb_state *mrb, mrb_value self)
   mrb_value owned = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
   Reader r;
   reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-  return decode_value_fast(mrb, &r, owned);
+  return decode_value_fast(mrb, &r, mrb_undef_value(), owned);
 }
 
 // ============================================================================
@@ -2081,18 +2084,18 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     case 2:
     case 3: {
       mrb_value len_v = read_cbor_uint(mrb, r, info);
-      reader_advance_checked(mrb, r, cbor_value_to_len(mrb, len_v));
+      reader_advance_checked(mrb, r, cbor_len_to_mrb_int(mrb, len_v));
       break;
     }
 
     case 4: {
-      mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+      mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
       for (mrb_int i = 0; i < len; i++) skip_cbor(mrb, r, buf, sharedrefs);
       break;
     }
 
     case 5: {
-      mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, info));
+      mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, info));
       for (mrb_int i = 0; i < len; i++) {
         skip_cbor(mrb, r, buf, sharedrefs);
         skip_cbor(mrb, r, buf, sharedrefs);
@@ -2103,7 +2106,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
     case 6: {
       mrb_value tag = read_cbor_uint(mrb, r, info);
 
-      if (!mrb_undef_p(buf) && !mrb_undef_p(sharedrefs) &&
+      if (!mrb_undef_p(buf) && mrb_array_p(sharedrefs) &&
           mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
         if (likely(mrb_array_p(sharedrefs))) {
           mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
@@ -2326,7 +2329,7 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
   if (likely(mrb_hash_p(kcache))) {
     mrb_int idx = mrb_integer(mrb_ensure_int_type(mrb, key));
-    mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, r->info));
+    mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, r->info));
 
     if (idx < 0) idx += len;
     if (unlikely(idx >= len || idx < 0))
@@ -2351,7 +2354,7 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
 {
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
   if (likely(mrb_hash_p(kcache))) {
-    mrb_int pairs = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, r->info));
+    mrb_int pairs = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, r->info));
     const mrb_bool key_is_str = mrb_string_p(key);
 
     for (mrb_int i = 0; i < pairs; i++) {
@@ -2361,7 +2364,7 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
       uint8_t kinfo = (uint8_t)(kb & 0x1F);
 
       if (key_is_str && (kmaj == 2 || kmaj == 3)) {
-        mrb_int klen = cbor_value_to_len(mrb, read_cbor_uint(mrb, r, kinfo));
+        mrb_int klen = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, kinfo));
         reader_advance_checked(mrb, r, klen);
         match = (klen == RSTRING_LEN(key) &&
                  memcmp(r->p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
@@ -2514,7 +2517,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
     switch (major) {
       case 4: {
         mrb_int idx = mrb_integer(mrb_ensure_int_type(mrb, key));
-        mrb_int len = cbor_value_to_len(mrb, read_cbor_uint(mrb, &r, r.info));
+        mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
         if (idx < 0) idx += len;
         if (idx < 0 || idx >= len) { current = mrb_nil_value(); continue; }
         for (mrb_int i = 0; i < idx; i++) skip_cbor(mrb, &r, current, sharedrefs);
@@ -2524,7 +2527,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
       } break;
 
       case 5: {
-        mrb_int pairs    = cbor_value_to_len(mrb, read_cbor_uint(mrb, &r, r.info));
+        mrb_int pairs    = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
         const mrb_bool key_is_str = mrb_string_p(key);
         mrb_bool found      = FALSE;
 
@@ -2535,7 +2538,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
           uint8_t kinfo = kb & 0x1F;
 
           if (key_is_str && (kmaj == 2 || kmaj == 3)) {
-            mrb_int klen = cbor_value_to_len(mrb, read_cbor_uint(mrb, &r, kinfo));
+            mrb_int klen = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, kinfo));
             reader_advance_checked(mrb, &r, klen);
             match = (klen == RSTRING_LEN(key) &&
                      memcmp(r.p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
@@ -2816,7 +2819,7 @@ mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf)
     mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
     Reader r;
     reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-    return decode_value_fast(mrb, &r, owned);
+    return decode_value_fast(mrb, &r, mrb_undef_value(), owned);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
 }
@@ -2851,7 +2854,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),    cbor_lazy_dig,    MRB_ARGS_ANY());
 }
 
-MRB_API void
+void
 mrb_mruby_cbor_gem_final(mrb_state* mrb)
 {
   (void)mrb;

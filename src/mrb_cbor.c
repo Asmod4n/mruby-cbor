@@ -374,9 +374,6 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
   mrb_value hash = mrb_hash_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
-  // assign an ID to this hash for logging
-  mrb_int hid = mrb_obj_id(hash);
-
   if (reg && mrb_array_p(sharedrefs)) {
     mrb_ary_push(mrb, sharedrefs, hash);
   }
@@ -585,7 +582,7 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
       mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
       mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
 
-      if (likely(!mrb_nil_p(found))) {
+      if (likely(!mrb_nil_p(found) && !mrb_undef_p(found))) {
         return found;
       } else {
         mrb_raise(mrb, E_INDEX_ERROR, "sharedref index not found");

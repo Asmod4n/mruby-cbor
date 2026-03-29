@@ -374,6 +374,9 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
   mrb_value hash = mrb_hash_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
+  // assign an ID to this hash for logging
+  mrb_int hid = mrb_obj_id(hash);
+
   if (reg && mrb_array_p(sharedrefs)) {
     mrb_ary_push(mrb, sharedrefs, hash);
   }
@@ -381,6 +384,7 @@ decode_map(mrb_state* mrb, Reader* r, mrb_value src,
   for (mrb_int i = 0; i < len; i++) {
     mrb_value key = decode_value(mrb, r, src, sharedrefs);
     mrb_value val = decode_value(mrb, r, src, sharedrefs);
+
     mrb_hash_set(mrb, hash, key, val);
     mrb_gc_arena_restore(mrb, idx);
   }
@@ -760,7 +764,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
         result = decode_unhandled_tag(mrb, r, src, sharedrefs, tag);
     } break;
 
-    case 7:
+    case 7: {
       if (info < 20) { result = mrb_nil_value(); break; }
       switch (info) {
         case 20: result = mrb_false_value(); break;
@@ -778,14 +782,18 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
       } break;
       if (unlikely(mrb_undef_p(result)))
         mrb_raise(mrb, E_RUNTIME_ERROR, "invalid simple/float");
-      break;
+    } break;
 
     default:
       mrb_raisef(mrb, E_NOTIMP_ERROR, "Not implemented major type %d", major);
   }
 
   r->depth--;
-  return result;
+  if (likely(!mrb_undef_p(result))) {
+    return result;
+  } else {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: failed to decode value");
+  }
 }
 
 static void

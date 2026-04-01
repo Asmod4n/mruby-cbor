@@ -38,11 +38,10 @@ MRB_END_DECL
 
 #define CBOR_TAG_CLASS UINT32_C(49999)
 
-#ifdef MRB_UTF8_STRING
-#define CBOR_FAST_STRING_TYPE 3
-#else
+/* Fast path always encodes strings as major 2 (byte string).
+ * The fast wire format is mruby-to-mruby only — the text/binary
+ * distinction is irrelevant at that layer. */
 #define CBOR_FAST_STRING_TYPE 2
-#endif
 
 typedef struct {
   const uint8_t *base;
@@ -57,7 +56,7 @@ static uint8_t
 reader_read8(mrb_state* mrb, Reader* r)
 {
   if (likely(r->p < r->end)) return *r->p++;
-  else mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
+  else mrb_raise(mrb, E_RANGE_ERROR, "unexpected end of buffer");
   return 0;
 }
 
@@ -296,7 +295,7 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
     mrb_gc_protect(mrb, res);
     return res;
   } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "payload is not a number");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: read_cbor_uint returned unexpected type");
   }
 #else
   mrb_raise(mrb, E_RANGE_ERROR, "negative integer out of range");
@@ -539,13 +538,13 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
           mrb_bug(mrb, "mrb_bint_from_bytes didnt return a int or bigint");
         }
       } else {
-        mrb_raise(mrb, E_RANGE_ERROR, "reader offset negative");
+        mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: reader offset negative");
       }
     } else {
       mrb_raise(mrb, E_RANGE_ERROR, "bignum payload length out of range");
     }
   } else {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "invalid bignum payload");
+    mrb_raise(mrb, E_TYPE_ERROR, "bignum tag payload must be a byte string");
   }
 
   return mrb_undef_value();
@@ -1433,7 +1432,7 @@ encode_value(CborWriter* w, mrb_value obj)
 //   MRB_USE_FLOAT32    → floats always f32 (0xFA, 5 bytes total)
 //   default            → floats always f64 (0xFB, 9 bytes total)
 //
-// Strings always encode as major 3 when mruby was compuiled with UTF8 Support, else major 2 — no UTF-8 scan.
+// Strings always encode as major 2 (byte string) — no UTF-8 scan, no text/binary distinction.
 // Arrays/maps encode their count the canonical way.
 // true/false/nil encode as standard 1-byte simples (unchanged).
 //
@@ -2105,7 +2104,7 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
   r->depth++;
 
   if (unlikely(r->p >= r->end))
-    mrb_raise(mrb, E_RUNTIME_ERROR, "unexpected end of buffer");
+    mrb_raise(mrb, E_RANGE_ERROR, "unexpected end of buffer");
 
   uint8_t b     = reader_read8(mrb, r);
   uint8_t major = b >> 5;
@@ -2734,7 +2733,7 @@ cbor_register_tag_impl(mrb_state *mrb, mrb_value tag_v, mrb_value klass)
 }
 
 static mrb_value
-cbor_register_tag_rb(mrb_state *mrb, mrb_value self)
+cbor_register_tag_class_rb(mrb_state *mrb, mrb_value self)
 {
   mrb_value tag_v;
   mrb_value klass;
@@ -2950,7 +2949,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_uint32),cbor_symbols_as_uint32,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(symbols_as_string),cbor_symbols_as_string,MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(decode),           cbor_decode_rb,        MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag),      cbor_register_tag_rb,      MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag_class),cbor_register_tag_class_rb,      MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(register_tag_proc), cbor_register_tag_proc_rb, MRB_ARGS_REQ(5));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(encode),           cbor_encode_rb,        MRB_ARGS_REQ(1)|MRB_ARGS_KEY(0,1));
   mrb_define_module_function_id(mrb, cbor, MRB_SYM(doc_end),          cbor_doc_end_rb,       MRB_ARGS_ARG(1,1));

@@ -216,7 +216,7 @@ obj = CBOR.decode_fast(buf)
 - Integers always encode at the full native width (`MRB_INT_BIT` bits), never shortest-form
 - Floats always encode at the full native width (`MRB_USE_FLOAT32` → f32, else → f64)
 - Strings, arrays, and maps use canonical shortest-form length prefixes (same as canonical)
-- No UTF-8 validation on strings
+- Strings always encode as major type 2 (byte string) — no UTF-8 scan, no text/binary distinction
 - Symbols always encode as tag 39 + string (ignores the global symbol strategy setting)
 - Classes and modules encode as tag 49999 + name string (same as canonical)
 - Registered tags, bigints, UnhandledTag, and proc-tag types fall back to canonical encoding transparently — `encode_fast` never raises on an unsupported type
@@ -318,16 +318,33 @@ Define a schema for your classes using the `native_ext_type` DSL:
 
 ```ruby
 class Address
+  attr_accessor :street, :city, :zip
+
   native_ext_type :@street, String
   native_ext_type :@city,   String
   native_ext_type :@zip,    String
+
+  def initialize(street, city, zip)
+    @street = street
+    @city   = city
+    @zip    = zip
+  end
 end
 
 class Person
+  attr_accessor :name, :age, :address, :active
+
   native_ext_type :@name,    String
   native_ext_type :@age,     Integer
-  native_ext_type :@address, Address    # Nested class!
+  native_ext_type :@address, Address           # Nested class!
   native_ext_type :@active,  TrueClass, FalseClass  # Multiple types OK
+
+  def initialize(name, age, address, active)
+    @name    = name
+    @age     = age
+    @address = address
+    @active  = active
+  end
 
   def _after_decode
     puts "Person #{@name} loaded"
@@ -345,28 +362,75 @@ CBOR.register_tag(1000, Person)
 CBOR.register_tag(1001, Address)
 
 # Encode
-addr = Address.new
-addr.instance_variable_set(:@street, "Main St")
-addr.instance_variable_set(:@city, "Berlin")
-addr.instance_variable_set(:@zip, "10115")
-
-person = Person.new
-person.instance_variable_set(:@name, "Alice")
-person.instance_variable_set(:@age, 30)
-person.instance_variable_set(:@address, addr)
-person.instance_variable_set(:@active, true)
+addr   = Address.new("Main St", "Berlin", "10115")
+person = Person.new("Alice", 30, addr, true)
 
 encoded = CBOR.encode(person)
 
 # Decode (hooks are called automatically)
 decoded = CBOR.decode(encoded)  # _after_decode called
-decoded.instance_variable_get(:@name)  # => "Alice"
-decoded.instance_variable_get(:@address).instance_variable_get(:@city)  # => "Berlin"
+decoded.name             # => "Alice"
+decoded.address.city     # => "Berlin"
 ```
 
-**Type constraints use standard Ruby classes:** `String`, `Integer`, `Float`, `Array`, `Hash`, `TrueClass`, `FalseClass`, `NilClass`, and any registered class. Inheritance works: `Numeric` matches both `Integer` and `Float`.
+#### Nullable fields
 
-**Security:** Only declared ivars are populated (allowlist model). Extra fields in the payload are silently ignored.
+Add `NilClass` to allow a field to be `nil` (CBOR null on the wire):
+
+```ruby
+class Product
+  attr_accessor :id, :name, :price, :description, :rating
+
+  native_ext_type :@id,          Integer
+  native_ext_type :@name,        String
+  native_ext_type :@price,       Integer, NilClass  # nullable — price may be unknown
+  native_ext_type :@description, String,  NilClass  # nullable — description optional
+  native_ext_type :@rating,      Float,   NilClass  # nullable — unrated products
+
+  def initialize(id, name, price = nil, description = nil, rating = nil)
+    @id          = id
+    @name        = name
+    @price       = price
+    @description = description
+    @rating      = rating
+  end
+end
+
+CBOR.register_tag(2000, Product)
+
+# Fully populated
+p1 = Product.new(1, "Widget", 999, "A fine widget", 4.5)
+decoded = CBOR.decode(CBOR.encode(p1))
+decoded.price        # => 999
+decoded.description  # => "A fine widget"
+decoded.rating       # => 4.5
+
+# Optional fields absent — nil encodes as CBOR null (0xF6)
+p2 = Product.new(2, "Mystery item")
+decoded2 = CBOR.decode(CBOR.encode(p2))
+decoded2.price        # => nil
+decoded2.description  # => nil
+decoded2.rating       # => nil
+
+# Type enforcement still active — String is not Integer or NilClass
+p3 = Product.new(3, "Bad", "free")
+CBOR.encode(p3)  # => TypeError: CBOR tag field type mismatch for ivar @price: expected [Integer, NilClass], got String
+```
+
+Common nullable patterns:
+
+```ruby
+native_ext_type :@note,    String,  NilClass              # optional string
+native_ext_type :@enabled, TrueClass, FalseClass, NilClass  # boolean or absent
+native_ext_type :@score,   Integer, Float,        NilClass  # numeric union or absent
+```
+
+**Type constraints use standard Ruby classes:** `String`, `Integer`, `Float`, `Array`,
+`Hash`, `TrueClass`, `FalseClass`, `NilClass`, and any registered class. Inheritance
+works: `Numeric` matches both `Integer` and `Float`.
+
+**Security:** Only declared ivars are populated (allowlist model). Extra fields in
+the payload are silently ignored.
 
 ### Streaming
 
@@ -632,7 +696,7 @@ This section answers: **Will the same input always produce the same output?**
 
 1. **Integer encoding (all bases: 2, 10, 16, etc.)**
    - Fixnum (`mrb_int`): Encoded in varint-style (shortest form, no padding)
-   - Bignum (`mrb_bigint`): Converted to big-endian byte string (Tag 2/3), no lossy conversions
+   - Bignum: Converted to big-endian byte string (Tag 2/3), no lossy conversions
    - Negative integers: Computed via `-1 - n` rule, not two's complement tricks
    - Same integer value → same wire bytes, always, regardless of how the integer was created
    - Example: `2**100` and `(1 << 100)` encode identically, even across mruby builds
@@ -660,7 +724,6 @@ This section answers: **Will the same input always produce the same output?**
 | Factor | Impact | Details |
 |--------|--------|---------|
 | **mruby build config** | Symbols, float width range | `MRB_USE_FLOAT32`, presym settings affect encoding choices |
-| **Compile flags** | Might affect numeric representation | Different `CFLAGS` *could* theoretically affect float behavior (though unlikely in practice) |
 | **Symbol IDs** | Non-portable across mruby binaries | Presym IDs differ between mruby builds; use `symbols_as_string` for portability |
 | **`encode_fast` integer width** | Non-portable across builds with different `MRB_INT_BIT` | Fast buffers must never cross build boundaries |
 
@@ -696,8 +759,6 @@ This implementation strictly follows RFC 8949:
 | Decode nested structure | 1× | ~1.2× faster | |
 | Decode int array [100] | 1× | ~1.1× faster | Fixed-width reads |
 
-**Lazy decoding shines:** When you only need a few fields from a 10 MB payload, lazy is 10–100× faster than eager.
-
 **`encode_fast` trade-off:** Fixed-width integers produce larger wire output for small values (e.g. `1` encodes as 9 bytes instead of 1). For integer-heavy payloads (large arrays of small numbers) the canonical encoder is actually faster due to lower `memcpy` volume. The fast path wins on rich structured messages with string keys and mixed scalar values — the typical actor message shape.
 
 ### Recursion Depth Tuning
@@ -705,16 +766,10 @@ This implementation strictly follows RFC 8949:
 Default limits depend on mruby profile:
 
 ```c
-MRB_PROFILE_MAIN / MRB_PROFILE_HIGH  → CBOR_MAX_DEPTH = 128
-MRB_PROFILE_BASELINE                 → CBOR_MAX_DEPTH = 64
-Constrained / other                  → CBOR_MAX_DEPTH = 32
-```
-
-Override at compile time:
-
-```bash
-cd /path/to/mruby
-MRUBY_CFLAGS="-DCBOR_MAX_DEPTH=256" rake compile
+MRB_HIGH_PROFILE                     → CBOR_MAX_DEPTH = 128
+MRB_MAIN_PROFILE                     → CBOR_MAX_DEPTH = 64
+MRB_BASELINE_PROFILE                 → CBOR_MAX_DEPTH = 32
+Other / constrained                  → CBOR_MAX_DEPTH = 16
 ```
 
 Exceeding depth raises `RuntimeError: "CBOR nesting depth exceeded"`.
@@ -910,7 +965,7 @@ The encoder checks each string's UTF-8 validity at encode time and chooses the a
 
 When **decoding**, text strings (major type 3) are validated as UTF-8 **when mruby is compiled with `MRB_UTF8_STRING`**. If mruby was compiled without UTF-8 string support, the validation is skipped (the strings are still decoded, just not validated).
 
-`encode_fast` always emits strings as major type 3 without UTF-8 validation — faster but trusts the caller to provide valid UTF-8.
+`encode_fast` always emits strings as major type 2 (byte string), regardless of content. The fast wire format is mruby-to-mruby only — the text/binary distinction does not apply at that layer.
 
 ---
 

@@ -1,5 +1,10 @@
 module CBOR
   class TagDSL
+    attr_reader :encode_type
+    attr_reader :encode_proc
+    attr_reader :decode_type
+    attr_reader :decode_proc
+
     def initialize
       @encode_type = nil
       @encode_proc = nil
@@ -16,16 +21,9 @@ module CBOR
       @decode_type = type
       @decode_proc = block
     end
-
-    def encode_type; @encode_type; end
-    def encode_proc; @encode_proc; end
-    def decode_type; @decode_type; end
-    def decode_proc; @decode_proc; end
   end
 
   class << self
-    alias_method :register_tag_class, :register_tag
-
     def register_tag(tag, klass = nil, &block)
       if block
         dsl = TagDSL.new

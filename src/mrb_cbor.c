@@ -2206,22 +2206,22 @@ skip_cbor_try(mrb_state *mrb, Reader *r)
   switch (major) {
 
     case 0: case 1:
-      if (likely(info < 24)) {
+      if ((info < 24)) {
         /* small int, nothing to skip */
       } else {
-        if (likely(info == 24 && r->p < r->end)) {
+        if ((info == 24 && r->p < r->end)) {
           mrb_value lv = read_cbor_uint(mrb, r, info);
           if (!mrb_integer_p(lv)) ok = FALSE;
         }
-        else if (likely(info == 25 && (r->end - r->p) >= 2)) {
+        else if ((info == 25 && (r->end - r->p) >= 2)) {
           mrb_value lv = read_cbor_uint(mrb, r, info);
           if (!mrb_integer_p(lv)) ok = FALSE;
         }
-        else if (likely(info == 26 && (r->end - r->p) >= 4)) {
+        else if ((info == 26 && (r->end - r->p) >= 4)) {
           mrb_value lv = read_cbor_uint(mrb, r, info);
           if (!mrb_integer_p(lv)) ok = FALSE;
         }
-        else if (likely(info == 27 && (r->end - r->p) >= 8)) {
+        else if ((info == 27 && (r->end - r->p) >= 8)) {
           mrb_value lv = read_cbor_uint(mrb, r, info);
           if (!mrb_integer_p(lv)) ok = FALSE;
         }
@@ -2318,7 +2318,7 @@ skip_cbor_try(mrb_state *mrb, Reader *r)
     }
 
     case 7: {
-      if (likely(info < 24)) {
+      if ((info < 24)) {
         /* simple values */
       } else {
         switch (info) {

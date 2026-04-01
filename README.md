@@ -8,7 +8,7 @@
 
 ## What is CBOR and Why You Want It
 
-**CBOR** (Concise Binary Object Representation, [RFC 8949](https://tools.ietf.org/html/rfc8949)) is a binary data format like JSON, msgpack, or Protocol Buffers. It's small, fast, and human-readable in diagnostic notation. Use it when you need:
+**CBOR** (Concise Binary Object Representation, [RFC 8949](https://tools.ietf.org/html/rfc8949)) is a data format like JSON, msgpack, or Protocol Buffers. It's small, fast, and human-readable in diagnostic notation. Use it when you need:
 
 - **Wire efficiency:** Encode numbers, arrays, and maps in the fewest bytes possible
 - **Language-agnostic data exchange:** Send structs between mruby and Python, Node.js, Go, Rust, etc.

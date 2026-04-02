@@ -2,7 +2,7 @@
 
 **Fast, spec-compliant CBOR encoding and decoding for mruby.**
 
-[![RFC 8949](https://img.shields.io/badge/RFC-8949-blue)](#specification) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-brightgreen)](#license)
+[![RFC 8949](https://img.shields.io/badge/RFC-8949-blue)](#specification--interoperability) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-brightgreen)](#license)
 
 ---
 

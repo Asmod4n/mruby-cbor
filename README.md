@@ -269,6 +269,10 @@ value = lazy["response"]["data"][0]["id"].value
 status = lazy.dig("response", "data", "status").value
 status = lazy.dig("nonexistent", "path").value  # => nil
 
+# JSON pointer-style path access — navigate deeply nested structures
+# without decoding anything outside the path:
+id = lazy.dig("response", "data", 0, "id").value
+
 # Repeated access uses cache (O(1) after first access):
 id1 = lazy["response"]["data"][0]["id"].value
 id2 = lazy["response"]["data"][0]["id"].value  # Same object, no re-parse
@@ -801,7 +805,7 @@ File streaming uses **adaptive readahead with doubling strategy:**
 |-------|-------|---------|
 | `ArgumentError` | Invalid option or reserved tag number | `CBOR.encode(obj, invalid: true)` |
 | `RangeError` | Integer overflow or invalid length | Encoding bigint larger than wire allows |
-| `RuntimeError` | Malformed CBOR, depth exceeded, or unimplemented | Truncated buffer, nested too deep, indefinite-length |
+| `RuntimeError` | Malformed CBOR or depth exceeded | Truncated buffer, nested too deep |
 | `TypeError` | Type mismatch in registered tag or unknown source | Field is Array but schema expects String |
 | `KeyError` | Lazy map access to missing key | `lazy["nonexistent"]` (use `.dig` for safe access) |
 | `IndexError` | Lazy array out of bounds or invalid shared ref | `lazy[999]` on 3-item array |
@@ -823,11 +827,9 @@ Full RFC 8949 compliance. Official specification: https://tools.ietf.org/html/rf
 
 Tested against:
 
-- **Python:** `cbor2` library (comprehensive test suite via `interop.py`)
+- **Go:** `fxamacker/cbor` v2 in strict mode (preferred serialization, UTF-8 validation, duplicate key rejection) — 63/63 checks pass including wire-level byte equality for all scalar types. See `interop_go/`.
 
 **RFC 8949 compliance:** This implementation strictly adheres to RFC 8949, so it should interoperate with any spec-compliant CBOR decoder in any language.
-
-**Guaranteed portability via `symbols_as_string`:** If you use string-based symbols (Tag 39), your CBOR documents are readable by any RFC 8949-compliant decoder in any language.
 
 ### Test Vectors
 
@@ -848,7 +850,7 @@ Apache License 2.0. See [LICENSE](LICENSE) file.
 
 ## Contributing
 
-Issues, PRs, and bug reports welcome. See `interop.py` for testing against other implementations.
+Issues, PRs, and bug reports welcome. See `interop_go/` for testing against Go's `fxamacker/cbor`.
 
 ---
 

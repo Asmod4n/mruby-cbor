@@ -2428,3 +2428,575 @@ assert('CBOR bignum tag: tag 3 with non-byte-string payload raises TypeError') d
   buf = "\xC3\x05"  # tag(3) + integer(5)
   assert_raise(TypeError) { CBOR.decode(buf) }
 end
+
+=begin
+# ============================================================================
+# CBOR::Path — [*] wildcard
+# ============================================================================
+
+assert('CBOR::Path: plain point query still works') do
+  lazy = CBOR.decode_lazy(CBOR.encode({"a" => {"b" => 42}}))
+  assert_equal 42, CBOR::Path.compile("$.a.b").at(lazy)
+end
+
+assert('CBOR::Path: [*] terminal returns array of element values') do
+  lazy = CBOR.decode_lazy(CBOR.encode([10, 20, 30]))
+  result = CBOR::Path.compile("$[*]").at(lazy)
+  assert_equal [10, 20, 30], result
+end
+
+assert('CBOR::Path: [*] with tail — projects one field per element') do
+  h = { "users" => [
+    { "name" => "Alice", "age" => 30 },
+    { "name" => "Bob",   "age" => 25 },
+    { "name" => "Carol", "age" => 35 }
+  ]}
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+  names = CBOR::Path.compile("$.users[*].name").at(lazy)
+  assert_equal ["Alice", "Bob", "Carol"], names
+end
+
+assert('CBOR::Path: [*] with nested tail') do
+  h = { "rows" => [
+    { "data" => { "v" => 1 } },
+    { "data" => { "v" => 2 } },
+    { "data" => { "v" => 3 } }
+  ]}
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+  vs = CBOR::Path.compile("$.rows[*].data.v").at(lazy)
+  assert_equal [1, 2, 3], vs
+end
+
+assert('CBOR::Path: [*] with bracket-index tail') do
+  h = { "pairs" => [[1, 2], [3, 4], [5, 6]] }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+  seconds = CBOR::Path.compile("$.pairs[*][1]").at(lazy)
+  assert_equal [2, 4, 6], seconds
+end
+
+assert('CBOR::Path: [*] on empty array') do
+  lazy = CBOR.decode_lazy(CBOR.encode({"users" => []}))
+  result = CBOR::Path.compile("$.users[*]").at(lazy)
+  assert_equal [], result
+end
+
+assert('CBOR::Path: [*] on map raises TypeError') do
+  lazy = CBOR.decode_lazy(CBOR.encode({"a" => 1}))
+  assert_raise(TypeError) { CBOR::Path.compile("$[*]").at(lazy) { |_| } }
+end
+
+assert('CBOR::Path: [*] on scalar raises TypeError') do
+  lazy = CBOR.decode_lazy(CBOR.encode(42))
+  assert_raise(TypeError) { CBOR::Path.compile("$[*]").at(lazy) { |_| } }
+end
+
+
+assert('CBOR::Path: compiled path reusable across lazies') do
+  path = CBOR::Path.compile("$.items[*].id")
+  ids_a = path.at(CBOR.decode_lazy(CBOR.encode({"items" => [{"id"=>1},{"id"=>2}]}))) { |x| x }
+  ids_b = path.at(CBOR.decode_lazy(CBOR.encode({"items" => [{"id"=>9},{"id"=>8},{"id"=>7}]}))) { |x| x }
+  assert_equal [1, 2],    ids_a
+  assert_equal [9, 8, 7], ids_b
+end
+
+assert('CBOR::Path: [*] skips untouched fields cheaply') do
+  # Each user has a large byte-blob field the tail never touches.
+  # If the executor decoded greedily, this would be slow or OOM.
+  # If it skips properly, it finishes instantly.
+  big = "x" * 100_000
+  users = (1..50).map { |i| { "name" => "u#{i}", "blob" => big } }
+  lazy = CBOR.decode_lazy(CBOR.encode({"users" => users}))
+  names = CBOR::Path.compile("$.users[*].name").at(lazy) { |n| n }
+  assert_equal 50, names.length
+  assert_equal "u1",  names.first
+  assert_equal "u50", names.last
+end
+
+# ============================================================================
+# CBOR::Path + CBOR::Lazy — shared cache consistency
+#
+# Verifies that Path wildcard iteration and direct [] access share cache
+# state: wrappers produced by one access pattern are the SAME mruby object
+# as wrappers produced by the other, regardless of order.
+# ============================================================================
+
+assert('cache shared: wildcard first, direct [] returns same wrapper') do
+  h = { "statuses" => (0...10).map { |i| { "id" => i } } }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  path = CBOR::Path.compile("$.statuses[*].id")
+  path.at(lazy) { |v| v }
+
+  # Capture wrappers via direct access after the wildcard has populated kcache
+  arr = lazy["statuses"]
+  first_direct  = arr[3]
+  second_direct = arr[3]
+  assert_same first_direct, second_direct
+
+  # Different indices must be different wrappers
+  assert_not_equal first_direct.__id__, arr[4].__id__
+end
+
+assert('cache shared: direct [] first, wildcard reuses existing wrapper') do
+  h = { "rows" => (0...5).map { |i| { "v" => i * 10 } } }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  # Warm index 2 via direct access first, including its leaf value
+  arr = lazy["rows"]
+  pre = arr[2]
+  assert_equal 20, pre["v"].value
+
+  # Capture identity of the direct-access wrapper for index 2
+  pre_id = pre.__id__
+
+  # Wildcard run — internally reuses arr's kcache for every element
+  # where a wrapper already exists
+  path = CBOR::Path.compile("$.rows[*].v")
+  path.at(lazy)
+
+  # After the wildcard: direct access to index 2 must still return the
+  # SAME wrapper we had before — not a fresh one allocated by the sweep
+  assert_equal pre_id, arr[2].__id__
+end
+
+assert('cache shared: vcache survives wildcard → direct roundtrip') do
+  h = { "items" => (0...3).map { |i| { "name" => "item#{i}" } } }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  # Wildcard populates per-element kcache and the leaf vcache
+  path = CBOR::Path.compile("$.items[*].name")
+  path.at(lazy) { |v| v }
+
+  # Direct access: the name string should hit vcache — identity preserved
+  direct_name_a = lazy["items"][1]["name"].value
+  direct_name_b = lazy["items"][1]["name"].value
+  assert_same direct_name_a, direct_name_b
+  assert_equal "item1", direct_name_a
+end
+
+assert('cache shared: direct access warms cache for subsequent wildcard') do
+  h = { "xs" => (0...4).map { |i| { "val" => i } } }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  # Warm all elements directly
+  arr = lazy["xs"]
+  direct_wrappers = (0...4).map { |i| arr[i] }
+
+  # Wildcard — iterate and pull the same element wrappers
+  path = CBOR::Path.compile("$.xs[*]")
+  yielded_objects = []
+  path.at(lazy) { |elem| yielded_objects << elem }
+
+  # The yielded values are the decoded hashes, not the wrappers,
+  # so to check wrapper identity we access arr[i] after the wildcard
+  # and compare to the wrappers we captured before
+  (0...4).each do |i|
+    assert_equal direct_wrappers[i].__id__, arr[i].__id__
+  end
+end
+
+assert('cache: repeated wildcard runs reuse the same children array') do
+  h = { "list" => (0...20).map { |i| { "id" => i } } }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  path = CBOR::Path.compile("$.list[*].id")
+
+  first_run  = path.at(lazy) { |v| v }
+  second_run = path.at(lazy) { |v| v }
+
+  # Results must match exactly (same ids)
+  assert_equal first_run, second_run
+  assert_equal (0..19).to_a, first_run
+end
+
+assert('cache: wildcard leaf values are same objects across runs') do
+  h = { "xs" => [{ "s" => "hello" }, { "s" => "world" }] }
+  lazy = CBOR.decode_lazy(CBOR.encode(h))
+
+  path = CBOR::Path.compile("$.xs[*].s")
+  first_run  = path.at(lazy) { |v| v }
+  second_run = path.at(lazy) { |v| v }
+
+  # Same string objects from vcache on second run
+  assert_same first_run[0], second_run[0]
+  assert_same first_run[1], second_run[1]
+end
+
+# test/test_path.rb
+# ============================================================================
+# CBOR::Path — multi-wildcard tests
+#
+# Data is modeled after real twitter.json shapes used in benchmark/path.rb:
+#   - $.statuses[*].id                              (1 wildcard, flat)
+#   - $.statuses[*].user.screen_name                (1 wildcard, tail)
+#   - $.statuses[*].metadata.iso_language_code      (1 wildcard, deeper tail)
+#   - $.statuses[*].entities.user_mentions[*].screen_name  (2 wildcards)
+# ============================================================================
+
+# ── shared fixtures ─────────────────────────────────────────────────────────
+
+TWITTER_LIKE = {
+  "statuses" => [
+    {
+      "metadata" => { "iso_language_code" => "ja", "result_type" => "recent" },
+      "id"       => 505874924095815681,
+      "user"     => { "screen_name" => "ayuu0123", "id" => 1186275104 },
+      "entities" => {
+        "hashtags"      => [],
+        "user_mentions" => [
+          { "screen_name" => "aym0566x", "id" => 866260188 }
+        ]
+      }
+    },
+    {
+      "metadata" => { "iso_language_code" => "ja", "result_type" => "recent" },
+      "id"       => 505874922023837696,
+      "user"     => { "screen_name" => "yuttari1998", "id" => 903487807 },
+      "entities" => {
+        "hashtags"      => [],
+        "user_mentions" => [
+          { "screen_name" => "KATANA77", "id" => 77915997 }
+        ]
+      }
+    },
+    {
+      "metadata" => { "iso_language_code" => "en", "result_type" => "recent" },
+      "id"       => 505874918000000000,
+      "user"     => { "screen_name" => "alice", "id" => 1 },
+      "entities" => {
+        "hashtags"      => [],
+        "user_mentions" => [
+          { "screen_name" => "bob",     "id" => 2 },
+          { "screen_name" => "charlie", "id" => 3 }
+        ]
+      }
+    },
+    {
+      # status with no mentions at all — exercises zero-length inner wildcard
+      "metadata" => { "iso_language_code" => "en", "result_type" => "recent" },
+      "id"       => 505874910000000000,
+      "user"     => { "screen_name" => "dave", "id" => 4 },
+      "entities" => {
+        "hashtags"      => [],
+        "user_mentions" => []
+      }
+    }
+  ]
+}
+
+TWITTER_CBOR = CBOR.encode(TWITTER_LIKE)
+
+# ── single wildcard — regression ────────────────────────────────────────────
+
+assert('CBOR::Path: single wildcard, id list') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].id")
+  assert_equal [
+    505874924095815681,
+    505874922023837696,
+    505874918000000000,
+    505874910000000000,
+  ], p.at(lazy)
+end
+
+assert('CBOR::Path: single wildcard, nested key on tail') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].user.screen_name")
+  assert_equal ["ayuu0123", "yuttari1998", "alice", "dave"], p.at(lazy)
+end
+
+assert('CBOR::Path: single wildcard, deeper tail') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].metadata.iso_language_code")
+  assert_equal ["ja", "ja", "en", "en"], p.at(lazy)
+end
+
+# ── two wildcards — nested result mirrors eager-decode shape ────────────────
+
+assert('CBOR::Path: two wildcards — screen_names per status') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].entities.user_mentions[*].screen_name")
+  assert_equal [
+    ["aym0566x"],
+    ["KATANA77"],
+    ["bob", "charlie"],
+    [],                  # status with no mentions → empty inner array
+  ], p.at(lazy)
+end
+
+assert('CBOR::Path: two wildcards — ids per status') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].entities.user_mentions[*].id")
+  assert_equal [
+    [866260188],
+    [77915997],
+    [2, 3],
+    [],
+  ], p.at(lazy)
+end
+
+# ── edge cases ──────────────────────────────────────────────────────────────
+
+assert('CBOR::Path: two wildcards, trailing [*] (no tail steps)') do
+  # `$.a[*].b[*]` should return the inner arrays materialized as-is
+  data = { "a" => [
+    { "b" => [1, 2, 3] },
+    { "b" => [] },
+    { "b" => [99] },
+  ]}
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.a[*].b[*]")
+  assert_equal [[1, 2, 3], [], [99]], p.at(lazy)
+end
+
+assert('CBOR::Path: three wildcards') do
+  data = { "orgs" => [
+    { "teams" => [
+      { "members" => [{ "e" => "a" }, { "e" => "b" }] },
+    ]},
+    { "teams" => [
+      { "members" => [{ "e" => "c" }] },
+      { "members" => [{ "e" => "d" }, { "e" => "e" }] },
+    ]},
+  ]}
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.orgs[*].teams[*].members[*].e")
+  assert_equal [
+    [["a", "b"]],
+    [["c"], ["d", "e"]],
+  ], p.at(lazy)
+end
+
+assert('CBOR::Path: adjacent wildcards [*][*]') do
+  data = [[1, 2, 3], [4, 5], [], [6]]
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$[*][*]")
+  assert_equal [[1, 2, 3], [4, 5], [], [6]], p.at(lazy)
+end
+
+assert('CBOR::Path: empty outer array with wildcards') do
+  data = { "statuses" => [] }
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.statuses[*].id")
+  assert_equal [], p.at(lazy)
+end
+
+# ── cache coherence — hot path returns same structural result ───────────────
+
+assert('CBOR::Path: repeated .at hits warm @kcache (multi-wildcard)') do
+  lazy = CBOR.decode_lazy(TWITTER_CBOR)
+  p    = CBOR::Path.compile("$.statuses[*].entities.user_mentions[*].screen_name")
+  r1   = p.at(lazy)
+  r2   = p.at(lazy)
+  r3   = p.at(lazy)
+  assert_equal r1, r2
+  assert_equal r2, r3
+  # structural correctness survives repeated access
+  assert_equal 4, r1.length
+  assert_equal ["bob", "charlie"], r1[2]
+end
+
+# ── errors ──────────────────────────────────────────────────────────────────
+
+assert('CBOR::Path: wildcard on non-array raises TypeError') do
+  data = { "statuses" => { "wrong" => "shape" } }  # map, not array
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.statuses[*].id")
+  assert_raise(TypeError) { p.at(lazy) }
+end
+
+assert('CBOR::Path: missing key raises KeyError (before wildcard)') do
+  data = { "not_statuses" => [] }
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.statuses[*].id")
+  assert_raise(KeyError) { p.at(lazy) }
+end
+
+assert('CBOR::Path: missing tail key in one element raises KeyError') do
+  data = { "a" => [
+    { "b" => 1 },
+    { "c" => 2 },   # missing "b"
+  ]}
+  lazy = CBOR.decode_lazy(CBOR.encode(data))
+  p    = CBOR::Path.compile("$.a[*].b")
+  assert_raise(KeyError) { p.at(lazy) }
+end
+
+# ── shared refs with wildcards ──────────────────────────────────────────────
+assert('sharedref lazy: wildcard iterates over sharedref array target') do
+  shared_users = [
+    { "screen_name" => "alice" },
+    { "screen_name" => "bob" },
+  ]
+  data = {
+    "primary" => { "users" => shared_users },
+    "backup"  => { "users" => shared_users },
+  }
+  buf  = CBOR.encode(data, sharedrefs: true)
+  lazy = CBOR.decode_lazy(buf)
+
+  p    = CBOR::Path.compile("$.backup.users[*].screen_name")
+  assert_equal ["alice", "bob"], p.at(lazy)
+end
+
+assert('path: two wildcards') do
+  data = {
+    "teams" => [
+      { "members" => [{"name" => "alice"}, {"name" => "bob"}] },
+      { "members" => [{"name" => "carol"}, {"name" => "dan"}] },
+    ]
+  }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.teams[*].members[*].name")
+  assert_equal [["alice", "bob"], ["carol", "dan"]], p.at(lazy)
+end
+
+assert('path: three wildcards') do
+  data = {
+    "regions" => [
+      { "teams" => [
+          { "members" => [{"n" => "a"}, {"n" => "b"}] },
+          { "members" => [{"n" => "c"}] },
+      ]},
+      { "teams" => [
+          { "members" => [{"n" => "d"}, {"n" => "e"}, {"n" => "f"}] },
+      ]},
+    ]
+  }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.regions[*].teams[*].members[*].n")
+  assert_equal [[["a", "b"], ["c"]], [["d", "e", "f"]]], p.at(lazy)
+end
+
+assert('path: wildcard at root') do
+  data = [{"x" => 1}, {"x" => 2}, {"x" => 3}]
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$[*].x")
+  assert_equal [1, 2, 3], p.at(lazy)
+end
+
+assert('path: two wildcards at root') do
+  data = [[1, 2], [3, 4, 5], [6]]
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$[*][*]")
+  assert_equal [[1, 2], [3, 4, 5], [6]], p.at(lazy)
+end
+
+assert('path: wildcard with empty array') do
+  data = { "items" => [] }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.items[*]")
+  assert_equal [], p.at(lazy)
+end
+
+assert('path: wildcard on empty inner arrays') do
+  data = { "groups" => [{"xs" => []}, {"xs" => [1, 2]}, {"xs" => []}] }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.groups[*].xs[*]")
+  assert_equal [[], [1, 2], []], p.at(lazy)
+end
+
+assert('path: index then wildcard') do
+  data = {
+    "rows" => [
+      [ {"v" => 10}, {"v" => 20} ],
+      [ {"v" => 30}, {"v" => 40} ],
+    ]
+  }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.rows[1][*].v")
+  assert_equal [30, 40], p.at(lazy)
+end
+
+assert('path: wildcard then index') do
+  data = {
+    "rows" => [
+      [10, 20, 30],
+      [40, 50, 60],
+      [70, 80, 90],
+    ]
+  }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.rows[*][1]")
+  assert_equal [20, 50, 80], p.at(lazy)
+end
+
+assert('path: wildcard on sharedref leaf') do
+  shared = [1, 2, 3]
+  data = { "a" => shared, "b" => shared }
+  buf  = CBOR.encode(data, sharedrefs: true)
+  lazy = CBOR.decode_lazy(buf)
+  assert_equal [1, 2, 3], CBOR::Path.compile("$.a[*]").at(lazy)
+  assert_equal [1, 2, 3], CBOR::Path.compile("$.b[*]").at(lazy)
+end
+
+assert('path: two wildcards over sharedref target') do
+  shared_teams = [
+    { "members" => [{"n" => "a"}, {"n" => "b"}] },
+    { "members" => [{"n" => "c"}] },
+  ]
+  data = { "primary" => { "teams" => shared_teams },
+           "backup"  => { "teams" => shared_teams } }
+  buf  = CBOR.encode(data, sharedrefs: true)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.backup.teams[*].members[*].n")
+  assert_equal [["a", "b"], ["c"]], p.at(lazy)
+end
+
+assert('path: wildcard inside sharedref, nested shared leaf') do
+  shared_tags = ["red", "blue"]
+  data = {
+    "posts" => [
+      { "tags" => shared_tags },
+      { "tags" => shared_tags },
+    ]
+  }
+  buf  = CBOR.encode(data, sharedrefs: true)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.posts[*].tags[*]")
+  assert_equal [["red", "blue"], ["red", "blue"]], p.at(lazy)
+end
+
+assert('path: wildcard raises on non-array target') do
+  data = { "x" => { "y" => 1 } }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.x[*]")
+  assert_raise(TypeError) { p.at(lazy) }
+end
+
+assert('path: wildcard result cached across repeated calls') do
+  data = { "xs" => [{"v" => 1}, {"v" => 2}, {"v" => 3}] }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.xs[*].v")
+  assert_equal [1, 2, 3], p.at(lazy)
+  assert_equal [1, 2, 3], p.at(lazy)  # second call hits kcache
+end
+
+assert('path: different compiled paths on same lazy') do
+  data = {
+    "xs" => [{"a" => 1, "b" => 10}, {"a" => 2, "b" => 20}],
+  }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  assert_equal [1, 2],   CBOR::Path.compile("$.xs[*].a").at(lazy)
+  assert_equal [10, 20], CBOR::Path.compile("$.xs[*].b").at(lazy)
+end
+
+assert('path: heterogeneous values under wildcard') do
+  data = { "xs" => [1, "two", nil, true, [3, 4], {"k" => "v"}] }
+  buf  = CBOR.encode(data)
+  lazy = CBOR.decode_lazy(buf)
+  p    = CBOR::Path.compile("$.xs[*]")
+  assert_equal [1, "two", nil, true, [3, 4], {"k" => "v"}], p.at(lazy)
+end
+=end

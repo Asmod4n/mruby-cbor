@@ -47,7 +47,6 @@ ops = (1.0 / elapsed).round(2)
 puts "  Time: #{elapsed.round(9)} sec"
 puts "  OPS:  #{ops}"
 
-
 # CBOR Lazy
 puts "\nCBOR.decode_lazy"
 timer = Chrono::Timer.new
@@ -57,6 +56,18 @@ ops = (1.0 / elapsed).round(2)
 puts "  Result: #{result.inspect}"
 puts "  Time: #{elapsed.round(9)} sec"
 puts "  OPS:  #{ops}"
+
+meta = CBOR::Path.compile("$.search_metadata")
+# CBOR Lazy (neues .at)
+puts "\nCBOR.decode_lazy.at"
+timer = Chrono::Timer.new
+result = meta.at(CBOR.decode_lazy(cbor))
+elapsed = timer.elapsed
+ops = (1.0 / elapsed).round(2)
+puts "  Result: #{result.inspect}"
+puts "  Time: #{elapsed.round(9)} sec"
+puts "  OPS:  #{ops}"
+
 
 # MessagePack Lazy
 puts "\nMessagePack.unpack_lazy"

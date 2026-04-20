@@ -3801,3 +3801,600 @@ assert('path: heterogeneous values under wildcard') do
   assert_equal [1, "two", nil, true, [3, 4], {"k" => "v"}], p.at(lazy)
 end
 =end
+
+# ============================================================================
+# 9. Shared references — Tag 28/29 (deduplication + cyclic structures)
+#
+# Semantics:
+#   - Only objects that appear in *value* positions participate in
+#     sharedref deduplication. Hash keys always encode inline, because
+#     preserving key identity is rarely useful and mruby's hash stores
+#     a fresh copy of the key anyway.
+#   - First non-key occurrence of an object  → Tag 28 + value.
+#   - Subsequent non-key occurrences         → Tag 29 + index into
+#                                              shareable table.
+#   - Decoder preserves identity across all Tag 29 references resolving
+#     to the same Tag 28 source.
+# ============================================================================
+
+# ── Value-position sharing: arrays, maps, strings ──────────────────────────
+
+assert('CBOR sharedref: two array refs preserve value and identity (eager)') do
+  a = [1, 2]
+  obj = [a, a]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal [[1, 2], [1, 2]], result
+  assert_equal [1, 2], result[0]
+  assert_equal [1, 2], result[1]
+  assert_same result[0], result[1]
+end
+
+assert('CBOR sharedref: three value refs preserve value and identity (eager)') do
+  v = [1, 2, 3]
+  obj = { "a" => v, "b" => v, "c" => v }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_equal [1, 2, 3], result["c"]
+  assert_same result["a"], result["b"]
+  assert_same result["b"], result["c"]
+end
+
+assert('CBOR sharedref: shared hash value (eager)') do
+  h = { "k" => "v", "n" => 42 }
+  obj = [h, h, h]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal [{ "k" => "v", "n" => 42 },
+                { "k" => "v", "n" => 42 },
+                { "k" => "v", "n" => 42 }], result
+  assert_same result[0], result[1]
+  assert_same result[1], result[2]
+end
+
+assert('CBOR sharedref: shared string in array (eager)') do
+  s = "shared_string"
+  obj = [s, s, s, { "key" => s }]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal "shared_string", result[0]
+  assert_equal "shared_string", result[1]
+  assert_equal "shared_string", result[2]
+  assert_equal "shared_string", result[3]["key"]
+  assert_same result[0], result[1]
+  assert_same result[1], result[2]
+  assert_same result[2], result[3]["key"]
+end
+
+# ── Cyclic structures ──────────────────────────────────────────────────────
+
+assert('CBOR sharedref: cyclic self-referential array (eager)') do
+  a = []
+  a << a
+  result = CBOR.decode(CBOR.encode(a, sharedrefs: true))
+  assert_true  result.is_a?(Array)
+  assert_equal 1, result.length
+  assert_same  result, result[0]
+end
+
+assert('CBOR sharedref: cyclic self-referential hash (eager)') do
+  h = {}
+  h["self"] = h
+  result = CBOR.decode(CBOR.encode(h, sharedrefs: true))
+  assert_true result.is_a?(Hash)
+  assert_same result, result["self"]
+end
+
+assert('CBOR sharedref: mutual recursion — hash references array references hash') do
+  a = []
+  h = { "list" => a }
+  a << h
+  a << h
+  result = CBOR.decode(CBOR.encode(h, sharedrefs: true))
+  assert_equal 2, result["list"].length
+  assert_same result, result["list"][0]
+  assert_same result, result["list"][1]
+end
+
+# ── Lazy decode ────────────────────────────────────────────────────────────
+
+assert('CBOR sharedref: two array refs (lazy)') do
+  a = [1, 2]
+  obj = [a, a]
+  result = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true)).value
+  assert_equal [[1, 2], [1, 2]], result
+  assert_same result[0], result[1]
+end
+
+assert('CBOR sharedref: map with shared value (lazy)') do
+  v = [1, 2, 3]
+  obj = { "a" => v, "b" => v }
+  result = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true)).value
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR sharedref: cyclic array (lazy)') do
+  a = []
+  a << a
+  result = CBOR.decode_lazy(CBOR.encode(a, sharedrefs: true)).value
+  assert_same result, result[0]
+end
+
+# ── Deep nesting ───────────────────────────────────────────────────────────
+
+assert('CBOR sharedref: shared leaf deep inside nested maps') do
+  shared = [10, 20, 30]
+  obj = {
+    "a" => { "b" => { "c" => { "d" => { "e" => shared } } } },
+    "x" => shared
+  }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal [10, 20, 30], result["a"]["b"]["c"]["d"]["e"]
+  assert_equal [10, 20, 30], result["x"]
+  assert_same result["a"]["b"]["c"]["d"]["e"], result["x"]
+end
+
+assert('CBOR sharedref: shared leaf deep inside nested arrays') do
+  shared = { "k" => "v", "n" => 42 }
+  obj = [[[[[shared]]]], shared, [shared]]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  leaf1 = result[0][0][0][0][0]
+  leaf2 = result[1]
+  leaf3 = result[2][0]
+  assert_equal({ "k" => "v", "n" => 42 }, leaf1)
+  assert_equal({ "k" => "v", "n" => 42 }, leaf2)
+  assert_equal({ "k" => "v", "n" => 42 }, leaf3)
+  assert_same leaf1, leaf2
+  assert_same leaf2, leaf3
+end
+
+assert('CBOR sharedref: diamond pattern — bottom reached via multiple paths') do
+  bottom = { "value" => 99 }
+  left   = { "child" => bottom }
+  right  = { "child" => bottom }
+  root   = { "left" => left, "right" => right, "direct" => bottom }
+  result = CBOR.decode(CBOR.encode(root, sharedrefs: true))
+
+  assert_equal 99, result["left"]["child"]["value"]
+  assert_equal 99, result["right"]["child"]["value"]
+  assert_equal 99, result["direct"]["value"]
+
+  assert_same result["left"]["child"],  result["right"]["child"]
+  assert_same result["left"]["child"],  result["direct"]
+  assert_same result["right"]["child"], result["direct"]
+end
+
+assert('CBOR sharedref: shared array containing shared sub-array') do
+  inner = [1, 2, 3]
+  outer = [inner, inner]    # outer contains inner twice
+  obj   = [outer, outer]    # obj contains outer twice
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  assert_equal [[[1, 2, 3], [1, 2, 3]], [[1, 2, 3], [1, 2, 3]]], result
+  assert_same result[0],    result[1]     # outer identity
+  assert_same result[0][0], result[0][1]  # inner identity within outer
+  assert_same result[0][0], result[1][0]  # inner identity across outer copies
+  assert_same result[0][0], result[1][1]  # transitivity
+end
+
+assert('CBOR sharedref: multiple distinct shared groups in same structure') do
+  a = [1, 2]
+  b = { "k" => "v" }
+  c = "shared_string"
+  obj = {
+    "a1" => a, "a2" => a,
+    "b1" => b, "b2" => b,
+    "c1" => c, "c2" => c,
+    "nested" => { "a" => a, "b" => b, "c" => c }
+  }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  # Values correct
+  assert_equal [1, 2],           result["a1"]
+  assert_equal({ "k" => "v" }, result["b1"])
+  assert_equal "shared_string",  result["c1"]
+
+  # Each group shares identity internally
+  assert_same result["a1"], result["a2"]
+  assert_same result["a1"], result["nested"]["a"]
+
+  assert_same result["b1"], result["b2"]
+  assert_same result["b1"], result["nested"]["b"]
+
+  assert_same result["c1"], result["c2"]
+  assert_same result["c1"], result["nested"]["c"]
+
+  # Groups are not conflated
+  assert_not_same result["a1"], result["b1"]
+  assert_not_same result["b1"], result["c1"]
+end
+
+assert('CBOR sharedref: shared object repeats at every nesting level') do
+  leaf = [1, 2]
+  obj  = [leaf, [leaf, [leaf, [leaf, [leaf]]]]]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  # Collect all five occurrences
+  occurrences = [result[0]]
+  cur = result[1]
+  while cur.is_a?(Array) && cur.length == 2
+    occurrences << cur[0]
+    cur = cur[1]
+  end
+  occurrences << cur[0] if cur.is_a?(Array)
+
+  assert_equal 5, occurrences.length
+  occurrences.each { |o| assert_equal [1, 2], o }
+  (0...occurrences.length - 1).each do |i|
+    assert_same occurrences[i], occurrences[i + 1]
+  end
+end
+
+# ── Hash keys are NOT shared ───────────────────────────────────────────────
+
+assert('CBOR sharedref: repeated key object does not participate in sharing') do
+  # Same string used as a key in two maps. With sharedrefs on, the decoded
+  # keys are still distinct string copies (mruby hash behaviour), and no
+  # Tag 28/29 is emitted in key positions.
+  k = "repeated_key"
+  obj = [{ k => 1 }, { k => 2 }]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal [{ "repeated_key" => 1 }, { "repeated_key" => 2 }], result
+end
+
+assert('CBOR sharedref: same array used as value AND key — only values share') do
+  arr = [1, 2, 3]
+  obj = {
+    "v1"         => arr,
+    "v2"         => arr,
+    "as_key_map" => { arr => "payload" }
+  }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  # Value occurrences share identity
+  assert_equal [1, 2, 3], result["v1"]
+  assert_equal [1, 2, 3], result["v2"]
+  assert_same  result["v1"], result["v2"]
+
+  # Key occurrence is a separate copy, not aliased into the value group
+  inner = result["as_key_map"]
+  assert_true inner.is_a?(Hash)
+  assert_equal 1, inner.size
+  key_arr = inner.keys[0]
+  assert_equal [1, 2, 3], key_arr
+  assert_equal "payload", inner[key_arr]
+  assert_not_same key_arr, result["v1"]
+end
+
+assert('CBOR sharedref: object embedded inside a key does not get Tag 28') do
+  # `nested` is used both inside a key-map and as a sibling value. The
+  # occurrence inside the key must encode inline; the sibling-value
+  # occurrence is the first Tag 28 and does not alias back into the key.
+  nested  = [1, 2]
+  key_map = { "inner" => nested }
+  obj     = { key_map => "v1", "also" => nested }
+  result  = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  assert_equal [1, 2], result["also"]
+
+  key_side = result.keys.find { |k| k.is_a?(Hash) }
+  assert_not_nil key_side
+  assert_equal [1, 2], key_side["inner"]
+  assert_not_same key_side["inner"], result["also"]
+end
+
+# ── Lazy + sharedrefs deep interaction ─────────────────────────────────────
+
+assert('CBOR sharedref: lazy navigation reaches deeply shared leaf via both paths') do
+  # Note: each lazy is either navigated OR materialised as a whole — not
+  # both. Mixing the two modes on the same lazy corrupts the shareable
+  # table, because navigation registers Lazy wrappers at Tag 28 offsets
+  # and a subsequent full decode would append instead of replace.
+  shared = [100, 200, 300]
+  obj = { "path" => { "to" => { "leaf" => shared } }, "alias" => shared }
+  lazy = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true))
+  assert_equal 100, lazy["path"]["to"]["leaf"][0].value
+  assert_equal 200, lazy["path"]["to"]["leaf"][1].value
+  assert_equal 300, lazy["alias"][2].value
+end
+
+assert('CBOR sharedref: full materialisation preserves identity across shared paths') do
+  shared = [100, 200, 300]
+  obj = { "path" => { "to" => { "leaf" => shared } }, "alias" => shared }
+  # Fresh lazy — no prior navigation
+  full = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true)).value
+  assert_equal [100, 200, 300], full["path"]["to"]["leaf"]
+  assert_equal [100, 200, 300], full["alias"]
+  assert_same  full["path"]["to"]["leaf"], full["alias"]
+end
+
+assert('CBOR sharedref: lazy materialisation of diamond structure') do
+  bottom = { "data" => [1, 2, 3] }
+  obj    = { "a" => { "x" => bottom }, "b" => { "y" => bottom }, "c" => bottom }
+  lazy   = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true))
+  full   = lazy.value
+  assert_equal [1, 2, 3], full["a"]["x"]["data"]
+  assert_equal [1, 2, 3], full["b"]["y"]["data"]
+  assert_equal [1, 2, 3], full["c"]["data"]
+  assert_same  full["a"]["x"], full["b"]["y"]
+  assert_same  full["a"]["x"], full["c"]
+end
+
+assert('CBOR sharedref: cyclic map round-trip preserves full cycle (eager)') do
+  inner = { "name" => "cycle" }
+  outer = { "child" => inner }
+  inner["parent"] = outer
+  result = CBOR.decode(CBOR.encode(outer, sharedrefs: true))
+
+  assert_equal "cycle", result["child"]["name"]
+  assert_same  result, result["child"]["parent"]
+  assert_same  result["child"], result["child"]["parent"]["child"]
+  assert_same  result["child"], result["child"]["parent"]["child"]["parent"]["child"]
+end
+
+# ── Registered tags under sharedrefs ──────────────────────────────────────
+
+assert('CBOR sharedref: same registered-class instance shares identity in array (eager)') do
+  class SharedPoint
+    native_ext_type :@x, Integer
+    native_ext_type :@y, Integer
+    def initialize(x = 0, y = 0); @x = x; @y = y; end
+    def x; @x; end
+    def y; @y; end
+  end
+  CBOR.register_tag(5000, SharedPoint)
+
+  p = SharedPoint.new(3, 7)
+  obj = [p, p, p]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_true  result[0].is_a?(SharedPoint)
+  assert_equal 3, result[0].x
+  assert_equal 7, result[0].y
+  assert_same result[0], result[1]
+  assert_same result[1], result[2]
+end
+
+assert('CBOR sharedref: distinct instances with equal fields do NOT share') do
+  class SharedPoint
+    native_ext_type :@x, Integer
+    native_ext_type :@y, Integer
+    def initialize(x = 0, y = 0); @x = x; @y = y; end
+    def x; @x; end
+  end
+  CBOR.register_tag(5000, SharedPoint)
+
+  p1 = SharedPoint.new(1, 2)
+  p2 = SharedPoint.new(1, 2)   # equal content, distinct object
+  obj = [p1, p2]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal 1, result[0].x
+  assert_equal 1, result[1].x
+  assert_not_same result[0], result[1]
+end
+
+assert('CBOR sharedref: registered instance shared across map values (with non-immediate ivar)') do
+  # String ivar creates a nested Tag 28 inside the registered-tag payload.
+  # Works thanks to preorder slot reservation in decode_tag_sharedrefs.
+  class SharedConfig
+    native_ext_type :@timeout, Integer
+    native_ext_type :@name,    String
+    def initialize(t = 0, n = ""); @timeout = t; @name = n; end
+    def timeout; @timeout; end
+    def name;    @name;    end
+  end
+  CBOR.register_tag(5001, SharedConfig)
+
+  cfg = SharedConfig.new(30, "default")
+  obj = { "primary" => cfg, "backup" => cfg, "fallback" => cfg }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal 30,        result["primary"].timeout
+  assert_equal "default", result["primary"].name
+  assert_same result["primary"], result["backup"]
+  assert_same result["backup"],  result["fallback"]
+end
+
+assert('CBOR sharedref: registered instance shared across mixed nesting') do
+  class SharedNode
+    native_ext_type :@id, Integer
+    def initialize(i = 0); @id = i; end
+    def id; @id; end
+  end
+  CBOR.register_tag(5002, SharedNode)
+
+  node = SharedNode.new(42)
+  obj = {
+    "a" => { "x" => node },
+    "b" => [node, node, { "nested" => node }]
+  }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_equal 42, result["a"]["x"].id
+  assert_same result["a"]["x"], result["b"][0]
+  assert_same result["b"][0],   result["b"][1]
+  assert_same result["b"][1],   result["b"][2]["nested"]
+end
+
+assert('CBOR sharedref: registered instance identity preserved through lazy.value') do
+  class LazyShared
+    native_ext_type :@val, Integer
+    def initialize(v = 0); @val = v; end
+    def val; @val; end
+  end
+  CBOR.register_tag(5003, LazyShared)
+
+  l = LazyShared.new(99)
+  obj = { "a" => l, "b" => l }
+  full = CBOR.decode_lazy(CBOR.encode(obj, sharedrefs: true)).value
+  assert_equal 99, full["a"].val
+  assert_same full["a"], full["b"]
+end
+
+assert('CBOR sharedref: registered instance as key is not aliased to value occurrences') do
+  class KeyShared
+    native_ext_type :@tag, String
+    def initialize(s = ""); @tag = s; end
+    def tag; @tag; end
+  end
+  CBOR.register_tag(5004, KeyShared)
+
+  k = KeyShared.new("keyish")
+  obj = { "v1" => k, "v2" => k, "as_key" => { k => "payload" } }
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+
+  # Value occurrences share
+  assert_same result["v1"], result["v2"]
+
+  # Key occurrence decodes to a separate instance
+  inner    = result["as_key"]
+  key_inst = inner.keys[0]
+  assert_true  key_inst.is_a?(KeyShared)
+  assert_equal "keyish", key_inst.tag
+  assert_equal "payload", inner[key_inst]
+  assert_not_same key_inst, result["v1"]
+end
+
+assert('CBOR sharedref: proc-registered Exception shares identity') do
+  CBOR.register_tag(60100) do
+    encode Exception do |e| [e.class, e.message] end
+    decode Array     do |a| a[0].new(a[1]) end
+  end
+
+  exc = RuntimeError.new("oops")
+  obj = [exc, exc, { "err" => exc }]
+  result = CBOR.decode(CBOR.encode(obj, sharedrefs: true))
+  assert_true  result[0].is_a?(RuntimeError)
+  assert_equal "oops", result[0].message
+  assert_same result[0], result[1]
+  assert_same result[1], result[2]["err"]
+end
+
+assert('CBOR sharedref: proc-registered distinct Exceptions with same message do NOT share') do
+  CBOR.register_tag(60100) do
+    encode Exception do |e| [e.class, e.message] end
+    decode Array     do |a| a[0].new(a[1]) end
+  end
+
+  e1 = RuntimeError.new("boom")
+  e2 = RuntimeError.new("boom")   # same class and message, distinct objects
+  result = CBOR.decode(CBOR.encode([e1, e2], sharedrefs: true))
+  assert_true  result[0].is_a?(RuntimeError)
+  assert_true  result[1].is_a?(RuntimeError)
+  assert_equal "boom", result[0].message
+  assert_equal "boom", result[1].message
+  assert_not_same result[0], result[1]
+end
+
+# ── Cyclic registered instances ───────────────────────────────────────────
+
+assert('CBOR sharedref: registered-class instance with self-referential field') do
+  # A node whose @nxt field points back to itself. The Tag 29(slot) inside
+  # the field payload must resolve to the in-construction instance, not nil.
+  class CyclicNode
+    native_ext_type :@id,  Integer
+    native_ext_type :@nxt, CyclicNode, NilClass
+    def initialize(i = 0); @id = i; @nxt = nil; end
+    def id;  @id;  end
+    def nxt; @nxt; end
+  end
+  CBOR.register_tag(5100, CyclicNode)
+
+  n = CyclicNode.new(1)
+  n.instance_variable_set(:@nxt, n)
+  result = CBOR.decode(CBOR.encode(n, sharedrefs: true))
+  assert_true  result.is_a?(CyclicNode)
+  assert_equal 1, result.id
+  assert_same  result, result.nxt
+end
+
+assert('CBOR sharedref: mutual recursion between two registered instances') do
+  # Declare both classes first, then reopen each to register the peer ivar
+  # with the other class as its type constraint. This is the cleanest way
+  # to express mutual type references in the native_ext_type DSL.
+  class MutualA
+    native_ext_type :@tag, Integer
+    def initialize(t = 0); @tag = t; @peer = nil; end
+    def tag;  @tag;  end
+    def peer; @peer; end
+  end
+  class MutualB
+    native_ext_type :@tag, Integer
+    def initialize(t = 0); @tag = t; @peer = nil; end
+    def tag;  @tag;  end
+    def peer; @peer; end
+  end
+  class MutualA
+    native_ext_type :@peer, MutualB, NilClass
+  end
+  class MutualB
+    native_ext_type :@peer, MutualA, NilClass
+  end
+  CBOR.register_tag(5101, MutualA)
+  CBOR.register_tag(5102, MutualB)
+
+  a = MutualA.new(1)
+  b = MutualB.new(2)
+  a.instance_variable_set(:@peer, b)
+  b.instance_variable_set(:@peer, a)
+
+  result = CBOR.decode(CBOR.encode(a, sharedrefs: true))
+  assert_true  result.is_a?(MutualA)
+  assert_equal 1, result.tag
+  assert_true  result.peer.is_a?(MutualB)
+  assert_equal 2, result.peer.tag
+  assert_same  result, result.peer.peer
+end
+
+
+
+
+assert('CBOR sharedref: without flag, values do not share identity') do
+  shared = [1, 2, 3]
+  obj = { "a" => shared, "b" => shared }
+  result = CBOR.decode(CBOR.encode(obj))
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_not_same result["a"], result["b"]
+end
+
+assert('CBOR sharedref: encoding a cycle without flag raises (depth limit)') do
+  a = []
+  a << a
+  assert_raise(RuntimeError) { CBOR.encode(a) }
+end
+
+# ── Wire-level decoder still accepts Tag 28 anywhere ──────────────────────
+
+assert('CBOR sharedref: scalar shareable — integer') do
+  buf = "\x82\xD8\x1C\x18\x2A\xD8\x1D\x00"
+  assert_equal [42, 42], CBOR.decode(buf)
+end
+
+assert('CBOR sharedref: invalid index raises IndexError') do
+  buf = "\xD8\x1D\x18\x63"
+  assert_raise(IndexError) { CBOR.decode(buf) }
+end
+
+assert('CBOR sharedref: tag 29 with non-uint payload raises TypeError') do
+  buf = "\xD8\x1D\x61\x61"   # tag(29) + "a"
+  assert_raise(TypeError) { CBOR.decode(buf) }
+end
+
+assert('CBOR sharedref: decoder accepts Tag 28 in map-value position') do
+  # Even though the encoder never emits Tag 28 in a key position, the
+  # decoder must accept Tag 28 anywhere it appears on the wire — other
+  # CBOR implementations may emit it differently.
+  buf = "\xA2\x61\x61\xD8\x1C\x83\x01\x02\x03\x61\x62\xD8\x1D\x00"
+  result = CBOR.decode(buf)
+  assert_equal [1, 2, 3], result["a"]
+  assert_equal [1, 2, 3], result["b"]
+  assert_same result["a"], result["b"]
+end
+
+assert('CBOR sharedref: lazy path through Tag 28 without prior registration') do
+  buf = "\xA2" \
+        "\x65outer" \
+        "\xD8\x1C\x82\x01\x02" \
+        "\x63ref" \
+        "\xD8\x1D\x00"
+  lazy = CBOR.decode_lazy(buf)
+  assert_equal [1, 2], lazy["ref"].value
+end

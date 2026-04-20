@@ -49,6 +49,7 @@ typedef struct {
   const uint8_t *p;
   const uint8_t *end;
   mrb_int        depth;
+  mrb_int        pending_slot;
   uint8_t        major;
   uint8_t        info;
 } Reader;
@@ -76,6 +77,7 @@ reader_init(Reader* r, const uint8_t* buf, size_t len)
   r->p     = buf;
   r->end   = buf + len;
   r->depth = 0;
+  r->pending_slot = -1;
   r->major = 0;
   r->info  = 0;
 }
@@ -566,9 +568,11 @@ decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
   if (mrb_array_p(sharedrefs)) {
     slot = RARRAY_LEN(sharedrefs);
     mrb_ary_push(mrb, sharedrefs, mrb_nil_value());
+    r->pending_slot = slot;
   }
 
   mrb_value v = decode_value(mrb, r, src, sharedrefs);
+  r->pending_slot = -1;
 
   if (slot >= 0) {
     mrb_ary_set(mrb, sharedrefs, slot, v);
@@ -2087,9 +2091,14 @@ decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src,
   if (likely(ttype == MRB_TT_OBJECT)) {
     mrb_value schema = mrb_net_schema(mrb, kp);
     if (likely(mrb_hash_p(schema))) {
+      mrb_int slot = r->pending_slot;
+      r->pending_slot = -1;
+      mrb_value obj = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
+      if (slot >= 0 && mrb_array_p(sharedrefs)) {
+        mrb_ary_set(mrb, sharedrefs, slot, obj);
+      }
       mrb_value payload = decode_value(mrb, r, src, sharedrefs);
       if (likely(mrb_hash_p(payload))) {
-        mrb_value obj = mrb_obj_value(mrb_obj_alloc(mrb, MRB_TT_OBJECT, kp));
         decode_ctx ctx = { obj, payload };
         struct RBasic *basic_ptr = mrb_basic_ptr(schema);
         unsigned int was_frozen = basic_ptr->frozen;
@@ -2377,6 +2386,7 @@ cbor_doc_end(mrb_state *mrb, const uint8_t *buf, size_t buf_len, mrb_int offset)
   r.p     = buf + offset;
   r.end   = buf + buf_len;
   r.depth = 0;
+  r.pending_slot = -1;
 
   if (unlikely(r.p >= r.end)) return mrb_nil_value();
   if (!skip_cbor_try(mrb, &r)) return mrb_nil_value();
@@ -2409,7 +2419,7 @@ cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
 
   if (likely((size_t)p->offset < total_len)) {
     Reader r;
-    r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = depth;
+    r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = depth; r.pending_slot = -1;
 
     mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
     if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) {
@@ -2437,7 +2447,7 @@ lazy_reader_init(mrb_state *mrb, Reader *r, cbor_lazy_t *p)
   const uint8_t *base = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len    = (size_t)RSTRING_LEN(p->buf);
   if (likely((size_t)p->offset < total_len)) {
-    r->base = base; r->p = base + p->offset; r->end = base + total_len; r->depth = 0;
+    r->base = base; r->p = base + p->offset; r->end = base + total_len; r->depth = 0; r->pending_slot = -1;
   } else {
     mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
   }
@@ -2615,7 +2625,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
       mrb_raise(mrb, E_RUNTIME_ERROR, "lazy offset out of bounds");
 
     Reader r;
-    r.base = base; r.p = base + p->offset; r.end = base + total; r.depth = 0;
+    r.base = base; r.p = base + p->offset; r.end = base + total; r.depth = 0; r.pending_slot = -1;
     reader_read_header(mrb, &r);
 
     mrb_value dig_resolved;

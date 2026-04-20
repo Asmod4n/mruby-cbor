@@ -561,9 +561,17 @@ decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
   }
 
   r->p--;
-  mrb_value v = decode_value(mrb, r, src, sharedrefs);
+
+  mrb_int slot = -1;
   if (mrb_array_p(sharedrefs)) {
-    mrb_ary_push(mrb, sharedrefs, v);
+    slot = RARRAY_LEN(sharedrefs);
+    mrb_ary_push(mrb, sharedrefs, mrb_nil_value());
+  }
+
+  mrb_value v = decode_value(mrb, r, src, sharedrefs);
+
+  if (slot >= 0) {
+    mrb_ary_set(mrb, sharedrefs, slot, v);
   }
   return v;
 }
@@ -1107,7 +1115,15 @@ static int
 encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
   CborWriter *w = (CborWriter*)data;
+  /* Suppress sharedref tracking while encoding the key.
+   * Hash keys do not participate in Tag 28/29 deduplication — in mruby,
+   * hashes create distinct copies for keys even when the same variable
+   * is used to insert, so preserving key identity is rarely useful and
+   * would just clutter the shareable-table index space. */
+  mrb_value saved_seen = w->seen;
+  w->seen = mrb_undef_value();
   encode_value(w, key);
+  w->seen = saved_seen;
   encode_value(w, val);
   return 0;
 }

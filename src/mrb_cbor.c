@@ -3012,9 +3012,6 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
   mrb_value resolved;
   uint8_t major;
 
-  /* Chase sharedref chain until we land on a concrete array header.
-   * lazy_resolve_tags handles Tag 28 registration and Tag 29 resolution;
-   * we just need to re-seat `node` on each sharedref target and retry. */
   for (;;) {
     cbor_lazy_t *p = mrb_data_get_ptr(mrb, node, &cbor_lazy_type);
     Reader r;
@@ -3024,7 +3021,6 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
     mrb_value sharedrefs = mrb_iv_get(mrb, node, MRB_SYM(sharedrefs));
     mrb_assert(mrb_array_p(sharedrefs));
 
-    mrb_int sharedrefs_before = RARRAY_LEN(sharedrefs);
     major = lazy_resolve_tags(mrb, &r, p->buf, sharedrefs, &resolved);
 
     if (major == 4) {
@@ -3032,20 +3028,29 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
       mrb_int   nseg       = RARRAY_LEN(segments);
       mrb_value next_steps = mrb_ary_ref(mrb, segments, depth + 1);
       mrb_bool  is_leaf    = (depth == nseg - 2);
+      mrb_value kcache     = mrb_iv_get(mrb, node, MRB_SYM(kcache));
+      mrb_value results    = mrb_ary_new_capa(mrb, len);
+      int       arena      = mrb_gc_arena_save(mrb);
 
-      /* If lazy_resolve_tags consumed a Tag28 and registered the inner Lazy,
-       * use that Lazy (which starts at the array header, not the Tag28 byte)
-       * for cbor_lazy_aref calls. Without this, each call re-reads the Tag28
-       * and pushes a duplicate into sharedrefs, corrupting Tag29 resolution. */
-      mrb_value work_node = (RARRAY_LEN(sharedrefs) > sharedrefs_before)
-        ? mrb_ary_ref(mrb, sharedrefs, RARRAY_LEN(sharedrefs) - 1)
-        : node;
-
-      mrb_value results = mrb_ary_new_capa(mrb, len);
-      mrb_int arena = mrb_gc_arena_save(mrb);
+      /* All elements cached iff kcache has at least len entries.
+       * In that case r.p tracking and skip_cbor are not needed. */
+      mrb_bool fully_cached = (mrb_hash_size(mrb, kcache) >= len);
 
       for (mrb_int i = 0; i < len; i++) {
-        mrb_value elem = cbor_lazy_aref(mrb, work_node, mrb_convert_mrb_int(mrb, i));
+        mrb_value idx_v = mrb_convert_mrb_int(mrb, i);
+        mrb_value elem  = mrb_hash_fetch(mrb, kcache, idx_v, mrb_undef_value());
+
+        if (mrb_undef_p(elem)) {
+          /* Cache miss — r.p is at element i, create lazy and advance. */
+          mrb_int elem_offset = cbor_pdiff(mrb, r.p, r.base);
+          elem = cbor_lazy_new(mrb, p->buf, elem_offset, sharedrefs);
+          mrb_hash_set(mrb, kcache, idx_v, elem);
+        }
+
+        if (!fully_cached) {
+          skip_cbor(mrb, &r, p->buf, sharedrefs);
+        }
+
         mrb_value next = path_walk_steps(mrb, elem, next_steps);
         mrb_value val  = is_leaf
           ? cbor_lazy_value(mrb, next)
@@ -3058,7 +3063,6 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
     }
 
     if (major == 0xFF) {
-      /* Tag 29 resolved — re-seat on target and loop. */
       if (!mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type))
         mrb_raise(mrb, E_TYPE_ERROR,
           "CBOR::Path [*]: sharedref target is not indexable");
@@ -3093,6 +3097,16 @@ mrb_cbor_path_at(mrb_state *mrb, mrb_value self)
   return (nseg == 1)
     ? cbor_lazy_value(mrb, node)
     : path_walk_wildcards(mrb, node, segments, 0);
+}
+
+static mrb_value
+cbor_lazy_inspect(mrb_state *mrb, mrb_value self)
+{
+  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
+  mrb_value sub = mrb_str_byte_subseq(mrb, p->buf, p->offset,
+                    RSTRING_LEN(p->buf) - p->offset);
+  return mrb_funcall_argv(mrb, mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(CBOR))),
+                          MRB_SYM(diagnose), 1, &sub);
 }
 
 MRB_BEGIN_DECL
@@ -3209,6 +3223,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, lazy, MRB_OPSYM(aref), cbor_lazy_aref_m, MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, lazy, MRB_SYM(value),  cbor_lazy_value,  MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),    cbor_lazy_dig,    MRB_ARGS_ANY());
+  mrb_define_method_id(mrb, lazy, MRB_SYM(inspect),cbor_lazy_inspect,MRB_ARGS_NONE());
 
   struct RClass *path =
     mrb_define_class_under_id(mrb, cbor, MRB_SYM(Path), mrb->object_class);

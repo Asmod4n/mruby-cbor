@@ -4397,3 +4397,68 @@ assert('CBOR sharedref: lazy path through Tag 28 without prior registration') do
   assert_equal [1, 2], lazy["ref"].value
 end
 
+assert('CBOR::Path wildcard + direct aref share same element lazies') do
+  docs = (0...5).map { |i| { "id" => i, "name" => "item#{i}" } }
+  buf  = CBOR.encode({ "items" => docs })
+  path = CBOR::Path.compile("$.items[*].name")
+  lazy = CBOR.decode_lazy(buf)
+
+  # path.at populates kcache for each element
+  path.at(lazy)
+
+  # direct aref must return same Lazy object (cache hit)
+  items = lazy["items"]
+  (0...5).each do |i|
+    via_path_elem  = lazy["items"][i]["name"]
+    via_aref_elem  = items[i]["name"]
+    via_dig_elem   = lazy.dig("items", i, "name")
+    assert_same via_path_elem, via_aref_elem
+    assert_same via_aref_elem, via_dig_elem
+  end
+end
+
+assert('CBOR::Path wildcard + .value cache consistent across apis') do
+  docs = (0...5).map { |i| { "id" => i, "name" => "item#{i}" } }
+  buf  = CBOR.encode({ "items" => docs })
+  path = CBOR::Path.compile("$.items[*].name")
+  lazy = CBOR.decode_lazy(buf)
+
+  # materialize via path first
+  names_via_path = path.at(lazy)
+
+  # then via direct aref + value — must be same Ruby objects (vcache hit)
+  (0...5).each do |i|
+    via_aref = lazy["items"][i]["name"].value
+    assert_same names_via_path[i], via_aref
+  end
+end
+
+assert('direct aref first, then path.at reuses populated kcache') do
+  docs = (0...5).map { |i| { "id" => i, "name" => "item#{i}" } }
+  buf  = CBOR.encode({ "items" => docs })
+  path = CBOR::Path.compile("$.items[*].name")
+  lazy = CBOR.decode_lazy(buf)
+
+  # warm kcache via direct aref first
+  pre = (0...5).map { |i| lazy["items"][i]["name"] }
+
+  # path.at must hit the existing cache — same Lazy objects
+  path.at(lazy)
+  (0...5).each do |i|
+    assert_same pre[i], lazy["items"][i]["name"]
+  end
+end
+
+assert('dig first, then path.at reuses populated kcache') do
+  docs = (0...5).map { |i| { "id" => i, "name" => "item#{i}" } }
+  buf  = CBOR.encode({ "items" => docs })
+  path = CBOR::Path.compile("$.items[*].name")
+  lazy = CBOR.decode_lazy(buf)
+
+  pre = (0...5).map { |i| lazy.dig("items", i, "name") }
+
+  path.at(lazy)
+  (0...5).each do |i|
+    assert_same pre[i], lazy.dig("items", i, "name")
+  end
+end

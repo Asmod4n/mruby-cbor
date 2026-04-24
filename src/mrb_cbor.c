@@ -306,8 +306,6 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
 // ============================================================================
 // Bytes / Text
 // ============================================================================
-static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs);
-
 static mrb_value
 decode_text(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
 {
@@ -347,6 +345,8 @@ decode_bytes(mrb_state* mrb, Reader* r, mrb_value src, uint8_t info)
   mrb_raise(mrb, E_RANGE_ERROR, "byte string out of bounds");
   return mrb_undef_value();
 }
+
+static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs);
 
 static mrb_value
 decode_array(mrb_state* mrb, Reader* r, mrb_value src,
@@ -2479,8 +2479,6 @@ static mrb_value
 lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
               mrb_value self, cbor_lazy_t *p, mrb_value sharedrefs)
 {
-  mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
-  mrb_assert(mrb_hash_p(kcache));
   mrb_int pairs = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, r->info));
   const mrb_bool key_is_str = mrb_string_p(key);
 
@@ -2503,6 +2501,8 @@ lazy_aref_map(mrb_state *mrb, Reader *r, mrb_value key,
     if (match) {
       mrb_int value_offset = cbor_pdiff(mrb, r->p, r->base);
       mrb_value lazy_new = cbor_lazy_new(mrb, p->buf, value_offset, sharedrefs);
+      mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
+      mrb_assert(mrb_hash_p(kcache));
       mrb_hash_set(mrb, kcache, key, lazy_new);
       return lazy_new;
     }
@@ -2865,7 +2865,6 @@ cbor_doc_end_rb(mrb_state *mrb, mrb_value self)
     offset);
 }
 
-#if 0
 /* ============================================================
  *  Parser: String → compiled segment list on the Path object
  *
@@ -3025,20 +3024,28 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
     mrb_value sharedrefs = mrb_iv_get(mrb, node, MRB_SYM(sharedrefs));
     mrb_assert(mrb_array_p(sharedrefs));
 
+    mrb_int sharedrefs_before = RARRAY_LEN(sharedrefs);
     major = lazy_resolve_tags(mrb, &r, p->buf, sharedrefs, &resolved);
 
     if (major == 4) {
-      /* Found the array — pull length, then iterate via cbor_lazy_aref. */
       mrb_int   len        = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
       mrb_int   nseg       = RARRAY_LEN(segments);
       mrb_value next_steps = mrb_ary_ref(mrb, segments, depth + 1);
       mrb_bool  is_leaf    = (depth == nseg - 2);
 
+      /* If lazy_resolve_tags consumed a Tag28 and registered the inner Lazy,
+       * use that Lazy (which starts at the array header, not the Tag28 byte)
+       * for cbor_lazy_aref calls. Without this, each call re-reads the Tag28
+       * and pushes a duplicate into sharedrefs, corrupting Tag29 resolution. */
+      mrb_value work_node = (RARRAY_LEN(sharedrefs) > sharedrefs_before)
+        ? mrb_ary_ref(mrb, sharedrefs, RARRAY_LEN(sharedrefs) - 1)
+        : node;
+
       mrb_value results = mrb_ary_new_capa(mrb, len);
-      int arena = mrb_gc_arena_save(mrb);
+      mrb_int arena = mrb_gc_arena_save(mrb);
 
       for (mrb_int i = 0; i < len; i++) {
-        mrb_value elem = cbor_lazy_aref(mrb, node, mrb_convert_mrb_int(mrb, i));
+        mrb_value elem = cbor_lazy_aref(mrb, work_node, mrb_convert_mrb_int(mrb, i));
         mrb_value next = path_walk_steps(mrb, elem, next_steps);
         mrb_value val  = is_leaf
           ? cbor_lazy_value(mrb, next)
@@ -3087,7 +3094,7 @@ mrb_cbor_path_at(mrb_state *mrb, mrb_value self)
     ? cbor_lazy_value(mrb, node)
     : path_walk_wildcards(mrb, node, segments, 0);
 }
-#endif
+
 MRB_BEGIN_DECL
 
 MRB_API mrb_value
@@ -3203,7 +3210,6 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, lazy, MRB_SYM(value),  cbor_lazy_value,  MRB_ARGS_NONE());
   mrb_define_method_id(mrb, lazy, MRB_SYM(dig),    cbor_lazy_dig,    MRB_ARGS_ANY());
 
-#if 0
   struct RClass *path =
     mrb_define_class_under_id(mrb, cbor, MRB_SYM(Path), mrb->object_class);
   mrb_undef_method_id(mrb, path, MRB_SYM(initialize));
@@ -3213,7 +3219,7 @@ mrb_mruby_cbor_gem_init(mrb_state* mrb)
 
   mrb_define_method_id(mrb, path, MRB_SYM(at),
     mrb_cbor_path_at, MRB_ARGS_REQ(1));
-#endif
+
 }
 
 void

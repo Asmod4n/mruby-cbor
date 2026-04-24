@@ -3230,7 +3230,6 @@ assert('CBOR bignum tag: tag 3 with non-byte-string payload raises TypeError') d
   assert_raise(TypeError) { CBOR.decode(buf) }
 end
 
-=begin
 # ============================================================================
 # CBOR::Path — [*] wildcard
 # ============================================================================
@@ -3800,7 +3799,6 @@ assert('path: heterogeneous values under wildcard') do
   p    = CBOR::Path.compile("$.xs[*]")
   assert_equal [1, "two", nil, true, [3, 4], {"k" => "v"}], p.at(lazy)
 end
-=end
 
 # ============================================================================
 # 9. Shared references — Tag 28/29 (deduplication + cyclic structures)
@@ -4398,3 +4396,4 @@ assert('CBOR sharedref: lazy path through Tag 28 without prior registration') do
   lazy = CBOR.decode_lazy(buf)
   assert_equal [1, 2], lazy["ref"].value
 end
+

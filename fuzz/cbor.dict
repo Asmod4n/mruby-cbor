@@ -1,3 +1,7 @@
+# ══════════════════════════════════════════════════════════════════════════
+# CBOR wire-level tokens — single-byte headers, length prefixes, simples
+# ══════════════════════════════════════════════════════════════════════════
+
 "\x00"
 "\x01"
 "\x17"
@@ -9,7 +13,6 @@
 "\x1a\xff\xff\xff\xff"
 "\x1b\x00\x00\x00\x00\x00\x00\x00\x00"
 "\x1b\xff\xff\xff\xff\xff\xff\xff\xff"
-
 "\x20"
 "\x37"
 "\x38\x00"
@@ -20,7 +23,6 @@
 "\x3a\xff\xff\xff\xff"
 "\x3b\x00\x00\x00\x00\x00\x00\x00\x00"
 "\x3b\xff\xff\xff\xff\xff\xff\xff\xff"
-
 "\x40"
 "\x41"
 "\x57"
@@ -30,7 +32,6 @@
 "\x59\x00\x00"
 "\x5a\x00\x00\x00\x00"
 "\x5b\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\x60"
 "\x61"
 "\x77"
@@ -39,7 +40,6 @@
 "\x79\x00\x00"
 "\x7a\x00\x00\x00\x00"
 "\x7b\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\x80"
 "\x81"
 "\x97"
@@ -48,7 +48,6 @@
 "\x99\x00\x00"
 "\x9a\x00\x00\x00\x00"
 "\x9b\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\xa0"
 "\xa1"
 "\xb7"
@@ -57,7 +56,6 @@
 "\xb9\x00\x00"
 "\xba\x00\x00\x00\x00"
 "\xbb\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\xc0"
 "\xc1"
 "\xc2"
@@ -83,7 +81,6 @@
 "\xd9\x00\x00"
 "\xda\x00\x00\x00\x00"
 "\xdb\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\xf4"
 "\xf5"
 "\xf6"
@@ -108,35 +105,173 @@
 "\xfb\xff\xf0\x00\x00\x00\x00\x00\x00"
 "\xfb\x80\x00\x00\x00\x00\x00\x00\x00"
 
+# ══════════════════════════════════════════════════════════════════════════
+# Composite CBOR structures — tag chains and malformed shapes
+# ══════════════════════════════════════════════════════════════════════════
+
 "\xc2\x41\x01"
 "\xc3\x41\x01"
 "\xd8\x1c\x81\x00"
 "\xd8\x1d\x82\x00\x01"
 "\xd8\x1d\x82\x41\x00\x42\x00\x00"
-
 "\xd8\x1c\x01"
 "\xd8\x1d\x00"
 "\xd8\x1d\x01"
 "\xd8\x1d\xff"
-
 "\x81\x81\x81\x80"
 "\xa1\x01\xa1\x01\xa0"
 "\x82\x01\x82\x02\x80"
-
 "\xa1\x61\x61\x01"
 "\xa1\x41\x00\x01"
 "\xa1\xf4\x01"
 "\xa1\xf6\x01"
-
 "\xc2\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00"
 "\xc3\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00"
-
 "\xf9\x00\x01"
 "\xfa\x00\x00\x00\x01"
 "\xfb\x00\x00\x00\x00\x00\x00\x00\x01"
-
 "\xff"
 "\x5f\xff"
 "\x7f\xff"
 "\x9f\xff"
 "\xbf\xff"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tag 39 — typed symbols (IANA registry)
+# The wire is major 6 info 24 + tag number 39. Strategy-dependent decode:
+# strat 1 expects a text string payload, strat 2 expects a uint32. Both
+# should be fuzzed against every payload shape.
+# ══════════════════════════════════════════════════════════════════════════
+
+"\xd8\x27"
+"\xd8\x27\x61a"
+"\xd8\x27\x63foo"
+"\xd8\x27\x60"
+"\xd8\x27\x04"
+"\xd8\x27\x18\xff"
+"\xd8\x27\x19\xff\xff"
+"\xd8\x27\x1a\xff\xff\xff\xff"
+"\xd8\x27\x1b\x00\x00\x00\x01\x00\x00\x00\x00"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tag 49999 — classes and modules (private tag)
+# Wire: 0xD9 0xC3 0x4F (major 6 info 25, value 0xC34F). Payload must be a
+# text string naming a defined constant; anything else raises.
+# ══════════════════════════════════════════════════════════════════════════
+
+"\xd9\xc3\x4f"
+"\xd9\xc3\x4f\x60"
+"\xd9\xc3\x4f\x66String"
+"\xd9\xc3\x4f\x67Integer"
+"\xd9\xc3\x4f\x65Float"
+"\xd9\xc3\x4f\x6bArgumentError"
+"\xd9\xc3\x4f\x68CBOR::Lazy"
+"\xd9\xc3\x4f\x01"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Common text-string map keys (CBOR-encoded)
+# These help Lazy#[] / Lazy#dig / Path executor land on real values when
+# the fuzzer produces map-shaped input. Short names match typical test and
+# benchmark fixtures (twitter-like JSON, registered-tag payloads).
+# ══════════════════════════════════════════════════════════════════════════
+
+"\x61a"
+"\x61b"
+"\x61x"
+"\x61y"
+"\x62id"
+"\x63key"
+"\x63val"
+"\x64data"
+"\x64name"
+"\x64user"
+"\x65items"
+"\x65users"
+"\x65value"
+"\x65count"
+"\x65score"
+"\x66tokens"
+"\x66active"
+"\x68statuses"
+"\x68metadata"
+"\x68entities"
+"\x6cscreen_name"
+"\x6duser_mentions"
+
+# ══════════════════════════════════════════════════════════════════════════
+# CBOR::Path parser — single-character operators and sigils
+# The hand-written state machine dispatches on these; having them in the
+# dict lets the fuzzer combine them into syntactically non-trivial paths
+# without waiting for random bytes to hit the right ASCII codepoints.
+# ══════════════════════════════════════════════════════════════════════════
+
+"$"
+"."
+"["
+"]"
+"*"
+"-"
+"\""
+
+# ══════════════════════════════════════════════════════════════════════════
+# CBOR::Path — well-formed paths
+# Cover the full grammar: dotted identifiers, bracket indices (positive,
+# negative, multi-digit), quoted keys, wildcards at root / mid / terminal,
+# adjacent [*][*], and realistic shapes from tests and benchmarks.
+# ══════════════════════════════════════════════════════════════════════════
+
+"$.a"
+"$.a.b"
+"$.a.b.c"
+"$._"
+"$._a"
+"$.a_b"
+"$.a1"
+"$[0]"
+"$[1]"
+"$[23]"
+"$[99]"
+"$[-1]"
+"$[-2]"
+"$[0][0]"
+"$[*]"
+"$.a[*]"
+"$.a[*].b"
+"$[*][*]"
+"$[*].a"
+"$[*].a[*]"
+"$.a[*].b[*]"
+"$.a[*].b[*].c"
+"$.a[0][*].b"
+"$[0][*].v"
+"$[\"key\"]"
+"$[\"a b\"]"
+"$[\"\"]"
+"$.items[*].id"
+"$.users[*].name"
+"$.rows[*][1]"
+"$.rows[1][*].v"
+"$.statuses[*].id"
+"$.statuses[*].user.screen_name"
+"$.statuses[*].entities.user_mentions[*].screen_name"
+
+# ══════════════════════════════════════════════════════════════════════════
+# CBOR::Path — known malformed inputs
+# Explicit exercise of each error-raise in the parser: invalid leading
+# char, unterminated string, unterminated bracket, empty bracket, digit-
+# leading identifier, trailing garbage after a step.
+# ══════════════════════════════════════════════════════════════════════════
+
+"$."
+"$.."
+"$..a"
+"$.a["
+"$.a[]"
+"$.a[*"
+"$.a[*]x"
+"$["
+"$[\""
+"$[abc]"
+"$.123"
+"$.a.1b"
+"$.a b"

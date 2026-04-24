@@ -583,24 +583,24 @@ decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
 static mrb_value
 decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
 {
-  mrb_assert(mrb_array_p(sharedrefs));
+  if (mrb_array_p(sharedrefs)) {
+    uint8_t ref_b     = reader_read8(mrb, r);
+    uint8_t ref_major = ref_b >> 5;
+    uint8_t ref_info  = ref_b & 0x1F;
 
-  uint8_t ref_b     = reader_read8(mrb, r);
-  uint8_t ref_major = ref_b >> 5;
-  uint8_t ref_info  = ref_b & 0x1F;
+    if (likely(ref_major == 0)) {
+      mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
+      mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
+      mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
 
-  if (likely(ref_major == 0)) {
-    mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
-    mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
-    mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
-
-    if (likely(!mrb_nil_p(found) && !mrb_undef_p(found))) {
-      return found;
+      if (likely(!mrb_nil_p(found) && !mrb_undef_p(found))) {
+        return found;
+      } else {
+        mrb_raise(mrb, E_INDEX_ERROR, "sharedref index not found");
+      }
     } else {
-      mrb_raise(mrb, E_INDEX_ERROR, "sharedref index not found");
+      mrb_raise(mrb, E_TYPE_ERROR, "sharedref payload must be unsigned integer");
     }
-  } else {
-    mrb_raise(mrb, E_TYPE_ERROR, "sharedref payload must be unsigned integer");
   }
 
   return mrb_undef_value();
@@ -804,7 +804,7 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   if (likely(!mrb_undef_p(result))) {
     return result;
   } else {
-    mrb_bug(mrb, "CBOR internal error: failed to decode value");
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR internal error: failed to decode value");
   }
 }
 
@@ -2562,7 +2562,6 @@ cbor_lazy_aref_r(mrb_state *mrb, mrb_value self, mrb_value key, mrb_int depth)
   reader_read_header(mrb, &r);
 
   mrb_value sharedrefs = mrb_iv_get(mrb, self, MRB_SYM(sharedrefs));
-  mrb_assert(mrb_array_p(sharedrefs));
   mrb_value resolved;
   uint8_t major = lazy_resolve_tags(mrb, &r, p->buf, sharedrefs, &resolved);
   switch (major) {
@@ -3019,7 +3018,6 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
     reader_read_header(mrb, &r);
 
     mrb_value sharedrefs = mrb_iv_get(mrb, node, MRB_SYM(sharedrefs));
-    mrb_assert(mrb_array_p(sharedrefs));
 
     major = lazy_resolve_tags(mrb, &r, p->buf, sharedrefs, &resolved);
 

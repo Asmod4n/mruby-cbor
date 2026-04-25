@@ -1,76 +1,52 @@
 # mruby-cbor
 
-**Fast, spec-compliant CBOR encoding and decoding for mruby.**
+Fast, spec-compliant CBOR encoding and decoding for mruby.
 
-[![RFC 8949](https://img.shields.io/badge/RFC-8949-blue)](#specification--interoperability) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-brightgreen)](#license)
-
----
-
-## What is CBOR and Why You Want It
-
-**CBOR** (Concise Binary Object Representation, [RFC 8949](https://tools.ietf.org/html/rfc8949)) is a data format like JSON, msgpack, or Protocol Buffers. It's small, fast, and human-readable in diagnostic notation. Use it when you need:
-
-- **Wire efficiency:** Encode numbers, arrays, and maps in the fewest bytes possible
-- **Language-agnostic data exchange:** Send structs between mruby and Python, Node.js, Go, Rust, etc.
-- **Self-describing types:** Distinguish between integers and floats, byte strings and text strings
-- **Recursive data structures:** Encode cyclic arrays and shared references without duplication
-- **Custom types:** Extend CBOR with application-defined tags for domain objects
-
-This gem gives you **~30% faster encoding than msgpack**, **1.3–3× faster selective decoding than simdjson** (lazy mode), and **zero security surprises**—depth limits, overflow protection, and deterministic behavior by default.
+[![RFC 8949](https://img.shields.io/badge/RFC-8949-blue)](https://tools.ietf.org/html/rfc8949) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-brightgreen)](#license)
 
 ---
 
 ## Table of Contents
 
-1. [Quick Start](#quick-start)
-2. [Installation](#installation)
-3. [Core Features](#core-features)
-4. [Usage Examples](#usage-examples)
-   - [Basic Encoding/Decoding](#basic-encodingdecoding)
-   - [Fast Encoding/Decoding](#fast-encodingdecoding)
-   - [On-Demand Decoding (Lazy)](#on-demand-decoding-lazy)
-   - [Shared References & Cyclic Structures](#shared-references--cyclic-structures)
-   - [Custom Types with `native_ext_type`](#custom-types-with-native_ext_type)
-   - [Streaming](#streaming)
-   - [Diagnostic Notation](#diagnostic-notation)
-   - [Symbol Handling](#symbol-handling)
-   - [Proc-Based Tags](#proc-based-tags)
-5. [Advanced Topics](#advanced-topics)
-6. [Determinism Guarantees](#determinism-guarantees)
-7. [Performance & Tuning](#performance--tuning)
-8. [Error Handling](#error-handling)
-9. [Specification & Interoperability](#specification--interoperability)
+- [Why CBOR?](#why-cbor)
+- [Highlights](#highlights)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Encoding & Decoding](#encoding--decoding)
+- [Lazy Decoding (`CBOR::Lazy`)](#lazy-decoding-cborlazy)
+- [Path Queries (`CBOR::Path`)](#path-queries-cborpath)
+- [Custom Types](#custom-types)
+  - [Schema DSL (`native_ext_type`)](#schema-dsl-native_ext_type)
+  - [Proc-Based](#proc-based)
+  - [Unknown Tags](#unknown-tags)
+- [Symbols](#symbols)
+- [Streaming](#streaming)
+- [Fast Path (Same-Build Only)](#fast-path-same-build-only)
+- [Diagnostic Notation](#diagnostic-notation)
+- [C-API](#c-api)
+- [Errors](#errors)
+- [Interoperability](#interoperability)
+- [Further Reading](#further-reading)
+- [License](#license)
 
 ---
 
-## Quick Start
+## Why CBOR?
 
-```ruby
-# Encode
-data = { "users" => [{ "id" => 1, "name" => "Alice" }], "count" => 1 }
-buffer = CBOR.encode(data)
-puts "Encoded #{buffer.bytesize} bytes"
+CBOR ([RFC 8949](https://tools.ietf.org/html/rfc8949)) is a binary data format with roughly the same data model as JSON. Compared to JSON: smaller wire size, faster parsing, and distinct integer/float and text/byte types. Compared to msgpack: a spec-compliant tag system for custom types, shared references for cyclic structures, and a clearly defined diagnostic notation.
 
-# Decode (eager)
-result = CBOR.decode(buffer)
-p result  # => {"users"=>[{"id"=>1, "name"=>"Alice"}], "count"=>1}
+## Highlights
 
-# Decode (lazy — access only what you need)
-lazy = CBOR.decode_lazy(buffer)
-first_user_name = lazy["users"][0]["name"].value
-puts "First user: #{first_user_name}"
+- **RFC 8949 compliant** — interoperates with Go (`fxamacker/cbor`), Python, Rust, and any spec-compliant decoder
+- **Zero-copy lazy decoding** — parse only what you access via `CBOR::Lazy`
+- **JSON-pointer-style queries** — `CBOR::Path` with `[*]` wildcard support
+- **Shared references** — Tag 28/29 for deduplication and cyclic structures
+- **Custom types** — schema DSL (`native_ext_type`) or proc-based registration
+- **Streaming** — decode CBOR sequences from strings, files, or sockets
+- **Diagnostic notation** — RFC 8949 §8.1 human-readable output
+- **Hardened** — UTF-8 validation, depth limits, overflow protection, fuzz-tested
 
-# Fast encode/decode (same-build internal use only — see below)
-buf = CBOR.encode_fast(data)
-result = CBOR.decode_fast(buf)
-
-# Shared references (deduplication + cyclic structures)
-shared = [1, 2, 3]
-obj = { "x" => shared, "y" => shared }
-buf = CBOR.encode(obj, sharedrefs: true)
-result = CBOR.decode(buf)
-result["x"].equal?(result["y"])  # => true (same object)
-```
+For deep-dive details (determinism guarantees, internal algorithms, performance tuning), see [`wiki/Internals.md`](wiki/Internals.md).
 
 ---
 
@@ -80,895 +56,293 @@ Add to your mruby `build_config.rb`:
 
 ```ruby
 MRuby::Build.new do |conf|
-  # ... other config ...
   conf.gem mgem: "mruby-cbor"
 end
 ```
 
-Then build:
+Build and test:
 
 ```bash
-cd /path/to/mruby
 rake compile
-```
-
-To run tests:
-
-```bash
 rake test
 ```
 
 ---
 
-## Core Features
-
-### Encode Everything
-
-| Type | Support | Notes |
-|------|---------|-------|
-| **Integers** | ✅ Full | Fixnum + Bigint (Tag 2/3 RFC 8949) |
-| **Floats** | ✅ Full | Preferred serialization: f16→f32→f64 (smallest lossless width) |
-| **Strings** | ✅ Full | UTF-8 text and binary byte strings |
-| **Arrays** | ✅ Full | Nested, empty, arbitrary size |
-| **Maps/Hashes** | ✅ Full | Any keys, arbitrary nesting |
-| **Booleans & Nil** | ✅ Full | `true`, `false`, `nil` |
-| **Symbols** | ✅ Full | Three modes: strip, tag+string, tag+uint32 (presym) |
-| **Classes & Modules** | ✅ Full | Auto round-trip via Tag 49999 |
-| **Custom Classes** | ✅ Full | Via `native_ext_type` DSL or `register_tag` proc |
-| **Shared Objects** | ✅ Full | Tag 28/29 for deduplication and cycles |
-
-### Zero-Copy Decoding
-
-Both eager and lazy decoding operate **directly on the input buffer without copying**:
-
-**Eager decoding:** Strings and byte strings reference the original buffer via views (no copy):
+## Quick Start
 
 ```ruby
-buf = CBOR.encode("hello world")
-result = CBOR.decode(buf)
-result.bytesize  # => 11 (string doesn't own its data, references buf)
-```
+# Encode and decode
+buf = CBOR.encode({ "users" => [{ "id" => 1, "name" => "Alice" }], "count" => 1 })
+CBOR.decode(buf)
+# => {"users"=>[{"id"=>1, "name"=>"Alice"}], "count"=>1}
 
-**Lazy decoding** (`CBOR::Lazy`) wraps the wire buffer without decoding:
+# Lazy decode — only the path you touch is parsed
+lazy = CBOR.decode_lazy(buf)
+lazy["users"][0]["name"].value           # => "Alice"
 
-```ruby
-lazy = CBOR.decode_lazy(huge_buffer)
-field = lazy["metadata"]["version"].value  # Parse only what you access
-```
+# JSON-pointer-style queries
+CBOR::Path.compile("$.users[*].name").at(lazy)   # => ["Alice"]
 
-Constant-time repeated access via built-in caching. No intermediate allocations.
-
-### Determinism & Reproducibility
-
-**Same input → same output, always.** Encoding is deterministic:
-- Float width determined by bit-pattern, not floating-point rounding
-- Hash field order follows insertion order (mruby's hash implementation)
-- NaN always encodes as canonical `0xF97E00` (quiet f16 NaN per RFC 8949)
-- Negation of large bignums computed in integer-only arithmetic, no FP edge cases
-
-See [Determinism Guarantees](#determinism-guarantees) for full details.
-
-### Security & Robustness
-
-- **Recursion depth limits** (configurable, profile-dependent default 32–128)
-- **Integer overflow protection** (explicit bounds checks, no wraparound)
-- **Buffer bounds checking** on every read (no out-of-bounds access)
-- **UTF-8 validation** (required for text strings; binary strings are untouched)
-- **Type safety** (schema-based validation for registered tags)
-- **No indefinite-length items** (use streaming instead if needed)
-
-### Streaming & Framing
-
-Decode CBOR sequences from strings, files, or sockets:
-
-```ruby
-# From a string of concatenated CBOR documents
-CBOR.stream(buf) { |doc| process(doc.value) }
-
-# From a file (with readahead for large documents)
-File.open("data.cbor") { |f| CBOR.stream(f) { |doc| ... } }
-
-# From a socket (incremental recv loop)
-CBOR.stream(socket) { |doc| ... }
+# Shared references — preserve identity, encode cycles
+shared = [1, 2, 3]
+result = CBOR.decode(CBOR.encode({ "a" => shared, "b" => shared }, sharedrefs: true))
+result["a"].equal?(result["b"])          # => true
 ```
 
 ---
 
-## Usage Examples
-
-### Basic Encoding/Decoding
+## Encoding & Decoding
 
 ```ruby
-# Integers
-CBOR.decode(CBOR.encode(42))            # => 42
-CBOR.decode(CBOR.encode(-1))            # => -1
-CBOR.decode(CBOR.encode(2**100))        # => 1267650600228229401496703205376 (bigint)
-
-# Floats
-CBOR.decode(CBOR.encode(1.5))           # => 1.5
-CBOR.decode(CBOR.encode(Float::INFINITY)) # => Infinity
-CBOR.decode(CBOR.encode(Float::NAN))    # => NaN
-
-# Strings
-CBOR.decode(CBOR.encode("hello"))       # => "hello"
-CBOR.decode(CBOR.encode("Ñoño"))        # => "Ñoño" (UTF-8 preserved)
-
-# Arrays & nested structures
-data = [1, [2, [3, 4]], "text"]
-CBOR.decode(CBOR.encode(data)) == data  # => true
-
-# Maps
-h = { "x" => 10, "y" => { "nested" => true } }
-CBOR.decode(CBOR.encode(h)) == h        # => true
+CBOR.encode(obj)                       # Canonical CBOR bytes
+CBOR.encode(obj, sharedrefs: true)     # With Tag 28/29 deduplication
+CBOR.decode(buf)                       # Eager decode — full Ruby value
+CBOR.decode_lazy(buf)                  # CBOR::Lazy wrapper, no parsing yet
+CBOR.diagnose(buf)                     # RFC 8949 §8.1 diagnostic notation
 ```
 
-### Fast Encoding/Decoding
+Supported out of the box: integers (incl. bignums), floats (`f16`/`f32`/`f64` preferred serialization), text and binary strings, arrays, hashes, booleans, `nil`, symbols, classes/modules, and any registered custom type.
 
-For high-throughput internal use where both encoder and decoder are the **same mruby build**, `encode_fast` and `decode_fast` provide a significantly faster path (~30% faster encode, ~20% faster decode on typical structured message payloads).
+---
+
+## Lazy Decoding (`CBOR::Lazy`)
+
+Wrap a buffer without decoding it; pay only for the bytes you actually read.
 
 ```ruby
-buf = CBOR.encode_fast(obj)
-obj = CBOR.decode_fast(buf)
-```
-
-**What differs from canonical encoding:**
-
-- Integers always encode at the full native width (`MRB_INT_BIT` bits), never shortest-form
-- Floats always encode at the full native width (`MRB_USE_FLOAT32` → f32, else → f64)
-- Strings, arrays, and maps use canonical shortest-form length prefixes (same as canonical)
-- Strings always encode as major type 2 (byte string) — no UTF-8 scan, no text/binary distinction
-- Symbols always encode as tag 39 + string (ignores the global symbol strategy setting)
-- Classes and modules encode as tag 49999 + name string (same as canonical)
-- Registered tags, bigints, UnhandledTag, and proc-tag types fall back to canonical encoding transparently — `encode_fast` never raises on an unsupported type
-
-**When to use:**
-
-| | `encode` / `decode` | `encode_fast` / `decode_fast` |
-|---|---|---|
-| External data / interop | ✅ | ❌ |
-| Cross-network, mixed builds | ✅ | ❌ |
-| Actor groups, same build | ✅ | ✅ faster |
-| Shared refs, bigints | ✅ | fallback to canonical |
-
-**⚠️ Critical constraint — build compatibility:**
-
-The fast wire format depends on the mruby build configuration:
-
-- `MRB_INT_BIT` (16 / 32 / 64) determines integer wire width
-- `MRB_USE_FLOAT32` determines float wire width
-
-**Buffers produced by `encode_fast` must only be decoded by `decode_fast` on a mruby binary compiled with identical settings.** Decoding a fast buffer on a different build produces silent data corruption — no error is raised, values are simply wrong.
-
-Never use `encode_fast` / `decode_fast` for:
-- Data sent across a network to nodes that may differ in build config
-- Data written to disk and read back by a different binary
-- Any context where you do not fully control both encoder and decoder
-
-For actor groups that span multiple machines, all nodes in the group must be compiled from the same mruby configuration. The group join handshake should verify `MRB_INT_BIT` and `MRB_USE_FLOAT32` explicitly before admitting a node.
-
-**C API:**
-
-```c
-mrb_value mrb_cbor_encode_fast(mrb_state *mrb, mrb_value obj);
-mrb_value mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf);
-```
-
-### On-Demand Decoding (Lazy)
-
-Parse only what you access. Perfect for large documents where you only need a few fields:
-
-```ruby
-# Wire buffer (not decoded yet)
 lazy = CBOR.decode_lazy(big_payload)
 
-# Navigate by chaining `[]` or `dig`:
-value = lazy["response"]["data"][0]["id"].value
-# Only the path you access is decoded; rest stays compressed
+# Navigate by chaining
+lazy["response"]["data"][0]["id"].value
 
-# `dig` is safe (returns nil for missing keys):
-status = lazy.dig("response", "data", "status").value
-status = lazy.dig("nonexistent", "path").value  # => nil
+# `dig` is safe — returns nil for missing keys instead of raising
+lazy.dig("maybe", "missing")             # => nil
 
-# JSON pointer-style path access — navigate deeply nested structures
-# without decoding anything outside the path:
-id = lazy.dig("response", "data", 0, "id").value
+# Negative array indices work
+lazy["items"][-1].value
 
-# Repeated access uses cache (O(1) after first access):
-id1 = lazy["response"]["data"][0]["id"].value
-id2 = lazy["response"]["data"][0]["id"].value  # Same object, no re-parse
-id1.equal?(id2)  # => true
-
-# Negative array indices work:
-last = lazy["items"][-1].value  # Last item
+# Repeated access is cached — same object back each time
+# `inspect` returns diagnostic notation for the wrapped slice
+puts lazy["items"][0].inspect            # => `{"id":1,...}`
 ```
 
-**Performance:** O(n) only in *skipped* elements, not the full document. For a 10 MB payload where you access 1% of fields, lazy decoding pays off immediately.
+Performance scales with the bytes you actually touch — perfect for large payloads where you only need a few fields.
 
-### Shared References & Cyclic Structures
+---
 
-Eliminate duplication. Represent cycles without infinite loops:
+## Path Queries (`CBOR::Path`)
+
+JSON-pointer-style path queries with `[*]` wildcard support. Compiled paths are reusable across multiple lazies.
 
 ```ruby
-# Two variables pointing to the same array
-shared_array = [1, 2, 3]
-obj = { "x" => shared_array, "y" => shared_array }
+data = {
+  "users" => [
+    { "name" => "Alice", "age" => 30 },
+    { "name" => "Bob",   "age" => 25 }
+  ]
+}
+lazy = CBOR.decode_lazy(CBOR.encode(data))
 
-# Encode with deduplication (Tag 28/29)
-buf = CBOR.encode(obj, sharedrefs: true)
+# Plain point query
+CBOR::Path.compile("$.users[0].name").at(lazy)
+# => "Alice"
 
-# Decode: identity is preserved
-decoded = CBOR.decode(buf)
-decoded["x"].equal?(decoded["y"])  # => true ✓ Same object
+# Single wildcard
+CBOR::Path.compile("$.users[*].name").at(lazy)
+# => ["Alice", "Bob"]
 
-# Cyclic structures (array containing itself)
-cyclic = []
-cyclic << cyclic
+# Nested wildcards — result mirrors the structure
+CBOR::Path.compile("$.teams[*].members[*].name").at(lazy)
+# => [["Alice", "Bob"], ["Carol"]]
 
-buf = CBOR.encode(cyclic, sharedrefs: true)
-result = CBOR.decode(buf)
-result.equal?(result[0])  # => true (self-referential)
-
-# Works with lazy decoding too:
-lazy = CBOR.decode_lazy(buf)
-decoded = lazy.value
-decoded.equal?(decoded[0])  # => true
+# Compile once, reuse across documents
+path = CBOR::Path.compile("$.items[*].id")
+ids1 = path.at(lazy_a)
+ids2 = path.at(lazy_b)
 ```
 
-**How it works:** First occurrence is tagged with Tag 28 (shareable). Subsequent references use Tag 29 (shared ref) with an index into the shareable table. On decode, the index is resolved to the already-decoded object, preserving identity.
+Grammar: `$`, `.identifier`, `[index]` (incl. negative), `["string key"]`, `[*]` wildcards. Path queries share `CBOR::Lazy`'s key cache, so repeated lookups against the same document are O(1) per step.
 
-### Custom Types with `native_ext_type`
+---
 
-Define a schema for your classes using the `native_ext_type` DSL:
+## Custom Types
+
+Two ways to register a class under a CBOR tag:
+
+### Schema DSL (`native_ext_type`)
+
+For plain Ruby classes whose state lives in instance variables:
 
 ```ruby
-class Address
-  attr_accessor :street, :city, :zip
-
-  native_ext_type :@street, String
-  native_ext_type :@city,   String
-  native_ext_type :@zip,    String
-
-  def initialize(street, city, zip)
-    @street = street
-    @city   = city
-    @zip    = zip
-  end
-end
-
 class Person
-  attr_accessor :name, :age, :address, :active
+  attr_accessor :name, :age, :email
 
-  native_ext_type :@name,    String
-  native_ext_type :@age,     Integer
-  native_ext_type :@address, Address           # Nested class!
-  native_ext_type :@active,  TrueClass, FalseClass  # Multiple types OK
+  native_ext_type :@name,  String
+  native_ext_type :@age,   Integer
+  native_ext_type :@email, String, NilClass    # nullable union
 
-  def initialize(name, age, address, active)
-    @name    = name
-    @age     = age
-    @address = address
-    @active  = active
+  def initialize(name, age, email = nil)
+    @name, @age, @email = name, age, email
   end
 
-  def _after_decode
-    puts "Person #{@name} loaded"
-    self
-  end
-
-  def _before_encode
-    @age += 1 if @age < 18  # Modify before encoding
-    self
-  end
+  # Optional hooks — called automatically
+  def _before_encode; ...; self; end
+  def _after_decode;  ...; self; end
 end
 
-# Register with a tag number
 CBOR.register_tag(1000, Person)
-CBOR.register_tag(1001, Address)
-
-# Encode
-addr   = Address.new("Main St", "Berlin", "10115")
-person = Person.new("Alice", 30, addr, true)
-
-encoded = CBOR.encode(person)
-
-# Decode (hooks are called automatically)
-decoded = CBOR.decode(encoded)  # _after_decode called
-decoded.name             # => "Alice"
-decoded.address.city     # => "Berlin"
 ```
 
-#### Nullable fields
+Type constraints accept any class plus `NilClass`. Inheritance works — `Numeric` matches both `Integer` and `Float`. Extra fields in the payload are silently ignored (allowlist model — security-positive default).
 
-Add `NilClass` to allow a field to be `nil` (CBOR null on the wire):
+### Proc-Based
 
-```ruby
-class Product
-  attr_accessor :id, :name, :price, :description, :rating
-
-  native_ext_type :@id,          Integer
-  native_ext_type :@name,        String
-  native_ext_type :@price,       Integer, NilClass  # nullable — price may be unknown
-  native_ext_type :@description, String,  NilClass  # nullable — description optional
-  native_ext_type :@rating,      Float,   NilClass  # nullable — unrated products
-
-  def initialize(id, name, price = nil, description = nil, rating = nil)
-    @id          = id
-    @name        = name
-    @price       = price
-    @description = description
-    @rating      = rating
-  end
-end
-
-CBOR.register_tag(2000, Product)
-
-# Fully populated
-p1 = Product.new(1, "Widget", 999, "A fine widget", 4.5)
-decoded = CBOR.decode(CBOR.encode(p1))
-decoded.price        # => 999
-decoded.description  # => "A fine widget"
-decoded.rating       # => 4.5
-
-# Optional fields absent — nil encodes as CBOR null (0xF6)
-p2 = Product.new(2, "Mystery item")
-decoded2 = CBOR.decode(CBOR.encode(p2))
-decoded2.price        # => nil
-decoded2.description  # => nil
-decoded2.rating       # => nil
-
-# Type enforcement still active — String is not Integer or NilClass
-p3 = Product.new(3, "Bad", "free")
-CBOR.encode(p3)  # => TypeError: CBOR tag field type mismatch for ivar @price: expected [Integer, NilClass], got String
-```
-
-Common nullable patterns:
+For types you can't add `native_ext_type` to (e.g. `Exception`, `Time`):
 
 ```ruby
-native_ext_type :@note,    String,  NilClass              # optional string
-native_ext_type :@enabled, TrueClass, FalseClass, NilClass  # boolean or absent
-native_ext_type :@score,   Integer, Float,        NilClass  # numeric union or absent
-```
-
-**Type constraints use standard Ruby classes:** `String`, `Integer`, `Float`, `Array`,
-`Hash`, `TrueClass`, `FalseClass`, `NilClass`, and any registered class. Inheritance
-works: `Numeric` matches both `Integer` and `Float`.
-
-**Security:** Only declared ivars are populated (allowlist model). Extra fields in
-the payload are silently ignored.
-
-### Streaming
-
-Decode CBOR sequences (multiple concatenated documents):
-
-```ruby
-# From a string
-buf = CBOR.encode("hello") + CBOR.encode("world") + CBOR.encode([1,2,3])
-
-results = []
-CBOR.stream(buf) { |doc| results << doc.value }
-# => ["hello", "world", [1,2,3]]
-
-# As an enumerator (no block)
-docs = CBOR.stream(buf).map(&:value)
-
-# From a file (with intelligent readahead)
-File.open("data.cbor", "rb") do |f|
-  CBOR.stream(f) { |doc| process(doc.value) }
-end
-
-# From a socket (event-driven)
-socket = TCPSocket.new("host", port)
-CBOR.stream(socket) { |doc| handle(doc.value) }
-
-# Manual socket handling (for async frameworks)
-decoder = CBOR::StreamDecoder.new { |doc| handle(doc.value) }
-while chunk = socket.recv(4096)
-  decoder.feed(chunk)
-end
-```
-
-**Dispatch rules:** Automatically detects string (via `bytesize`/`byteslice`), file (via `seek`/`read`), or socket (via `recv`), and handles buffering transparently.
-
-### Diagnostic Notation
-
-Human-readable output for debugging and logging (RFC 8949 §8.1):
-
-```ruby
-# Integers and basic types
-CBOR.diagnose(CBOR.encode(1))        # => "1"
-CBOR.diagnose(CBOR.encode(true))     # => "true"
-CBOR.diagnose(CBOR.encode(nil))      # => "null"
-
-# Floats with width suffix (_1=f16, _2=f32, _3=f64)
-CBOR.diagnose(CBOR.encode(1.0))      # => "1.0_1"   (f16, 3 bytes)
-CBOR.diagnose(CBOR.encode(1.0e10))   # => "10000000000.0_2"  (f32, 5 bytes)
-CBOR.diagnose(CBOR.encode(3.14))     # => "3.14_3"  (f64, 9 bytes)
-
-# NaN and Infinity
-CBOR.diagnose(CBOR.encode(Float::NAN))      # => "NaN_1"
-CBOR.diagnose(CBOR.encode(Float::INFINITY)) # => "Infinity_1"
-
-# Strings and bytes
-CBOR.diagnose(CBOR.encode("hello"))         # => '"hello"'
-CBOR.diagnose(CBOR.encode("\x01\x02\x03".b)) # => "h'010203'"
-
-# Containers
-CBOR.diagnose(CBOR.encode([1, [2, 3]]))     # => "[1,[2,3]]"
-CBOR.diagnose(CBOR.encode({"a" => 1}))      # => '{"a":1}'
-
-# Tags
-CBOR.diagnose("\xc1\x1a\x51\x4b\x67\xb0")   # => "1(1363896240)"
-
-# Indefinite-length items (from external sources)
-CBOR.diagnose("\x9f\x01\x02\xff")           # => "[_ 1,2]"
-CBOR.diagnose("\xbf\x61a\x01\xff")          # => "{_ \"a\":1}"
-```
-
-**`MRB_NO_FLOAT` builds:** Use exact rational arithmetic for f16/f32 and hex-float notation for f64 (RFC 8610 Appendix G), avoiding floating-point operations entirely.
-
-### Symbol Handling
-
-Three strategies, each with tradeoffs:
-
-```ruby
-# Strategy 1: Strip symbols (default, no round-trip)
-CBOR.no_symbols
-sym = :hello
-encoded = CBOR.encode(sym)
-decoded = CBOR.decode(encoded)  # => "hello" (lost the symbol!)
-
-# Strategy 2: Tag 39 + string (RFC 8949, interoperable)
-CBOR.symbols_as_string
-sym = :hello
-encoded = CBOR.encode(sym)
-decoded = CBOR.decode(encoded)  # => :hello (preserved!)
-# Works with other implementations that recognize tag 39
-
-# Strategy 3: Tag 39 + uint32 (mruby-only, fastest)
-CBOR.symbols_as_uint32
-sym = :hello
-encoded = CBOR.encode(sym)
-decoded = CBOR.decode(encoded)  # => :hello
-# Faster: just an integer ID, but requires same mruby build and presym
-
-# In data structures
-CBOR.symbols_as_string
-h = { name: "Alice", age: 30 }
-decoded = CBOR.decode(CBOR.encode(h))
-decoded[:name]  # => "Alice"
-```
-
-| Mode | Encoding | Interop | Round-trip | Speed |
-|------|----------|---------|-----------|-------|
-| `no_symbols` | Plain string | ✅ All | ❌ No | Fast |
-| `symbols_as_string` | Tag 39 + string | ✅ All | ✅ Yes | Good |
-| `symbols_as_uint32` | Tag 39 + uint32 | ❌ mruby only | ✅ Yes | Fastest |
-
-**Note:** `encode_fast` always encodes symbols as tag 39 + string regardless of the global strategy setting.
-
-**⚠️ `symbols_as_uint32` requires:**
-- Same mruby build (encoder and decoder must use identical `libmruby.a`)
-- Compile-time symbols (presym enabled)
-- No dynamic symbol creation during decoding
-
-Use `symbols_as_string` for external/untrusted data. Use `symbols_as_uint32` only for internal mruby-to-mruby IPC.
-
-### Proc-Based Tags
-
-For types that can't use `native_ext_type` (e.g., `Exception`, `Time`, or built-in C types), register encode/decode procs:
-
-```ruby
-# Exception serialization (encode + decode)
 CBOR.register_tag(50000) do
   encode Exception do |e|
     [e.class, e.message, e.backtrace]
   end
-
   decode Array do |a|
     exc = a[0].new(a[1])
     exc.set_backtrace(a[2]) if a[2]
     exc
   end
 end
-
-# Now encode and re-raise exceptions:
-buf = begin
-  raise ArgumentError, "something went wrong"
-rescue => e
-  CBOR.encode(e)
-end
-
-exc = CBOR.decode(buf)
-raise exc  # Re-raises ArgumentError with original message & backtrace
-
-# Time serialization (if mruby-time available)
-CBOR.register_tag(1) do  # Tag 1 is RFC 8949 epoch-based time
-  encode Time do |t|
-    t.to_f  # Seconds since Unix epoch as float
-  end
-
-  decode Float do |v|
-    Time.at(v)
-  end
-end
-
-CBOR.encode(Time.now)     # => tag(1, <float>)
-CBOR.decode(buf)          # => Time object
 ```
 
-**Encode type matching uses `kind_of?`:** Register `Exception` and it matches `StandardError`, `ArgumentError`, and all subclasses. Natively-encoded types (`String`, `Integer`, `Array`, `Hash`, etc.) are rejected as encode types (they're handled by the core encoder and would be ignored).
+Encode-type matching uses `kind_of?`. Built-in types (`String`, `Integer`, `Array`, etc.) cannot be registered as encode targets — they're handled by the core encoder. `Exception` is explicitly allowed.
+
+### Unknown Tags
+
+Tags you haven't registered decode as `CBOR::UnhandledTag` objects with `#tag` and `#value` readers, rather than raising. This keeps decoders forward-compatible with newer schemas.
 
 ---
 
-## Advanced Topics
+## Symbols
 
-### Classes and Modules (Tag 49999)
-
-Classes and modules round-trip automatically via a private tag (49999):
+Three encoding strategies, choose at runtime:
 
 ```ruby
-CBOR.encode(String)              # => tag(49999, "String")
-CBOR.decode(buf)                 # => String (the class itself)
-
-CBOR.encode(CBOR::UnhandledTag)  # => tag(49999, "CBOR::UnhandledTag")
-
-# In structures
-h = { "exception_type" => StandardError, "code" => 123 }
-decoded = CBOR.decode(CBOR.encode(h))
-decoded["exception_type"]  # => StandardError
-
-# Anonymous classes raise ArgumentError
-CBOR.encode(Class.new)     # Error: "cannot encode anonymous class/module"
+CBOR.no_symbols           # Default. Encode as plain string. No round-trip.
+CBOR.symbols_as_string    # Tag 39 + string.  RFC 8949 compatible.  Round-trip.
+CBOR.symbols_as_uint32    # Tag 39 + uint32.  mruby-only, fastest.   Round-trip.
 ```
 
-**mruby-to-mruby only:** The constant path syntax (`::` separator) is Ruby-specific. Other runtimes won't know how to resolve `StandardError` from the string path.
-
-### Float Encoding (Preferred Serialization)
-
-Floats use the smallest CBOR float width that represents them losslessly:
-
-```ruby
-CBOR.encode(0.0).bytesize      # => 3 bytes (f16)
-CBOR.encode(1.0).bytesize      # => 3 bytes (f16)
-CBOR.encode(1.5).bytesize      # => 3 bytes (f16)
-CBOR.encode(1.0e10).bytesize   # => 5 bytes (f32)
-CBOR.encode(3.14).bytesize     # => 9 bytes (f64)
-```
-
-**Algorithm:** Pure bit-pattern arithmetic, zero floating-point operations:
-
-| Value | Encoding | Rationale |
-|-------|----------|-----------|
-| NaN (any payload) | f16 `0x7E00` | Canonical per RFC 8949 Appendix B |
-| ±Inf, ±0 | f16 | Always representable |
-| f16 normal | f16 if exp32 ∈ [113..142] and low 13 mant bits = 0 | Lossless in f16 |
-| f16 subnormal | f16 if exp32 ∈ [103..112] and shift is exact | Lossless in f16 |
-| Fits in f32 | f32 if low 29 f64 mant bits = 0 and exp in range | Lossless in f32 |
-| Everything else | f64 | Need full precision |
-
-**`MRB_USE_FLOAT32` builds:** Start at f32 and try f16, skipping f64 entirely.
-
-**`encode_fast` floats:** Always emit at full native width (f32 or f64) with no bit-pattern analysis — faster but larger on wire.
-
-### Unhandled Tags
-
-CBOR documents may contain tags your code doesn't recognize. Rather than failing, unknown tags decode as `CBOR::UnhandledTag` objects:
-
-```ruby
-# Decode a tag(100, 42) that you didn't register
-result = CBOR.decode("\xD8\x64\x18\x2A")
-result.is_a?(CBOR::UnhandledTag)  # => true
-result.tag                         # => 100
-result.value                       # => 42
-
-# In nested structures
-result = CBOR.decode("\xD8\x64\x83\x01\x02\x03")
-result.is_a?(CBOR::UnhandledTag)   # => true
-result.value                       # => [1, 2, 3]
-```
-
-### Error Handling
-
-```ruby
-begin
-  CBOR.decode(malformed_buffer)
-rescue RangeError => e
-  # Out-of-bounds access, integer overflow, length too large
-  puts "Bounds error: #{e.message}"
-rescue RuntimeError => e
-  # Truncated buffer, invalid encoding, nesting too deep
-  puts "Runtime error: #{e.message}"
-rescue TypeError => e
-  # Type mismatch in registered tags
-  puts "Type error: #{e.message}"
-rescue KeyError => e
-  # Missing key in lazy map access (use dig for safe access)
-  puts "Missing key: #{e.message}"
-rescue NameError => e
-  # Tag 49999 resolves to unknown constant
-  puts "Unknown class: #{e.message}"
-end
-```
+Use `symbols_as_string` for cross-language interop. `symbols_as_uint32` is faster but only works between mruby builds with identical presym tables — never use it for data that crosses build boundaries.
 
 ---
 
-## Determinism Guarantees
+## Streaming
 
-This section answers: **Will the same input always produce the same output?**
+Decode multiple concatenated CBOR documents from any source:
 
-### ✅ What IS Deterministic
+```ruby
+# String of concatenated documents
+CBOR.stream(buf) { |doc| process(doc.value) }
 
-1. **Integer encoding (all bases: 2, 10, 16, etc.)**
-   - Fixnum (`mrb_int`): Encoded in varint-style (shortest form, no padding)
-   - Bignum: Converted to big-endian byte string (Tag 2/3), no lossy conversions
-   - Negative integers: Computed via `-1 - n` rule, not two's complement tricks
-   - Same integer value → same wire bytes, always, regardless of how the integer was created
-   - Example: `2**100` and `(1 << 100)` encode identically, even across mruby builds
+# File (with adaptive readahead)
+File.open("data.cbor", "rb") { |f| CBOR.stream(f) { |doc| ... } }
 
-2. **Float width selection (bit-pattern only)**
-   - A float's wire encoding depends solely on its bit-pattern, not FP rounding
-   - NaN always → canonical f16 `0xF97E00`, regardless of NaN payload or sign bit
-   - Same float value → same wire bytes, always
+# Socket
+CBOR.stream(socket) { |doc| handle(doc.value) }
 
-3. **Hash field order**
-   - Encoding follows insertion order (guaranteed in mruby)
-   - Hashes are always encoded in the order fields are created, forever
-   - Reproducible across encodes, mruby versions, and across different machines
+# Manual feed for async frameworks
+decoder = CBOR::StreamDecoder.new { |doc| handle(doc.value) }
+decoder.feed(chunk)
+```
 
-4. **Bignum negation**
-   - Negative bignums computed in pure integer arithmetic (no FP edge cases)
-   - `-n` = `-1 - (n-1)` for correctness; no rounding, no overflow surprises
+Each yielded `doc` is a `CBOR::Lazy`. The dispatch is duck-typed — anything responding to `bytesize`/`byteslice` is a string, anything responding to `seek`/`read` is a file, anything responding to `recv` is a socket.
 
-5. **Integer overflow protection**
-   - Explicit bounds checks prevent wraparound
-   - Out-of-range values raise `RangeError` consistently
-
-### ⚠️ What Is NOT Deterministic Across Builds
-
-| Factor | Impact | Details |
-|--------|--------|---------|
-| **mruby build config** | Symbols, float width range | `MRB_USE_FLOAT32`, presym settings affect encoding choices |
-| **Symbol IDs** | Non-portable across mruby binaries | Presym IDs differ between mruby builds; use `symbols_as_string` for portability |
-| **`encode_fast` integer width** | Non-portable across builds with different `MRB_INT_BIT` | Fast buffers must never cross build boundaries |
-
-**Practical: Same mruby binary + same input = same output, forever.** For cross-machine reproducibility, use `symbols_as_string` (portable) instead of `symbols_as_uint32` (binary-specific), and use `encode` / `decode` instead of `encode_fast` / `decode_fast` unless all peers share the same build.
-
-### RFC 8949 Compliance
-
-This implementation strictly follows RFC 8949:
-
-- **§3.1 (Unsigned integers):** Encoded in shortest form (varint-style)
-- **§3.2 (Negative integers):** Follows `-1 - n` rule consistently
-- **§3.3 (Byte strings):** Uninterpreted binary; no UTF-8 check
-- **§3.4 (Text strings):** Validated UTF-8; major type 3
-- **§3.5 (Arrays & maps):** Definite length only (no indefinite, use streaming instead)
-- **§4.1 (Float preferred serialization):** Smallest lossless width (f16→f32→f64)
-- **§4.2 (Simplicity values):** `false`, `true`, `null` only (not `undefined`)
-- **§3.4.3 (Bignums/Tags 2&3):** RFC 8949 zero-length payload rule respected
-- **§3.4.1 (Tags 28&29):** Shared references and identity-preserving decoding
-- **Appendix B (CBOR Canonical CBOR, CTAP2):** NaN always `0xF97E00`
+`CBOR.doc_end(buf, offset = 0)` returns the byte offset of the end of the first complete document, or `nil` if the buffer is truncated. Used internally by `stream` and exposed for custom framing.
 
 ---
 
-## Performance & Tuning
+## Fast Path (Same-Build Only)
 
-### Benchmarks (Relative, 100k iterations, `-O3 -march=native`)
+For high-throughput internal use where both encoder and decoder are the **same mruby binary**:
 
-| Operation | Canonical | Fast | Notes |
-|-----------|-----------|------|-------|
-| Encode small map | 1× | ~1.4× faster | Typical actor message |
-| Encode nested structure | 1× | ~1.3× faster | Maps + arrays |
-| Encode int array [100] | 1× | ~0.9× slower | Fixed-width integers = more bytes |
-| Decode small map | 1× | ~1.3× faster | |
-| Decode nested structure | 1× | ~1.2× faster | |
-| Decode int array [100] | 1× | ~1.1× faster | Fixed-width reads |
+```ruby
+buf = CBOR.encode_fast(obj)
+obj = CBOR.decode_fast(buf)
+```
 
-**`encode_fast` trade-off:** Fixed-width integers produce larger wire output for small values (e.g. `1` encodes as 9 bytes instead of 1). For integer-heavy payloads (large arrays of small numbers) the canonical encoder is actually faster due to lower `memcpy` volume. The fast path wins on rich structured messages with string keys and mixed scalar values — the typical actor message shape.
+Trades wire portability for speed: integers and floats use fixed native widths, strings always emit as major 2 (byte string), no UTF-8 validation. Roughly 30% faster on typical structured-message payloads.
 
-### Recursion Depth Tuning
+> [!IMPORTANT]
+> Buffers produced by `encode_fast` must only be decoded by `decode_fast` on a binary with identical `MRB_INT_BIT` and `MRB_USE_FLOAT32` settings. Otherwise data is silently corrupted with no error raised. **Never use `encode_fast` for cross-network, cross-build, or persisted data.**
 
-Default limits depend on mruby profile:
+Registered tags, bigints, `UnhandledTag`, and proc-tag types fall back to canonical encoding transparently — `encode_fast` never raises on an unsupported type.
+
+---
+
+## Diagnostic Notation
+
+```ruby
+CBOR.diagnose(CBOR.encode(1.0))           # => "1.0_1"   (suffix _1/_2/_3 = float width)
+CBOR.diagnose(CBOR.encode(3.14))          # => "3.14_3"
+CBOR.diagnose(CBOR.encode(Float::NAN))    # => "NaN_1"
+CBOR.diagnose(CBOR.encode("hello"))       # => '"hello"'
+CBOR.diagnose("\xc1\x1a\x51\x4b\x67\xb0") # => "1(1363896240)"
+```
+
+Works on `MRB_NO_FLOAT` builds — exact rational arithmetic for f16/f32, hex-float notation for f64.
+
+---
+
+## C API
+
+Public C header at `<mruby/cbor.h>`:
 
 ```c
-MRB_HIGH_PROFILE                     → CBOR_MAX_DEPTH = 128
-MRB_MAIN_PROFILE                     → CBOR_MAX_DEPTH = 64
-MRB_BASELINE_PROFILE                 → CBOR_MAX_DEPTH = 32
-Other / constrained                  → CBOR_MAX_DEPTH = 16
+mrb_value mrb_cbor_encode(mrb_state *mrb, mrb_value obj);
+mrb_value mrb_cbor_encode_sharedrefs(mrb_state *mrb, mrb_value obj);
+mrb_value mrb_cbor_encode_fast(mrb_state *mrb, mrb_value obj);
+mrb_value mrb_cbor_decode(mrb_state *mrb, mrb_value buf);
+mrb_value mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value buf);
+mrb_value mrb_cbor_lazy_value(mrb_state *mrb, mrb_value lazy);
+mrb_value mrb_cbor_decode_fast(mrb_state *mrb, mrb_value buf);
+mrb_value mrb_cbor_doc_end(mrb_state *mrb, mrb_value buf, mrb_int offset);
+void      mrb_cbor_register_tag(mrb_state *mrb, uint64_t tag_num, struct RClass *klass);
 ```
-
-Exceeding depth raises `RuntimeError: "CBOR nesting depth exceeded"`.
-
-### Memory Layout (SBO + Heap)
-
-Encoding uses a **small-buffer optimization (SBO)** with 16 KB stack buffer:
-
-- Small documents (< 16 KB) → stack only, no allocation
-- Larger → spills to heap, grows geometrically
-- No unnecessary copies; final result is the heap string
-
-### File I/O Optimization
-
-File streaming uses **adaptive readahead with doubling strategy:**
-
-1. First read: 9 bytes (minimum needed to parse any CBOR header)
-2. Use `doc_end()` to find where the document ends by skipping its contents
-3. If the buffer contains the full document: yield it, move to next
-4. If not complete: double the read size, re-read from the same offset, retry
-5. Continue doubling until the full document is buffered
-6. Then read exactly the remaining bytes needed (if any) to avoid over-reading
 
 ---
 
-## Error Handling
+## Errors
 
-| Error | Cause | Example |
-|-------|-------|---------|
-| `ArgumentError` | Invalid option or reserved tag number | `CBOR.encode(obj, invalid: true)` |
-| `RangeError` | Integer overflow or invalid length | Encoding bigint larger than wire allows |
-| `RuntimeError` | Malformed CBOR or depth exceeded | Truncated buffer, nested too deep |
-| `TypeError` | Type mismatch in registered tag or unknown source | Field is Array but schema expects String |
-| `KeyError` | Lazy map access to missing key | `lazy["nonexistent"]` (use `.dig` for safe access) |
-| `IndexError` | Lazy array out of bounds or invalid shared ref | `lazy[999]` on 3-item array |
-| `NameError` | Unknown constant in Tag 49999 | Decoding a class name not defined on this side |
-| `NotImplementedError` | Indefinite-length or presym unavailable | `CBOR.symbols_as_uint32` on non-presym mruby |
+| Error | Cause |
+|-------|-------|
+| `ArgumentError`        | Invalid option, anonymous class, reserved tag number |
+| `RangeError`           | Integer overflow, length out of range, buffer bounds violation |
+| `RuntimeError`         | Malformed CBOR, depth exceeded, sharedref cycle in lazy resolution |
+| `TypeError`            | Type mismatch in registered tag, wrong tag payload type |
+| `KeyError`             | Lazy map access to missing key (use `dig` for safe access) |
+| `IndexError`           | Lazy array out of bounds, invalid sharedref index |
+| `NameError`            | Tag 49999 resolves to unknown constant |
+| `NotImplementedError`  | Indefinite-length item, presym unavailable for `symbols_as_uint32` |
 
 ---
 
-## Specification & Interoperability
+## Interoperability
 
-### CBOR RFC 8949
+Tested against `fxamacker/cbor` v2 (Go) in strict mode — preferred serialization, UTF-8 validation, duplicate-key rejection, indefinite-length rejection. 63/63 checks pass including byte-level wire equality for all scalar types. Run `interop_go/main.go` to verify against your build.
 
-Full RFC 8949 compliance. Official specification: https://tools.ietf.org/html/rfc8949
+Should interoperate with any RFC 8949-compliant decoder; the official RFC 8949 Appendix A test vectors are included in `test-vectors/` and run as part of `rake test`.
 
-- RFC 8949 Section 1–6: Complete support (except indefinite-length)
-- RFC 8949 Appendix A–D: Diagnostic notation, CDDL, CBOR in JSON, test vectors
+---
 
-### Interoperability
+## Further Reading
 
-Tested against:
+The wiki covers what isn't part of the everyday API:
 
-- **Go:** `fxamacker/cbor` v2 in strict mode (preferred serialization, UTF-8 validation, duplicate key rejection) — 63/63 checks pass including wire-level byte equality for all scalar types. See `interop_go/`.
-
-**RFC 8949 compliance:** This implementation strictly adheres to RFC 8949, so it should interoperate with any spec-compliant CBOR decoder in any language.
-
-### Test Vectors
-
-Official RFC 8949 test vectors (Appendix A) included in `/test-vectors/`. Run:
-
-```ruby
-# Validate against official vectors
-rake test
-```
+- [`wiki/Internals.md`](wiki/Internals.md) — float-encoding algorithm, sharedref bookkeeping, lazy architecture, fast wire format, depth tracking, RFC 8949 compliance breakdown, determinism guarantees, performance benchmarks and tuning.
 
 ---
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) file.
+Apache License 2.0. See [LICENSE](LICENSE).
 
----
-
-## Contributing
-
-Issues, PRs, and bug reports welcome. See `interop_go/` for testing against Go's `fxamacker/cbor`.
-
----
-
-## Advanced Reference: Implementation Details
-
-### Float Encoding Algorithm (Pure Bit-Pattern, Zero FP Ops)
-
-```
-1. Extract sign, exponent, mantissa from f64 bit-pattern
-2. If NaN: emit canonical f16 0xF97E00, done
-3. If can fit in f32 (29 low mant bits = 0, exp in range): continue to f16 check
-4. If can fit in f16 (subnormal or normal range checks): emit f16
-5. If fits in f32: emit f32
-6. Else: emit f64
-
-Key insight: No float rounding—entire algorithm is integer bit manipulation.
-```
-
-### Fast Encoding Algorithm
-
-```
-For each value:
-  integer  → fixed-width (MRB_INT_BIT / 8 bytes), major 0 or 1
-  float    → fixed-width (sizeof(mrb_float) bytes), 0xFA or 0xFB
-  string   → canonical length prefix + bytes, no UTF-8 check
-  array    → canonical length prefix + fast-encoded elements
-  map      → canonical length prefix + fast-encoded pairs
-  symbol   → tag 39 + canonical length + name bytes (always string, no strategy)
-  class    → tag 49999 + canonical length + name bytes
-  other    → fall back to canonical encode_value
-
-Key insight: Only scalars are fixed-width. Structural lengths remain shortest-form
-so container overhead is identical to canonical.
-```
-
-### Shared Reference Algorithm (Tag 28/29)
-
-**Encoding:** When `sharedrefs: true`, maintain a hash of seen objects by `mrb_obj_id`:
-
-```
-1. Pre-pass (skip_cbor): Walk the object graph, tagging each unique object once with Tag 28
-2. Encode: When re-encountering an object, emit Tag 29 + index into shareable table
-3. Identity preserved: Decoder maintains a parallel array, resolving indexes to same decoded objects
-```
-
-**Decoding:**
-
-```
-1. Tag 28 (Shareable): Decode the wrapped value, push to shareable table
-2. Tag 29 (Shared ref): Read index, fetch from shareable table, return that object
-3. Result: `decoded["x"].equal?(decoded["y"])` is true if `obj["x"]` and `obj["y"]` were identical
-```
-
-### Lazy Decoding Architecture (Zero-Copy, On-Demand)
-
-**Key insight: Lazy object is a (buffer, offset, key-cache) triple**
-
-```
-1. cbor_lazy_new: Create Lazy wrapping buffer + offset, cache empty
-2. lazy["key"]: Seek to offset, decode just enough to find key, create new Lazy for value, cache result
-3. lazy.value: Decode from current offset, return fully-realized value, cache in vcache
-4. Repeated access: Fetch from cache (O(1))
-```
-
-Buffer is **not copied**; each Lazy view just changes the offset. Perfect for partial extraction from large files.
-
-### BigInt Encoding (Tag 2/3)
-
-**RFC 8949 §3.4.3:** Bignums outside int64 range encoded as:
-
-- Tag 2: Positive bigint as byte string (big-endian)
-- Tag 3: Negative bigint as byte string (|magnitude| - 1, big-endian)
-
-Example: `(1 << 200) + 1` → Tag 2 wrapping 26-byte hex string
-
-**Zero-length payloads:** `tag(2, h'') = 0`, `tag(3, h'') = -1` (edge case handled per RFC 8949)
-
-### Symbol Encoding Strategies
-
-| Mode | Wire Format | Lookup Speed | Interop |
-|------|-------------|--------------|---------|
-| `no_symbols` | Plain string | N/A | Universal, loses type |
-| `symbols_as_string` | Tag 39 + string | O(string compare) | RFC 8949 compatible |
-| `symbols_as_uint32` | Tag 39 + uint32 | O(array index) | mruby-only, requires presym |
-| `encode_fast` (any mode) | Tag 39 + string | O(string compare) | RFC 8949 compatible |
-
-**Presym IDs are non-portable:** Symbol ID 42 on your mruby might be ID 100 on another mruby built with different `--enable-presym-inline` settings.
-
-### Stack Overflow Prevention (Depth Tracking)
-
-Each decode call increments a per-Reader depth counter. At `CBOR_MAX_DEPTH`, raises `RuntimeError`. Prevents:
-
-```
-- Deeply nested arrays: [[[[[...]]]]]]
-- Deeply nested maps: {"a": {"a": {"a": ...}}}
-- Circular references without sharedrefs (would loop forever)
-```
-
-Limit is configurable at compile time and profile-aware.
-
-### String Encoding (UTF-8 vs Binary Auto-Detection)
-
-When **encoding**, strings are automatically classified:
-
-```ruby
-# UTF-8 string → encoded as text (major type 3)
-CBOR.encode("hello")  # => major 3 (text string)
-
-# Binary string → encoded as bytes (major type 2)
-CBOR.encode("\x00\xFF\xFE".b)  # => major 2 (byte string)
-```
-
-The encoder checks each string's UTF-8 validity at encode time and chooses the appropriate major type (3 for text, 2 for binary).
-
-When **decoding**, text strings (major type 3) are validated as UTF-8 **when mruby is compiled with `MRB_UTF8_STRING`**. If mruby was compiled without UTF-8 string support, the validation is skipped (the strings are still decoded, just not validated).
-
-`encode_fast` always emits strings as major type 2 (byte string), regardless of content. The fast wire format is mruby-to-mruby only — the text/binary distinction does not apply at that layer.
-
----
-
-**Built with ❤️ for mruby. Fast. Reliable. Deterministic.**
+Issues, PRs, and bug reports welcome.

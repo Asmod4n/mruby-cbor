@@ -1913,6 +1913,7 @@ cbor_decode_fast_rb(mrb_state *mrb, mrb_value self)
 typedef struct {
   mrb_value buf;
   mrb_int   offset;
+  mrb_bool  evaluating;
 } cbor_lazy_t;
 
 static const struct mrb_data_type cbor_lazy_type = {
@@ -1931,6 +1932,7 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedref
 
   p->buf    = buf;
   p->offset = offset;
+  p->evaluating = FALSE;
   mrb_value obj = mrb_obj_value(data);
   mrb_iv_set(mrb, obj, MRB_SYM(buf),        buf);
   mrb_iv_set(mrb, obj, MRB_SYM(vcache),     mrb_undef_value());
@@ -2413,6 +2415,9 @@ cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
   if (!mrb_undef_p(vcache)) return vcache;
 
   cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
+  if (unlikely(p->evaluating))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR shared reference cycle detected");
+  p->evaluating = TRUE;
   const uint8_t *base  = (const uint8_t*)RSTRING_PTR(p->buf);
   size_t total_len     = (size_t)RSTRING_LEN(p->buf);
   mrb_value sharedrefs = mrb_iv_get(mrb, self, MRB_SYM(sharedrefs));
@@ -2425,6 +2430,7 @@ cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
     if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) {
       value = cbor_lazy_value_r(mrb, value, r.depth + 1);
     }
+    p->evaluating = FALSE;
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
@@ -2517,7 +2523,10 @@ lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value buf,
                   mrb_value sharedrefs, mrb_value *resolved_out)
 {
   *resolved_out = mrb_undef_value();
+  mrb_int tag_depth = 0;
   while (r->major == 6) {
+    if (unlikely(tag_depth++ >= CBOR_MAX_DEPTH))
+      mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR tag chain depth exceeded");
     mrb_value tag = read_cbor_uint(mrb, r, r->info);
     if (mrb_cmp(mrb, tag, mrb_fixnum_value(29)) == 0) {
       *resolved_out = decode_tag_sharedref(mrb, r, sharedrefs);
@@ -2567,9 +2576,17 @@ cbor_lazy_aref_r(mrb_state *mrb, mrb_value self, mrb_value key, mrb_int depth)
   switch (major) {
     case 4: return lazy_aref_array(mrb, &r, key, self, p, sharedrefs);
     case 5: return lazy_aref_map(mrb, &r, key, self, p, sharedrefs);
-    case 0xFF:
-      if (mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type))
+    case 0xFF: {
+      cbor_lazy_t *rp = mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type);
+      if (rp) {
+        cbor_lazy_t *rp = mrb_data_get_ptr(mrb, resolved, &cbor_lazy_type);
+        if (unlikely(rp->evaluating))
+          mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR shared reference cycle detected");
+
         return cbor_lazy_aref_r(mrb, resolved, key, depth + 1);
+      }
+    }
+
       /* fall through */
     default:
       mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
@@ -3010,8 +3027,10 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
 {
   mrb_value resolved;
   uint8_t major;
-
+  mrb_int resolve_depth = 0;
   for (;;) {
+    if (unlikely(resolve_depth++ >= CBOR_MAX_DEPTH))
+        mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR shared reference cycle in path wildcard");
     cbor_lazy_t *p = mrb_data_get_ptr(mrb, node, &cbor_lazy_type);
     Reader r;
     lazy_reader_init(mrb, &r, p);

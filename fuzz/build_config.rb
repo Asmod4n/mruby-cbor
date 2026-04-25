@@ -5,8 +5,8 @@ MRuby::Build.new do |conf|
 
   conf.enable_debug
   conf.enable_bintest
-  conf.cc.defines  << 'MRB_UTF8_STRING' << 'MRB_HIGH_PROFILE'
-  conf.cxx.defines << 'MRB_UTF8_STRING' << 'MRB_HIGH_PROFILE'
+  conf.cc.defines  << 'MRB_UTF8_STRING' << 'MRB_HIGH_PROFILE' << 'MRB_USE_MALLOC_TRIM'
+  conf.cxx.defines << 'MRB_UTF8_STRING' << 'MRB_HIGH_PROFILE' << 'MRB_USE_MALLOC_TRIM'
   conf.gem '../'
   conf.gem File.expand_path(__dir__)
 end

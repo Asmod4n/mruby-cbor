@@ -2,6 +2,7 @@
 #include <mruby/error.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 
 static mrb_state *mrb     = NULL;
 static size_t     counter = 0;
@@ -158,13 +159,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   }
 
   mrb_gc_arena_restore(mrb, 0);
-  mrb_incremental_gc(mrb);
 
-  if (++counter > 10000) {
-    mrb_close(mrb);
-    mrb     = NULL;
-    counter = 0;
-  }
 
   return 0;
 }

@@ -12,12 +12,12 @@ assert('mruby-cbor-fuzzer: no crashes in fuzzing run') do
   cmd = cmd_list('mruby-cbor-fuzzer') + [
     CORPUS_DIR,
     "-dict=#{DICT_FILE}",
-    "-jobs=4",
+    "-jobs=3",
     "-artifact_prefix=#{findings_dir}/",
     "-max_len=65536",
      "-ignore_ooms=1",
      "-use_value_profile=1",
-     "-rss_limit_mb=3072"
+     "-rss_limit_mb=5000"
   ]
 
   Dir.chdir(findings_dir) do

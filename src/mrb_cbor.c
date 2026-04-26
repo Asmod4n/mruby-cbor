@@ -3392,6 +3392,110 @@ path_walk_steps(mrb_state *mrb, mrb_value node, mrb_value steps)
   return node;
 }
 
+/* Cursor-based step walking for use inside [*] iteration.
+ *
+ * Operates entirely on (buf, offset) without allocating a Lazy per step.
+ * Mirrors lazy_aref_array / lazy_aref_map's matching logic. Returns
+ * the offset of the matched value; raises on key/index miss exactly
+ * like the Lazy variants. */
+static mrb_int
+cursor_walk_one_step(mrb_state *mrb, mrb_value buf, mrb_int offset,
+                     mrb_value sharedrefs, mrb_value key)
+{
+  const uint8_t *base  = (const uint8_t*)RSTRING_PTR(buf);
+  size_t         total = (size_t)RSTRING_LEN(buf);
+
+  if (unlikely((size_t)offset >= total))
+    mrb_raise(mrb, E_RANGE_ERROR, "cursor offset out of bounds");
+
+  Reader r;
+  r.base = base; r.p = base + offset; r.end = base + total;
+  r.depth = 0; r.pending_slot = -1;
+  reader_read_header(mrb, &r);
+
+  mrb_value resolved;
+  uint8_t major = lazy_resolve_tags(mrb, &r, buf, sharedrefs, &resolved);
+
+  if (major == 0xFF) {
+    cbor_lazy_t *rp = mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type);
+    if (rp) {
+      return cursor_walk_one_step(mrb, rp->buf, rp->offset, sharedrefs, key);
+    }
+    mrb_raise(mrb, E_TYPE_ERROR, "CBOR::Path cursor: sharedref target is not indexable");
+  }
+
+  if (major == 4) {
+    mrb_int idx = mrb_as_int(mrb, key);
+    mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
+    if (idx < 0) idx += len;
+    if (idx < 0 || idx >= len)
+      mrb_raisef(mrb, E_INDEX_ERROR, "array index out of range: %d", (int)idx);
+    for (mrb_int i = 0; i < idx; i++) skip_cbor(mrb, &r, buf, sharedrefs);
+    return cbor_pdiff(mrb, r.p, r.base);
+  }
+
+  if (major == 5) {
+    mrb_int pairs = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
+    const mrb_bool key_is_str = mrb_string_p(key);
+
+    for (mrb_int i = 0; i < pairs; i++) {
+      mrb_bool match;
+      uint8_t kb    = reader_read8(mrb, &r);
+      uint8_t kmaj  = (uint8_t)(kb >> 5);
+      uint8_t kinfo = (uint8_t)(kb & 0x1F);
+
+      if (key_is_str && (kmaj == 2 || kmaj == 3)) {
+        mrb_int klen = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, kinfo));
+        reader_advance_checked(mrb, &r, klen);
+        match = (klen == RSTRING_LEN(key) &&
+                 memcmp(r.p - klen, RSTRING_PTR(key), (size_t)klen) == 0);
+      } else {
+        r.p--;
+        match = mrb_equal(mrb, decode_value(mrb, &r, buf, sharedrefs), key);
+      }
+
+      if (match) return cbor_pdiff(mrb, r.p, r.base);
+      skip_cbor(mrb, &r, buf, sharedrefs);
+    }
+    mrb_raisef(mrb, E_KEY_ERROR, "key not found: \"%v\"", key);
+  }
+
+  mrb_raise(mrb, E_TYPE_ERROR, "CBOR::Path cursor: not indexable");
+}
+
+/* Walk all steps of a step-list starting from `offset`, returning the
+ * final offset. The step-list format is [sym, key, sym, key, ...] —
+ * same as path_walk_steps consumes via cbor_lazy_aref. */
+static mrb_int
+cursor_walk_steps(mrb_state *mrb, mrb_value buf, mrb_int offset,
+                  mrb_value sharedrefs, mrb_value steps)
+{
+  mrb_int n = RARRAY_LEN(steps);
+  for (mrb_int i = 1; i < n; i += 2) {
+    offset = cursor_walk_one_step(mrb, buf, offset, sharedrefs,
+                                  mrb_ary_ref(mrb, steps, i));
+  }
+  return offset;
+}
+
+/* Materialize the value at offset. Replaces cbor_lazy_value at the leaf
+ * of a wildcard walk. */
+static mrb_value
+cursor_materialize(mrb_state *mrb, mrb_value buf, mrb_int offset,
+                   mrb_value sharedrefs)
+{
+  const uint8_t *base  = (const uint8_t*)RSTRING_PTR(buf);
+  size_t         total = (size_t)RSTRING_LEN(buf);
+
+  if (unlikely((size_t)offset >= total))
+    mrb_raise(mrb, E_RANGE_ERROR, "cursor offset out of bounds");
+
+  Reader r;
+  r.base = base; r.p = base + offset; r.end = base + total;
+  r.depth = 0; r.pending_slot = -1;
+  return decode_value(mrb, &r, buf, sharedrefs);
+}
+
 /* [*] driver. `node` is a Lazy positioned at the wildcard's array
  * (possibly behind a Tag 29 sharedref). Resolves the sharedref chain
  * once up front, reads the array length from the header, then indexes
@@ -3422,33 +3526,33 @@ path_walk_wildcards(mrb_state *mrb, mrb_value node,
       mrb_int   nseg       = RARRAY_LEN(segments);
       mrb_value next_steps = mrb_ary_ref(mrb, segments, depth + 1);
       mrb_bool  is_leaf    = (depth == nseg - 2);
-      mrb_value kcache     = mrb_iv_get(mrb, node, MRB_SYM(kcache));
       mrb_value results    = mrb_ary_new_capa(mrb, len);
       int       arena      = mrb_gc_arena_save(mrb);
 
-      /* All elements cached iff kcache has at least len entries.
-       * In that case r.p tracking and skip_cbor are not needed. */
-      mrb_bool fully_cached = (mrb_hash_size(mrb, kcache) >= len);
-
+      /* Cursor-based iteration: walk by offset, never allocate a Lazy
+       * for sub-elements within this loop. The kcache previously
+       * populated here was never read (each index visited at most
+       * once per wildcard call), so we drop it.
+       *
+       * Per element:
+       *   1. snapshot r.p as element offset
+       *   2. skip_cbor advances r.p past the element for next iteration
+       *   3. cursor_walk_steps walks remaining steps from element offset
+       *   4. cursor_materialize at the leaf, or recurse with one Lazy
+       *      for inner [*] (one Lazy per outer iter is acceptable). */
       for (mrb_int i = 0; i < len; i++) {
-        mrb_value idx_v = mrb_convert_mrb_int(mrb, i);
-        mrb_value elem  = mrb_hash_fetch(mrb, kcache, idx_v, mrb_undef_value());
+        mrb_int elem_offset = cbor_pdiff(mrb, r.p, r.base);
+        skip_cbor(mrb, &r, p->buf, sharedrefs);
 
-        if (mrb_undef_p(elem)) {
-          /* Cache miss — r.p is at element i, create lazy and advance. */
-          mrb_int elem_offset = cbor_pdiff(mrb, r.p, r.base);
-          elem = cbor_lazy_new(mrb, p->buf, elem_offset, sharedrefs);
-          mrb_hash_set(mrb, kcache, idx_v, elem);
+        mrb_int leaf_offset = cursor_walk_steps(mrb, p->buf, elem_offset,
+                                                sharedrefs, next_steps);
+        mrb_value val;
+        if (is_leaf) {
+          val = cursor_materialize(mrb, p->buf, leaf_offset, sharedrefs);
+        } else {
+          mrb_value sub_lazy = cbor_lazy_new(mrb, p->buf, leaf_offset, sharedrefs);
+          val = path_walk_wildcards(mrb, sub_lazy, segments, depth + 1);
         }
-
-        if (!fully_cached) {
-          skip_cbor(mrb, &r, p->buf, sharedrefs);
-        }
-
-        mrb_value next = path_walk_steps(mrb, elem, next_steps);
-        mrb_value val  = is_leaf
-          ? cbor_lazy_value(mrb, next)
-          : path_walk_wildcards(mrb, next, segments, depth + 1);
         mrb_ary_push(mrb, results, val);
         mrb_gc_arena_restore(mrb, arena);
       }

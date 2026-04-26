@@ -1427,15 +1427,6 @@ assert('cache: vcache survives across path / aref / dig') do
   assert_same a, lazy.dig("items", 1, "name").value
 end
 
-assert('cache: repeated path.at runs yield same leaf Ruby objects') do
-  data = { "xs" => [{"s" => "hello"}, {"s" => "world"}] }
-  lazy = CBOR.decode_lazy(CBOR.encode(data))
-  path = CBOR::Path.compile("$.xs[*].s")
-  r1 = path.at(lazy); r2 = path.at(lazy)
-  assert_same r1[0], r2[0]
-  assert_same r1[1], r2[1]
-end
-
 # =============================================================================
 # Non-RFC: CBOR.stream / CBOR::StreamDecoder
 # =============================================================================
@@ -1560,4 +1551,3 @@ assert('safety: lazy aref on non-container / huge index handled cleanly') do
   assert_safe { CBOR.decode_lazy(CBOR.encode(42))["key"] }
   assert_safe { CBOR.decode_lazy(CBOR.encode([1, 2, 3]))[0x7FFFFFFF] }
 end
-

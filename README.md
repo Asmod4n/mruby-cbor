@@ -46,7 +46,7 @@ CBOR ([RFC 8949](https://tools.ietf.org/html/rfc8949)) is a binary data format w
 - **Diagnostic notation** — RFC 8949 §8.1 human-readable output
 - **Hardened** — UTF-8 validation, depth limits, overflow protection, fuzz-tested
 
-For deep-dive details (determinism guarantees, internal algorithms, performance tuning), see [`wiki/Internals.md`](wiki/Internals.md).
+For deep-dive details (determinism guarantees, internal algorithms, performance tuning), see [`wiki/Internals`](../../wiki/Internals).
 
 ---
 
@@ -337,7 +337,7 @@ Should interoperate with any RFC 8949-compliant decoder; the official RFC 8949 A
 
 The wiki covers what isn't part of the everyday API:
 
-- [`wiki/Internals.md`](wiki/Internals.md) — float-encoding algorithm, sharedref bookkeeping, lazy architecture, fast wire format, depth tracking, RFC 8949 compliance breakdown, determinism guarantees, performance benchmarks and tuning.
+- [`wiki/Internals`](../../wiki/Internals) — float-encoding algorithm, sharedref bookkeeping, lazy architecture, fast wire format, depth tracking, RFC 8949 compliance breakdown, determinism guarantees, performance benchmarks and tuning.
 
 ---
 

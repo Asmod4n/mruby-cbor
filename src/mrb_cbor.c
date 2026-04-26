@@ -44,6 +44,73 @@ MRB_END_DECL
  * distinction is irrelevant at that layer. */
 #define CBOR_FAST_STRING_TYPE 2
 
+/* ============================================================================
+ * Sharedrefs storage
+ *
+ * `sharedrefs` is a Ruby Array of shareable values, indexed by encoder slot:
+ * sharedrefs[N] is the value referred to by Tag 29 with index N.
+ *
+ * To make registration idempotent across multiple traversals of the same
+ * wire bytes (e.g. lazy.value followed by lazy[i].value), we attach an
+ * offset_map (payload_offset -> slot) Hash as an ivar on the sharedrefs
+ * array. Any Tag 28 site that finds its payload offset already in the map
+ * reuses the existing slot instead of allocating a new one — this is what
+ * makes `full[0].equal?(lazy[0].value)` hold for shared references.
+ *
+ * The offset_map is created lazily on first registration, so documents
+ * without Tag 28s pay no overhead.
+ * ========================================================================= */
+
+/* sharedrefs layout:
+ *   [0] = HWM (mrb_int) — highest payload offset registered. Used by
+ *         skip_cbor / lazy_resolve_tags as a cheap "already registered?"
+ *         check during monotonic forward traversal.
+ *   [1] = offset_map (Hash) — payload_offset -> slot. Used by
+ *         decode_tag_sharedrefs and cbor_lazy_value_r to find the slot
+ *         for a known offset (re-decode detection, placeholder routing).
+ *   [N+2..] = the shareable values themselves; encoder slot N is at
+ *             sharedrefs[N + CBOR_SHAREDREFS_INDEX_BIAS]. */
+#define CBOR_SHAREDREFS_INDEX_BIAS 2
+
+static mrb_value
+sharedrefs_new(mrb_state *mrb)
+{
+  mrb_value a = mrb_ary_new_capa(mrb, 4);
+  mrb_ary_push(mrb, a, mrb_fixnum_value(0)); /* slot 0: HWM */
+  mrb_ary_push(mrb, a, mrb_hash_new(mrb));   /* slot 1: offset_map */
+  return a;
+}
+
+static mrb_int
+sharedrefs_hwm(mrb_state *mrb, mrb_value sharedrefs)
+{
+  mrb_value v = mrb_ary_ref(mrb, sharedrefs, 0);
+  return mrb_integer_p(v) ? mrb_integer(v) : 0;
+}
+
+static mrb_int
+sharedrefs_lookup_offset(mrb_state *mrb, mrb_value sharedrefs, mrb_int offset)
+{
+  mrb_value m = mrb_ary_ref(mrb, sharedrefs, 1);
+  if (!mrb_hash_p(m)) return -1;
+  mrb_value v = mrb_hash_fetch(mrb, m, mrb_fixnum_value(offset), mrb_undef_value());
+  return mrb_integer_p(v) ? mrb_integer(v) : -1;
+}
+
+static void
+sharedrefs_register_offset(mrb_state *mrb, mrb_value sharedrefs,
+                           mrb_int offset, mrb_int slot)
+{
+  mrb_value m = mrb_ary_ref(mrb, sharedrefs, 1);
+  if (likely(mrb_hash_p(m))) {
+    mrb_hash_set(mrb, m, mrb_fixnum_value(offset), mrb_fixnum_value(slot));
+  }
+  /* Advance HWM so skip_cbor's monotonic check covers this entry too. */
+  if (offset > sharedrefs_hwm(mrb, sharedrefs)) {
+    mrb_ary_set(mrb, sharedrefs, 0, mrb_fixnum_value(offset));
+  }
+}
+
 typedef struct {
   const uint8_t *base;
   const uint8_t *p;
@@ -53,6 +120,23 @@ typedef struct {
   uint8_t        major;
   uint8_t        info;
 } Reader;
+
+/* Lazy struct + data type defined here (rather than near the bottom of the
+ * file) because decode_tag_sharedref needs to identify Lazy placeholders in
+ * sharedrefs slots, and decode_tag_sharedrefs / cbor_lazy_value_r refer to
+ * each other across this boundary. The Lazy method bodies remain at the
+ * bottom of the file. */
+typedef struct {
+  mrb_value buf;
+  mrb_int   offset;
+  mrb_bool  evaluating;
+  mrb_bool  initialized;  /* FALSE = raw (only buf ivar set);
+                             TRUE  = full (vcache/kcache/sharedrefs ivars set) */
+} cbor_lazy_t;
+
+static const struct mrb_data_type cbor_lazy_type = {
+  "CBOR::Lazy", mrb_free
+};
 
 static uint8_t
 reader_read8(mrb_state* mrb, Reader* r)
@@ -99,12 +183,18 @@ typedef struct {
   mrb_state *mrb;
   char      *heap_ptr;
   mrb_value  heap_str;
-  mrb_value  seen;
+  mrb_value  counts;     /* obj_id -> refcount (Pass 1).
+                            mrb_undef_value() = sharedrefs encoding inactive. */
+  mrb_value  slots;      /* obj_id -> assigned slot (Pass 2, lazy). */
+  mrb_value  proc_cache; /* obj_id -> transformed value (proc tag encode-proc
+                            results / _before_encode results); cached in Pass 1
+                            to avoid re-invocation in Pass 2. */
   size_t     stack_len;
   size_t     heap_len;
   size_t     heap_capa;
   mrb_int    arena_index;
   mrb_int    depth;
+  mrb_int    next_slot;  /* next sharedref slot index (Pass 2). */
 } CborWriter;
 
 /* Forward declarations */
@@ -114,6 +204,11 @@ static mrb_value cbor_proc_tag_registry(mrb_state *mrb);
 static mrb_value cbor_proc_tag_rev_registry(mrb_state *mrb);
 static void      encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num);
 static mrb_value decode_registered_tag(mrb_state *mrb, Reader *r, mrb_value src, mrb_value sharedrefs, mrb_value klass);
+static void      skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs);
+static mrb_value cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth);
+static mrb_value cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedrefs);
+static mrb_value cbor_lazy_new_raw(mrb_state *mrb, mrb_value buf, mrb_int offset);
+static void      cbor_lazy_ensure_initialized(mrb_state *mrb, mrb_value self, mrb_value sharedrefs);
 
 static mrb_int
 cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
@@ -350,15 +445,15 @@ static mrb_value decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_valu
 
 static mrb_value
 decode_array(mrb_state* mrb, Reader* r, mrb_value src,
-             uint8_t info, mrb_value sharedrefs, bool reg)
+             uint8_t info, mrb_value sharedrefs, mrb_int reg_slot)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_len_to_mrb_int(mrb, len_v);
   mrb_value ary = mrb_ary_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
-  if (reg && mrb_array_p(sharedrefs)) {
-    mrb_ary_push(mrb, sharedrefs, ary);
+  if (reg_slot >= 0 && mrb_array_p(sharedrefs)) {
+    mrb_ary_set(mrb, sharedrefs, reg_slot, ary);
   }
 
   for (mrb_int i = 0; i < len; i++) {
@@ -371,15 +466,15 @@ decode_array(mrb_state* mrb, Reader* r, mrb_value src,
 
 static mrb_value
 decode_map(mrb_state* mrb, Reader* r, mrb_value src,
-           uint8_t info, mrb_value sharedrefs, bool reg)
+           uint8_t info, mrb_value sharedrefs, mrb_int reg_slot)
 {
   mrb_value len_v = read_cbor_uint(mrb, r, info);
   mrb_int len = cbor_len_to_mrb_int(mrb, len_v);
   mrb_value hash = mrb_hash_new(mrb);
   int idx = mrb_gc_arena_save(mrb);
 
-  if (reg && mrb_array_p(sharedrefs)) {
-    mrb_ary_push(mrb, sharedrefs, hash);
+  if (reg_slot >= 0 && mrb_array_p(sharedrefs)) {
+    mrb_ary_set(mrb, sharedrefs, reg_slot, hash);
   }
 
   for (mrb_int i = 0; i < len; i++) {
@@ -552,25 +647,50 @@ static mrb_value
 decode_tag_sharedrefs(mrb_state* mrb, Reader* r,
                      mrb_value src, mrb_value sharedrefs)
 {
+  mrb_int payload_off = cbor_pdiff(mrb, r->p, r->base);
+
+  /* Identity preservation: if this Tag 28's payload offset has been
+   * registered before — by a prior decode_value pass, by skip_cbor during
+   * navigation, or by lazy_resolve_tags — reuse the existing slot. Without
+   * this, each pass would allocate a fresh slot and decode a fresh value
+   * for the same offset, breaking `full[0].equal?(lazy[0].value)`. */
+  mrb_int slot = -1;
+  if (mrb_array_p(sharedrefs)) {
+    mrb_int existing = sharedrefs_lookup_offset(mrb, sharedrefs, payload_off);
+    if (existing >= 0) {
+      slot = existing;
+      mrb_value cached = mrb_ary_ref(mrb, sharedrefs, slot);
+
+      /* Already materialized as a real value — skip the payload, return cached. */
+      if (!mrb_nil_p(cached) && !mrb_undef_p(cached) &&
+          !mrb_data_check_get_ptr(mrb, cached, &cbor_lazy_type)) {
+        skip_cbor(mrb, r, src, sharedrefs);
+        return cached;
+      }
+      /* Else: slot holds a Lazy placeholder (from skip_cbor) or nil
+       * (in-progress); fall through and decode into this slot. */
+    } else {
+      slot = RARRAY_LEN(sharedrefs);
+      mrb_ary_push(mrb, sharedrefs, mrb_nil_value());
+      sharedrefs_register_offset(mrb, sharedrefs, payload_off, slot);
+    }
+  }
 
   uint8_t nb = reader_read8(mrb, r);
   uint8_t major = nb >> 5;
   uint8_t info  = nb & 0x1F;
 
-  switch (major) {
-    case 4: return decode_array(mrb, r, src, info, sharedrefs, true);
-    case 5: return decode_map(mrb, r, src, info, sharedrefs, true);
-  }
+  /* Container fast path: pre-fill the slot with the empty container so
+   * that Tag 29 references inside the payload resolve to the partially
+   * constructed object (cyclic structures). */
+  if (major == 4) return decode_array(mrb, r, src, info, sharedrefs, slot);
+  if (major == 5) return decode_map  (mrb, r, src, info, sharedrefs, slot);
 
+  /* Non-container path: rewind the header byte; pending_slot lets
+   * registered tags install themselves into the slot before their ivar
+   * payload is decoded (allows cycles through registered objects). */
   r->p--;
-
-  mrb_int slot = -1;
-  if (mrb_array_p(sharedrefs)) {
-    slot = RARRAY_LEN(sharedrefs);
-    mrb_ary_push(mrb, sharedrefs, mrb_nil_value());
-    r->pending_slot = slot;
-  }
-
+  r->pending_slot = slot;
   mrb_value v = decode_value(mrb, r, src, sharedrefs);
   r->pending_slot = -1;
 
@@ -591,9 +711,19 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
     if (likely(ref_major == 0)) {
       mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
       mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
-      mrb_value found = mrb_ary_ref(mrb, sharedrefs, idx);
+      mrb_int abs = idx + CBOR_SHAREDREFS_INDEX_BIAS;
+      mrb_value found = mrb_ary_ref(mrb, sharedrefs, abs);
 
+      /* Raw Lazies are an internal optimization that lives only inside
+       * sharedrefs slots. When returning a Lazy from a Tag 29 lookup,
+       * upgrade to full so callers see uniform Lazy state. The slot
+       * itself is updated too — preserves identity for future Tag 29
+       * lookups of this idx. */
       if (likely(!mrb_nil_p(found) && !mrb_undef_p(found))) {
+        cbor_lazy_t *lp = mrb_data_check_get_ptr(mrb, found, &cbor_lazy_type);
+        if (lp && !lp->initialized) {
+          cbor_lazy_ensure_initialized(mrb, found, sharedrefs);
+        }
         return found;
       } else {
         mrb_raise(mrb, E_INDEX_ERROR, "sharedref index not found");
@@ -742,8 +872,8 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
     case 1: result = decode_negative(mrb, r, info); break;
     case 2: result = decode_bytes(mrb, r, src, info); break;
     case 3: result = decode_text(mrb, r, src, info); break;
-    case 4: result = decode_array(mrb, r, src, info, sharedrefs, false); break;
-    case 5: result = decode_map(mrb, r, src, info, sharedrefs, false); break;
+    case 4: result = decode_array(mrb, r, src, info, sharedrefs, -1); break;
+    case 5: result = decode_map(mrb, r, src, info, sharedrefs, -1); break;
 
     case 6: {
       mrb_value tag = read_cbor_uint(mrb, r, info);
@@ -815,11 +945,14 @@ cbor_writer_init(CborWriter *w, mrb_state *mrb)
   w->mrb         = mrb;
   w->heap_ptr    = NULL;
   w->heap_str    = mrb_undef_value();
-  w->seen        = mrb_undef_value();
+  w->counts      = mrb_undef_value();
+  w->slots       = mrb_undef_value();
+  w->proc_cache  = mrb_undef_value();
   w->heap_len    = 0;
   w->heap_capa   = 0;
   w->arena_index = mrb_gc_arena_save(mrb);
   w->depth       = 0;
+  w->next_slot   = 0;
 }
 
 static size_t next_pow2(size_t x)
@@ -904,7 +1037,9 @@ static mrb_value
 cbor_writer_finish(CborWriter *w)
 {
   mrb_state *mrb = w->mrb;
-  if (mrb_hash_p(w->seen)) mrb_gc_unregister(mrb, w->seen);
+  if (mrb_hash_p(w->counts))     mrb_gc_unregister(mrb, w->counts);
+  if (mrb_hash_p(w->slots))      mrb_gc_unregister(mrb, w->slots);
+  if (mrb_hash_p(w->proc_cache)) mrb_gc_unregister(mrb, w->proc_cache);
   if (likely(mrb_undef_p(w->heap_str))) {
     return mrb_str_new(mrb, (const char*)w->stack_buf, (mrb_int)w->stack_len);
   } else if (mrb_string_p(w->heap_str)) {
@@ -958,27 +1093,55 @@ static void encode_uint64(CborWriter *w, uint64_t v) { encode_len(w, 0, v); }
 // Shared reference tracking
 // ============================================================================
 
+/* Two-pass shareable check: counts (Pass 1) -> slots (Pass 2 lazy).
+ *
+ * Returns TRUE iff Tag 29 was emitted at the current position. Caller
+ * skips encoding the value bytes.
+ *
+ * Returns FALSE in all other cases:
+ *   - sharedrefs encoding inactive (counts is undef)
+ *   - counts[id] < 2 (value is unique, no Tag needed)
+ *   - first encounter of a refcount-2+ value (Tag 28 emitted, slot assigned;
+ *     caller proceeds to encode the value bytes after the Tag 28)
+ */
 static mrb_bool
 encode_check_shared(CborWriter *w, mrb_value obj)
 {
-  if (!mrb_hash_p(w->seen)) return FALSE;
+  if (!mrb_hash_p(w->counts)) return FALSE;
   mrb_state *mrb = w->mrb;
 
   mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
-  mrb_value found  = mrb_hash_fetch(mrb, w->seen, id_key, mrb_undef_value());
+  mrb_value rc_v   = mrb_hash_fetch(mrb, w->counts, id_key, mrb_undef_value());
+  if (!mrb_integer_p(rc_v) || mrb_integer(rc_v) < 2) {
+    /* Unique or not tracked — encode normally, no Tag. */
+    return FALSE;
+  }
 
-  if (mrb_integer_p(found)) {
+  /* Refcount >= 2: shared. Check if already assigned a slot. */
+  if (!mrb_hash_p(w->slots)) {
+    w->slots = mrb_hash_new(mrb);
+    mrb_gc_register(mrb, w->slots);
+  }
+  mrb_value slot_v = mrb_hash_fetch(mrb, w->slots, id_key, mrb_undef_value());
+  if (mrb_integer_p(slot_v)) {
+    /* Subsequent occurrence — emit Tag 29 + slot, skip encode. */
     uint8_t tag29[2] = { 0xD8, 0x1D };
     cbor_writer_write(w, tag29, 2);
-    encode_len(w, 0, (uint64_t)mrb_integer(found));
+    encode_len(w, 0, (uint64_t)mrb_integer(slot_v));
     return TRUE;
   }
 
-  mrb_hash_set(mrb, w->seen, id_key, mrb_convert_mrb_int(mrb, mrb_hash_size(mrb, w->seen)));
+  /* First occurrence of a shared value — emit Tag 28, assign slot. */
+  mrb_int slot = w->next_slot++;
+  mrb_hash_set(mrb, w->slots, id_key, mrb_fixnum_value(slot));
   uint8_t tag28[2] = { 0xD8, 0x1C };
   cbor_writer_write(w, tag28, 2);
   return FALSE;
 }
+
+/* Pass 1 helpers — forward decls. */
+static void      walk_count(CborWriter *w, mrb_value obj);
+static mrb_value cbor_proc_cache_lookup(CborWriter *w, mrb_value obj);
 
 // ============================================================================
 // BigInt encoding (Tag 2/3)
@@ -1120,14 +1283,15 @@ encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
   CborWriter *w = (CborWriter*)data;
   /* Suppress sharedref tracking while encoding the key.
-   * Hash keys do not participate in Tag 28/29 deduplication — in mruby,
-   * hashes create distinct copies for keys even when the same variable
-   * is used to insert, so preserving key identity is rarely useful and
-   * would just clutter the shareable-table index space. */
-  mrb_value saved_seen = w->seen;
-  w->seen = mrb_undef_value();
+   * Hash keys do not participate in Tag 28/29 deduplication. Pass 1's
+   * walk already skipped Hash keys — so even if a key obj_id collides
+   * with a value's, counts for the key reflect only its value-side
+   * occurrences. We still gate encode_check_shared off during the key
+   * itself so it doesn't emit a Tag for keys. */
+  mrb_value saved_counts = w->counts;
+  w->counts = mrb_undef_value();
   encode_value(w, key);
-  w->seen = saved_seen;
+  w->counts = saved_counts;
   encode_value(w, val);
   return 0;
 }
@@ -1373,7 +1537,10 @@ proc_tag_foreach_cb(mrb_state *mrb, mrb_value enc_type, mrb_value entry, void *u
     mrb_value tag_v      = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(tag)),         mrb_undef_value());
     mrb_value encode_prc = mrb_hash_fetch(mrb, entry, mrb_symbol_value(MRB_SYM(encode_proc)), mrb_undef_value());
     if (mrb_integer_p(tag_v) && mrb_proc_p(encode_prc)) {
-      mrb_value encoded = mrb_yield_argv(mrb, encode_prc, 1, &a->obj);
+      mrb_value cached = cbor_proc_cache_lookup(a->w, a->obj);
+      mrb_value encoded = mrb_undef_p(cached)
+        ? mrb_yield_argv(mrb, encode_prc, 1, &a->obj)
+        : cached;
       encode_len(a->w, 6, (uint64_t)mrb_integer(tag_v));
       encode_value(a->w, encoded);
       a->found = TRUE;
@@ -1392,6 +1559,162 @@ encode_proc_tag(mrb_state *mrb, CborWriter *w, mrb_value obj)
   return a.found;
 }
 
+/* Pass 1 walk: count obj_id refs and cache transform results.
+ *
+ * For each non-immediate value seen, increment counts[id]. On the *first*
+ * encounter, recurse into the value's children (so we count refs deep
+ * into the tree). On subsequent encounters, just bump the count — no
+ * recurse, which avoids both wasted work and infinite loops on cycles.
+ *
+ * For values that get transformed during encoding (registered tags via
+ * _before_encode, proc tags via encode-proc), the transform is invoked
+ * here in Pass 1 and cached in proc_cache so Pass 2 can reuse the
+ * result. This keeps total invocations equal to the previous single-pass
+ * encoder. */
+
+static int
+walk_count_hash_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
+{
+  CborWriter *w = (CborWriter*)data;
+  /* Hash keys do not participate in sharedref tracking — match Pass 2. */
+  walk_count(w, val);
+  return 0;
+}
+
+static int
+walk_count_proc_rev_foreach(mrb_state *mrb, mrb_value enc_type, mrb_value entry, void *ud)
+{
+  /* ud is a 3-element array: [obj, encoded_holder (out), found_flag (out)] */
+  mrb_value *out = (mrb_value*)ud;
+  mrb_value obj  = out[0];
+
+  if (mrb_hash_p(entry) &&
+      (mrb_class_p(enc_type) || mrb_module_p(enc_type)) &&
+      mrb_obj_is_kind_of(mrb, obj, mrb_class_ptr(enc_type))) {
+    mrb_value encode_prc = mrb_hash_fetch(mrb, entry,
+                              mrb_symbol_value(MRB_SYM(encode_proc)),
+                              mrb_undef_value());
+    if (mrb_proc_p(encode_prc)) {
+      mrb_value encoded = mrb_yield_argv(mrb, encode_prc, 1, &obj);
+      out[1] = encoded;
+      out[2] = mrb_true_value();
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void
+walk_count(CborWriter *w, mrb_value obj)
+{
+  if (mrb_immediate_p(obj)) return;
+
+  mrb_state *mrb = w->mrb;
+  mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
+
+  mrb_value rc = mrb_hash_fetch(mrb, w->counts, id_key, mrb_undef_value());
+  if (mrb_integer_p(rc)) {
+    /* Already counted; just bump. No recurse — children were walked when
+     * we first saw this object. Cycles terminate here. */
+    mrb_hash_set(mrb, w->counts, id_key, mrb_fixnum_value(mrb_integer(rc) + 1));
+    return;
+  }
+  mrb_hash_set(mrb, w->counts, id_key, mrb_fixnum_value(1));
+
+  /* First sight: recurse into children. */
+  switch (mrb_type(obj)) {
+    case MRB_TT_ARRAY: {
+      mrb_int len = RARRAY_LEN(obj);
+      for (mrb_int i = 0; i < len; i++) {
+        walk_count(w, mrb_ary_ref(mrb, obj, i));
+      }
+      break;
+    }
+    case MRB_TT_HASH: {
+      mrb_hash_foreach(mrb, mrb_hash_ptr(obj), walk_count_hash_foreach, w);
+      break;
+    }
+    case MRB_TT_STRING:
+#ifdef MRB_USE_BIGINT
+    case MRB_TT_BIGINT:
+#endif
+      /* Atomic — no children to walk. */
+      break;
+    case MRB_TT_CLASS:
+    case MRB_TT_MODULE:
+      /* Encoded via Tag 49999 + class path; the path String is freshly
+       * built per encode and not user-visible, so don't try to share it. */
+      break;
+    default: {
+      /* Registered class tag, proc tag, or fallback-to-string.
+       * Mirror encode_value's default branch dispatch. */
+      mrb_value rev = cbor_tag_rev_registry(mrb);
+      mrb_value klass   = mrb_obj_value(mrb_class(mrb, obj));
+      mrb_value tag_val = mrb_hash_fetch(mrb, rev, klass, mrb_undef_value());
+
+      if (mrb_integer_p(tag_val)) {
+        /* Registered class tag. Apply _before_encode if present, cache
+         * the result, walk the schema's ivars on the (possibly transformed)
+         * object. */
+        mrb_value subject = obj;
+        if (mrb_respond_to(mrb, obj, MRB_SYM(_before_encode))) {
+          subject = mrb_funcall_argv(mrb, obj, MRB_SYM(_before_encode), 0, NULL);
+          if (!mrb_hash_p(w->proc_cache)) {
+            w->proc_cache = mrb_hash_new(mrb);
+            mrb_gc_register(mrb, w->proc_cache);
+          }
+          mrb_hash_set(mrb, w->proc_cache, id_key, subject);
+        }
+        mrb_value schema = mrb_net_schema(mrb, mrb_class(mrb, subject));
+        if (mrb_hash_p(schema)) {
+          /* Walk values of all schema ivars on the subject. */
+          mrb_value keys = mrb_hash_keys(mrb, schema);
+          mrb_int n = RARRAY_LEN(keys);
+          for (mrb_int i = 0; i < n; i++) {
+            mrb_value sym = mrb_ary_ref(mrb, keys, i);
+            if (mrb_symbol_p(sym)) {
+              mrb_value val = mrb_iv_get(mrb, subject, mrb_symbol(sym));
+              walk_count(w, val);
+            }
+          }
+        }
+        return;
+      }
+
+      /* Proc tag? Iterate the rev registry to find a matching encode-type. */
+      mrb_value proc_rev = cbor_proc_tag_rev_registry(mrb);
+      if (mrb_hash_p(proc_rev)) {
+        mrb_value out[3] = { obj, mrb_undef_value(), mrb_false_value() };
+        mrb_hash_foreach(mrb, mrb_hash_ptr(proc_rev),
+                         walk_count_proc_rev_foreach, out);
+        if (mrb_bool(out[2])) {
+          /* Cache the encoded result. */
+          if (!mrb_hash_p(w->proc_cache)) {
+            w->proc_cache = mrb_hash_new(mrb);
+            mrb_gc_register(mrb, w->proc_cache);
+          }
+          mrb_hash_set(mrb, w->proc_cache, id_key, out[1]);
+          walk_count(w, out[1]);
+          return;
+        }
+      }
+
+      /* Fallback: encoded as String via mrb_obj_as_string. The resulting
+       * string is freshly allocated per encode, can't usefully be shared. */
+      break;
+    }
+  }
+}
+
+static mrb_value
+cbor_proc_cache_lookup(CborWriter *w, mrb_value obj)
+{
+  if (!mrb_hash_p(w->proc_cache)) return mrb_undef_value();
+  mrb_state *mrb = w->mrb;
+  mrb_value id_key = mrb_convert_mrb_int(mrb, mrb_obj_id(obj));
+  return mrb_hash_fetch(mrb, w->proc_cache, id_key, mrb_undef_value());
+}
+
 static void
 encode_value(CborWriter* w, mrb_value obj)
 {
@@ -1400,7 +1723,7 @@ encode_value(CborWriter* w, mrb_value obj)
   if (likely(w->depth < CBOR_MAX_DEPTH)) w->depth++;
   else mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
 
-  if (!mrb_undef_p(w->seen) && !mrb_immediate_p(obj) && encode_check_shared(w, obj)) {
+  if (!mrb_undef_p(w->counts) && !mrb_immediate_p(obj) && encode_check_shared(w, obj)) {
     w->depth--;
     return;
   }
@@ -1910,16 +2233,32 @@ cbor_decode_fast_rb(mrb_state *mrb, mrb_value self)
 // CBOR::Lazy
 // ============================================================================
 
-typedef struct {
-  mrb_value buf;
-  mrb_int   offset;
-  mrb_bool  evaluating;
-} cbor_lazy_t;
+/* Raw Lazy — minimal: RData + buf ivar (GC anchor for p->buf). Used by
+ * skip_cbor / lazy_resolve_tags to mark Tag 28 slots without paying for
+ * the full ivar/kcache machinery. cbor_lazy_ensure_initialized fills the
+ * missing ivars when something actually accesses them. */
+static mrb_value
+cbor_lazy_new_raw(mrb_state *mrb, mrb_value buf, mrb_int offset)
+{
+  struct RClass *cbor = mrb_module_get_id(mrb, MRB_SYM(CBOR));
+  struct RClass *lazy = mrb_class_get_under_id(mrb, cbor, MRB_SYM(Lazy));
 
-static const struct mrb_data_type cbor_lazy_type = {
-  "CBOR::Lazy", mrb_free
-};
+  cbor_lazy_t *p;
+  struct RData *data;
+  Data_Make_Struct(mrb, lazy, cbor_lazy_t, &cbor_lazy_type, p, data);
 
+  p->buf         = buf;
+  p->offset      = offset;
+  p->evaluating  = FALSE;
+  p->initialized = FALSE;
+  mrb_value obj = mrb_obj_value(data);
+  mrb_iv_set(mrb, obj, MRB_SYM(buf), buf);
+  return obj;
+}
+
+/* Full Lazy — same RData + the four ivars (buf, vcache, kcache, sharedrefs).
+ * Used at the top level (decode_lazy) and wherever a Lazy is created with
+ * sharedrefs context already known. */
 static mrb_value
 cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedrefs)
 {
@@ -1930,15 +2269,30 @@ cbor_lazy_new(mrb_state *mrb, mrb_value buf, mrb_int offset, mrb_value sharedref
   struct RData *data;
   Data_Make_Struct(mrb, lazy, cbor_lazy_t, &cbor_lazy_type, p, data);
 
-  p->buf    = buf;
-  p->offset = offset;
-  p->evaluating = FALSE;
+  p->buf         = buf;
+  p->offset      = offset;
+  p->evaluating  = FALSE;
+  p->initialized = TRUE;
   mrb_value obj = mrb_obj_value(data);
   mrb_iv_set(mrb, obj, MRB_SYM(buf),        buf);
   mrb_iv_set(mrb, obj, MRB_SYM(vcache),     mrb_undef_value());
   mrb_iv_set(mrb, obj, MRB_SYM(kcache),     mrb_hash_new(mrb));
   mrb_iv_set(mrb, obj, MRB_SYM(sharedrefs), sharedrefs);
   return obj;
+}
+
+/* Lazily fill in the ivars a raw Lazy is missing. Idempotent: subsequent
+ * calls are an O(1) flag check. The caller passes the ambient sharedrefs
+ * to install (raw Lazies don't carry one). */
+static void
+cbor_lazy_ensure_initialized(mrb_state *mrb, mrb_value self, mrb_value sharedrefs)
+{
+  cbor_lazy_t *p = mrb_data_get_ptr(mrb, self, &cbor_lazy_type);
+  if (likely(p->initialized)) return;
+  mrb_iv_set(mrb, self, MRB_SYM(vcache),     mrb_undef_value());
+  mrb_iv_set(mrb, self, MRB_SYM(kcache),     mrb_hash_new(mrb));
+  mrb_iv_set(mrb, self, MRB_SYM(sharedrefs), sharedrefs);
+  p->initialized = TRUE;
 }
 
 // ============================================================================
@@ -2033,7 +2387,12 @@ encode_registered_tag(CborWriter *w, mrb_value obj, mrb_int tag_num)
   mrb_state *mrb = w->mrb;
 
   if (mrb_respond_to(mrb, obj, MRB_SYM(_before_encode))) {
-    obj = mrb_funcall_argv(mrb, obj, MRB_SYM(_before_encode), 0, NULL);
+    /* If Pass 1 already invoked _before_encode and cached the result, use it.
+     * Otherwise (no sharedrefs encoding) call as before. */
+    mrb_value cached = cbor_proc_cache_lookup(w, obj);
+    obj = mrb_undef_p(cached)
+      ? mrb_funcall_argv(mrb, obj, MRB_SYM(_before_encode), 0, NULL)
+      : cached;
   }
 
   mrb_value schema = mrb_net_schema(mrb, mrb_class(mrb, obj));
@@ -2177,9 +2536,17 @@ skip_cbor(mrb_state *mrb, Reader *r, mrb_value buf, mrb_value sharedrefs)
 
       if (!mrb_undef_p(buf) && mrb_array_p(sharedrefs) &&
           mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0) {
-        mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
-        mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
-        mrb_ary_push(mrb, sharedrefs, lazy);
+        /* Fast HWM check — skip_cbor walks document monotonically forward,
+         * so any payload offset at-or-below HWM was already registered by
+         * an earlier traversal. Avoids a hash lookup per Tag 28. */
+        mrb_int payload_off = cbor_pdiff(mrb, r->p, r->base);
+        if (payload_off > sharedrefs_hwm(mrb, sharedrefs)) {
+          mrb_int slot = RARRAY_LEN(sharedrefs);
+          /* Raw Lazy — initialized lazily on first real access. */
+          mrb_value ph = cbor_lazy_new_raw(mrb, buf, payload_off);
+          mrb_ary_push(mrb, sharedrefs, ph);
+          sharedrefs_register_offset(mrb, sharedrefs, payload_off, slot);
+        }
       }
       skip_cbor(mrb, r, buf, sharedrefs);
       break;
@@ -2397,8 +2764,6 @@ cbor_doc_end(mrb_state *mrb, const uint8_t *buf, size_t buf_len, mrb_int offset)
 }
 
 /* Lazy#value */
-static mrb_value cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth);
-
 static mrb_value
 cbor_lazy_value(mrb_state *mrb, mrb_value self)
 {
@@ -2422,18 +2787,34 @@ cbor_lazy_value_r(mrb_state *mrb, mrb_value self, mrb_int depth)
   size_t total_len     = (size_t)RSTRING_LEN(p->buf);
   mrb_value sharedrefs = mrb_iv_get(mrb, self, MRB_SYM(sharedrefs));
 
+  /* If this Lazy's offset is registered in the sharedrefs offset_map, it
+   * is a sharedref placeholder (created by skip_cbor / lazy_resolve_tags
+   * pointing at a Tag 28 payload). Route through decode_tag_sharedrefs so
+   * the container slot-pre-fill logic handles cyclic Tag 29 references
+   * inside the payload correctly. */
+  mrb_int placeholder_slot = -1;
+  if (mrb_array_p(sharedrefs)) {
+    placeholder_slot = sharedrefs_lookup_offset(mrb, sharedrefs, p->offset);
+  }
+
   if (likely((size_t)p->offset < total_len)) {
     Reader r;
     r.base = base; r.p = base + p->offset; r.end = base + total_len; r.depth = depth; r.pending_slot = -1;
 
-    mrb_value value = decode_value(mrb, &r, p->buf, sharedrefs);
-    if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) {
-      value = cbor_lazy_value_r(mrb, value, r.depth + 1);
+    mrb_value value;
+    if (placeholder_slot >= 0) {
+      value = decode_tag_sharedrefs(mrb, &r, p->buf, sharedrefs);
+    } else {
+      value = decode_value(mrb, &r, p->buf, sharedrefs);
+      if (mrb_data_check_get_ptr(mrb, value, &cbor_lazy_type)) {
+        value = cbor_lazy_value_r(mrb, value, r.depth + 1);
+      }
     }
     p->evaluating = FALSE;
     mrb_iv_set(mrb, self, MRB_SYM(vcache), value);
     return value;
   } else {
+    p->evaluating = FALSE;
     mrb_raise(mrb, E_RANGE_ERROR, "lazy offset out of bounds");
   }
   return mrb_undef_value();
@@ -2534,15 +2915,13 @@ lazy_resolve_tags(mrb_state *mrb, Reader *r, mrb_value buf,
     }
     if (mrb_cmp(mrb, tag, mrb_fixnum_value(28)) == 0 &&
         mrb_array_p(sharedrefs)) {
-      /* Register the container this Tag 28 wraps at its stream-order
-       * position in sharedrefs. The inner_offset points at the byte
-       * right after the Tag 28 marker, where the wrapped value starts.
-       * This keeps the decoder's sharedrefs table aligned with the
-       * encoder's index counter, so later Tag 29 references resolve
-       * to the correct container. */
-      mrb_int inner_offset = cbor_pdiff(mrb, r->p, r->base);
-      mrb_value lazy = cbor_lazy_new(mrb, buf, inner_offset, sharedrefs);
-      mrb_ary_push(mrb, sharedrefs, lazy);
+      mrb_int payload_off = cbor_pdiff(mrb, r->p, r->base);
+      if (payload_off > sharedrefs_hwm(mrb, sharedrefs)) {
+        mrb_int slot = RARRAY_LEN(sharedrefs);
+        mrb_value ph = cbor_lazy_new_raw(mrb, buf, payload_off);
+        mrb_ary_push(mrb, sharedrefs, ph);
+        sharedrefs_register_offset(mrb, sharedrefs, payload_off, slot);
+      }
     }
     reader_read_header(mrb, r);
   }
@@ -2579,14 +2958,11 @@ cbor_lazy_aref_r(mrb_state *mrb, mrb_value self, mrb_value key, mrb_int depth)
     case 0xFF: {
       cbor_lazy_t *rp = mrb_data_check_get_ptr(mrb, resolved, &cbor_lazy_type);
       if (rp) {
-        cbor_lazy_t *rp = mrb_data_get_ptr(mrb, resolved, &cbor_lazy_type);
         if (unlikely(rp->evaluating))
           mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR shared reference cycle detected");
-
         return cbor_lazy_aref_r(mrb, resolved, key, depth + 1);
       }
     }
-
       /* fall through */
     default:
       mrb_raise(mrb, E_TYPE_ERROR, "not indexable");
@@ -2607,7 +2983,7 @@ cbor_decode_rb_lazy(mrb_state *mrb, mrb_value self)
   mrb_value buf;
   mrb_get_args(mrb, "S", &buf);
   mrb_value owned_buf   = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
-  mrb_value sharedrefs  = mrb_ary_new(mrb);
+  mrb_value sharedrefs  = sharedrefs_new(mrb);
   return cbor_lazy_new(mrb, owned_buf, 0, sharedrefs);
 }
 
@@ -2663,7 +3039,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
         mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
         if (idx < 0) idx += len;
         if (idx < 0 || idx >= len) { current = mrb_nil_value(); continue; }
-        for (mrb_int i = 0; i < idx; i++) skip_cbor(mrb, &r, current, sharedrefs);
+        for (mrb_int i = 0; i < idx; i++) skip_cbor(mrb, &r, p->buf, sharedrefs);
         mrb_int elem_off = cbor_pdiff(mrb, r.p, base);
         result = cbor_lazy_new(mrb, p->buf, elem_off, sharedrefs);
         mrb_hash_set(mrb, kcache, key, result);
@@ -2697,7 +3073,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
             found = TRUE;
             break;
           }
-          skip_cbor(mrb, &r, current, sharedrefs);
+          skip_cbor(mrb, &r, p->buf, sharedrefs);
         }
 
         if (!found) { current = mrb_nil_value(); continue; }
@@ -2845,8 +3221,9 @@ cbor_encode_rb(mrb_state *mrb, mrb_value self)
   cbor_writer_init(&w, mrb);
 
   if (!mrb_undef_p(kw_values[0]) && mrb_bool(kw_values[0])) {
-    w.seen = mrb_hash_new(mrb);
-    mrb_gc_register(mrb, w.seen);
+    w.counts = mrb_hash_new(mrb);
+    mrb_gc_register(mrb, w.counts);
+    walk_count(&w, obj);
   }
 
   encode_value(&w, obj);
@@ -2863,7 +3240,7 @@ cbor_decode_rb(mrb_state *mrb, mrb_value self)
   mrb_get_args(mrb, "S", &src);
   src = mrb_str_byte_subseq(mrb, src, 0, RSTRING_LEN(src));
   reader_init(&r, (const uint8_t*)RSTRING_PTR(src), (size_t)RSTRING_LEN(src));
-  mrb_value sharedrefs = mrb_ary_new(mrb);
+  mrb_value sharedrefs = sharedrefs_new(mrb);
   return decode_value(mrb, &r, src, sharedrefs);
 }
 
@@ -2961,8 +3338,8 @@ cbor_path_parse(mrb_state *mrb, mrb_value src, mrb_value obj)
 
       } else {
         const char *start = p;
-        if (*p == '-') p++;
-        if (!isdigit((unsigned char)*p)) {
+        if (p < end && *p == '-') p++;
+        if (p >= end || !isdigit((unsigned char)*p)) {
           mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid index in CBOR path");
         }
         while (p < end && isdigit((unsigned char)*p)) p++;
@@ -3142,8 +3519,9 @@ mrb_cbor_encode_sharedrefs(mrb_state *mrb, mrb_value obj)
 {
   CborWriter w;
   cbor_writer_init(&w, mrb);
-  w.seen = mrb_hash_new(mrb);
-  mrb_gc_register(mrb, w.seen);
+  w.counts = mrb_hash_new(mrb);
+  mrb_gc_register(mrb, w.counts);
+  walk_count(&w, obj);
   encode_value(&w, obj);
   return cbor_writer_finish(&w);
 }
@@ -3155,7 +3533,7 @@ mrb_cbor_decode(mrb_state *mrb, mrb_value buf)
     mrb_value owned = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
     Reader r;
     reader_init(&r, (const uint8_t*)RSTRING_PTR(owned), (size_t)RSTRING_LEN(owned));
-    mrb_value sharedrefs = mrb_ary_new(mrb);
+    mrb_value sharedrefs = sharedrefs_new(mrb);
     return decode_value(mrb, &r, owned, sharedrefs);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");
@@ -3166,7 +3544,7 @@ mrb_cbor_decode_lazy(mrb_state *mrb, mrb_value buf)
 {
   if (likely(mrb_string_p(buf))) {
     mrb_value owned      = mrb_str_byte_subseq(mrb, buf, 0, RSTRING_LEN(buf));
-    mrb_value sharedrefs = mrb_ary_new(mrb);
+    mrb_value sharedrefs = sharedrefs_new(mrb);
     return cbor_lazy_new(mrb, owned, 0, sharedrefs);
   }
   mrb_raise(mrb, E_TYPE_ERROR, "buf is not a String");

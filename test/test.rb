@@ -1560,3 +1560,4 @@ assert('safety: lazy aref on non-container / huge index handled cleanly') do
   assert_safe { CBOR.decode_lazy(CBOR.encode(42))["key"] }
   assert_safe { CBOR.decode_lazy(CBOR.encode([1, 2, 3]))[0x7FFFFFFF] }
 end
+

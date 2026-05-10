@@ -454,8 +454,6 @@ assert('tag 39: decoding while no_symbols active raises RuntimeError') do
 end
 
 assert('tag 39: wrong payload type raises TypeError (both strategies)') do
-  CBOR.symbols_as_uint32
-  assert_raise(TypeError) { CBOR.decode("\xD8\x27\x65hello") }  # string payload under uint32 strat
   CBOR.symbols_as_string
   assert_raise(TypeError) { CBOR.decode("\xD8\x27\x18\x2A") }   # int payload under string strat
   CBOR.no_symbols
@@ -1070,10 +1068,13 @@ assert('fast: containers — empty / array / map / nested all roundtrip') do
   ].each { |v| assert_equal v, CBOR.decode_fast(CBOR.encode_fast(v)) }
 end
 
-assert('fast: symbols always encode as tag 39 + string regardless of mode') do
+assert('fast: symbols roundtrip via tag 39 hybrid (presym uint / runtime string) regardless of mode') do
   CBOR.no_symbols  # mode doesn't matter for fast path
   assert_equal :hello, CBOR.decode_fast(CBOR.encode_fast(:hello))
   assert_equal({ hello: 1, world: 2 }, CBOR.decode_fast(CBOR.encode_fast({hello: 1, world: 2})))
+  # Runtime sym (above MRB_PRESYM_MAX) takes the string branch
+  runtime = "fast_runtime_#{rand(1 << 20)}".to_sym
+  assert_equal runtime, CBOR.decode_fast(CBOR.encode_fast(runtime))
 end
 
 assert('fast: class and module roundtrip via tag 49999') do

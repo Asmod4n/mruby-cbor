@@ -753,6 +753,30 @@ cbor_set_sym_strategy(mrb_state *mrb, uint8_t mode)
   mrb_iv_set(mrb, mrb_obj_value(mod), MRB_SYM(__sym_strat__), mrb_fixnum_value(mode));
 }
 
+/* Tag 39 hybrid payload -> mrb_sym. String -> intern, uint -> cast.
+ * Shared by canonical strategy 2 and the fast decoder. Presyms span
+ * 1 .. MRB_PRESYM_MAX inclusive; runtime syms travel as strings. */
+static mrb_value
+sym_from_tag39_payload(mrb_state *mrb, mrb_value v)
+{
+  if (mrb_string_p(v)) {
+    return mrb_symbol_value(mrb_intern_str(mrb, v));
+  }
+  else if (likely(mrb_integer_p(v))) {
+    mrb_int n = mrb_integer(v);
+    if (likely(n >= 1 && n <= MRB_PRESYM_MAX)) {
+      return mrb_symbol_value((mrb_sym)n);
+    } else {
+      mrb_raise(mrb, E_RANGE_ERROR, "tag 39 presym ID out of range");
+    }
+  }
+  else {
+    mrb_raise(mrb, E_TYPE_ERROR,
+      "invalid payload for tag 39 (expected text string or uint)");
+  }
+  return mrb_nil_value(); /* unreachable */
+}
+
 static mrb_value
 decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 {
@@ -775,17 +799,7 @@ decode_symbol(mrb_state *mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
   }
 
   if (mrb_cmp(mrb, strategy, mrb_fixnum_value(2)) == 0) {
-    if (likely(mrb_integer_p(v))) {
-      mrb_int n = mrb_integer(v);
-      if (likely(n >= 0 && n <= UINT32_MAX)) {
-        return mrb_symbol_value((mrb_sym)n);
-      } else {
-        mrb_raise(mrb, E_RANGE_ERROR, "invalid symbol ID size for tag 39");
-      }
-    } else {
-      mrb_raise(mrb, E_TYPE_ERROR,
-        "invalid payload for tag 39 (expected uint32)");
-    }
+    return sym_from_tag39_payload(mrb, v);
   }
 
   mrb_raise(mrb, E_RUNTIME_ERROR, "invalid symbol strategy");
@@ -1498,24 +1512,53 @@ emit_f64:;
 #endif /* MRB_USE_FLOAT32 */
 #endif /* MRB_NO_FLOAT */
 
+/* Tag 39 hybrid body -- canonical string codec.
+ * presym -> uint payload (sym ID); runtime -> string payload. */
+static void
+encode_sym_hybrid(CborWriter *w, mrb_sym sym)
+{
+  encode_len(w, 6, 39);
+  if (sym > MRB_PRESYM_MAX) {
+    encode_string(w, mrb_sym2str(w->mrb, sym));
+  } else {
+    encode_len(w, 0, sym);
+  }
+}
+
+/* Tag 39 hybrid body -- fast string codec.
+ * Always major CBOR_FAST_STRING_TYPE, no UTF-8 scan. */
+static void
+encode_sym_hybrid_fast(CborWriter *w, mrb_sym sym)
+{
+  encode_len(w, 6, 39);
+  if (sym > MRB_PRESYM_MAX) {
+    mrb_value s = mrb_sym2str(w->mrb, sym);
+    mrb_int blen = RSTRING_LEN(s);
+    encode_len(w, CBOR_FAST_STRING_TYPE, (uint64_t)blen);
+    cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(s), (size_t)blen);
+  } else {
+    encode_len(w, 0, sym);
+  }
+}
+
 static void
 encode_sym(CborWriter *w, mrb_value obj)
 {
   mrb_state *mrb = w->mrb;
   mrb_value mode = cbor_sym_strategy(mrb);
+  mrb_sym sym = mrb_symbol(obj);
 
   if (mrb_cmp(mrb, mode, mrb_fixnum_value(0)) == 0) {
-    encode_string(w, mrb_sym2str(mrb, mrb_symbol(obj)));
+    encode_string(w, mrb_sym2str(mrb, sym));
     return;
   }
   if (mrb_cmp(mrb, mode, mrb_fixnum_value(1)) == 0) {
     encode_len(w, 6, 39);
-    encode_string(w, mrb_sym2str(mrb, mrb_symbol(obj)));
+    encode_string(w, mrb_sym2str(mrb, sym));
     return;
   }
   if (mrb_cmp(mrb, mode, mrb_fixnum_value(2)) == 0) {
-    encode_len(w, 6, 39);
-    encode_len(w, 0, mrb_symbol(obj));
+    encode_sym_hybrid(w, sym);
     return;
   }
   mrb_bug(mrb, "CBOR internal error: invalid symbol strategy mode");
@@ -1933,15 +1976,9 @@ encode_value_fast(CborWriter *w, mrb_value obj)
     }
     case MRB_TT_ARRAY: encode_array_fast(w, obj); break;
     case MRB_TT_HASH:  encode_map_fast(w, obj);   break;
-    case MRB_TT_SYMBOL: {
-      /* always tag 39 + string — no strategy config, same build both ends */
-      encode_len(w, 6, 39);
-      mrb_value s = mrb_sym2str(mrb, mrb_symbol(obj));
-      mrb_int blen = RSTRING_LEN(s);
-      encode_len(w, CBOR_FAST_STRING_TYPE, (uint64_t)blen);
-      cbor_writer_write(w, (const uint8_t*)RSTRING_PTR(s), (size_t)blen);
+    case MRB_TT_SYMBOL:
+      encode_sym_hybrid_fast(w, mrb_symbol(obj));
       break;
-    }
     case MRB_TT_CLASS:
     case MRB_TT_MODULE: {
       mrb_value name = mrb_class_path(mrb, mrb_class_ptr(obj));
@@ -2151,13 +2188,9 @@ decode_value_fast(mrb_state *mrb, Reader *r, mrb_value src)
         mrb_value tag = read_cbor_uint(mrb, r, info);
 
         if (mrb_cmp(mrb, tag, mrb_fixnum_value(39)) == 0) {
-          /* symbol — always encoded as tag 39 + string in fast path */
+          /* symbol -- tag 39 + string (runtime) or uint (presym ID) */
           mrb_value v = decode_value_fast(mrb, r, src);
-          if (likely(mrb_string_p(v))) {
-            result = mrb_symbol_value(mrb_intern_str(mrb, v));
-          } else {
-            mrb_raise(mrb, E_TYPE_ERROR, "fast: tag 39 payload must be string");
-          }
+          result = sym_from_tag39_payload(mrb, v);
         }
         else if (mrb_cmp(mrb, tag, mrb_convert_uint32(mrb, CBOR_TAG_CLASS)) == 0) {
           /* class/module — tag 49999 + string */

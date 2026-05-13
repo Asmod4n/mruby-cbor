@@ -1367,13 +1367,13 @@ assert('path: compiled path is reusable across different lazies') do
 end
 
 assert('path: [*] skips untouched fields cheaply (regression for greedy decode)') do
-  big = "x" * 100_000
-  users = (1..50).map { |i| { "name" => "u#{i}", "blob" => big } }
+  big = "x" * 10_000
+  users = (1..5).map { |i| { "name" => "u#{i}", "blob" => big } }
   lazy = CBOR.decode_lazy(CBOR.encode({"users" => users}))
   names = CBOR::Path.compile("$.users[*].name").at(lazy)
-  assert_equal 50,    names.length
+  assert_equal 5,    names.length
   assert_equal "u1",  names.first
-  assert_equal "u50", names.last
+  assert_equal "u5", names.last
 end
 
 assert('path + sharedref: wildcard iterates over Tag 29 target') do

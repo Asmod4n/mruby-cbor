@@ -16,5 +16,6 @@ MRuby::Gem::Specification.new('mruby-cbor') do |spec|
   spec.add_test_dependency 'mruby-b64'
   spec.add_test_dependency 'mruby-metaprog'
   spec.add_test_dependency 'mruby-sprintf'
+  spec.add_test_dependency 'mruby-string-ext'
   spec.add_test_dependency 'mruby-fast-json'
 end

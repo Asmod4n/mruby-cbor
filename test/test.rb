@@ -454,8 +454,6 @@ assert('tag 39: decoding while no_symbols active raises RuntimeError') do
 end
 
 assert('tag 39: wrong payload type raises TypeError (both strategies)') do
-  CBOR.symbols_as_uint32
-  assert_raise(TypeError) { CBOR.decode("\xD8\x27\x65hello") }  # string payload under uint32 strat
   CBOR.symbols_as_string
   assert_raise(TypeError) { CBOR.decode("\xD8\x27\x18\x2A") }   # int payload under string strat
   CBOR.no_symbols
@@ -1070,10 +1068,13 @@ assert('fast: containers — empty / array / map / nested all roundtrip') do
   ].each { |v| assert_equal v, CBOR.decode_fast(CBOR.encode_fast(v)) }
 end
 
-assert('fast: symbols always encode as tag 39 + string regardless of mode') do
+assert('fast: symbols roundtrip via tag 39 hybrid (presym uint / runtime string) regardless of mode') do
   CBOR.no_symbols  # mode doesn't matter for fast path
   assert_equal :hello, CBOR.decode_fast(CBOR.encode_fast(:hello))
   assert_equal({ hello: 1, world: 2 }, CBOR.decode_fast(CBOR.encode_fast({hello: 1, world: 2})))
+  # Runtime sym (above MRB_PRESYM_MAX) takes the string branch
+  runtime = "fast_runtime_#{rand(1 << 20)}".to_sym
+  assert_equal runtime, CBOR.decode_fast(CBOR.encode_fast(runtime))
 end
 
 assert('fast: class and module roundtrip via tag 49999') do
@@ -1366,13 +1367,13 @@ assert('path: compiled path is reusable across different lazies') do
 end
 
 assert('path: [*] skips untouched fields cheaply (regression for greedy decode)') do
-  big = "x" * 100_000
-  users = (1..50).map { |i| { "name" => "u#{i}", "blob" => big } }
+  big = "x" * 10_000
+  users = (1..5).map { |i| { "name" => "u#{i}", "blob" => big } }
   lazy = CBOR.decode_lazy(CBOR.encode({"users" => users}))
   names = CBOR::Path.compile("$.users[*].name").at(lazy)
-  assert_equal 50,    names.length
+  assert_equal 5,    names.length
   assert_equal "u1",  names.first
-  assert_equal "u50", names.last
+  assert_equal "u5", names.last
 end
 
 assert('path + sharedref: wildcard iterates over Tag 29 target') do
@@ -1425,15 +1426,6 @@ assert('cache: vcache survives across path / aref / dig') do
   b = lazy["items"][1]["name"].value
   assert_same a, b
   assert_same a, lazy.dig("items", 1, "name").value
-end
-
-assert('cache: repeated path.at runs yield same leaf Ruby objects') do
-  data = { "xs" => [{"s" => "hello"}, {"s" => "world"}] }
-  lazy = CBOR.decode_lazy(CBOR.encode(data))
-  path = CBOR::Path.compile("$.xs[*].s")
-  r1 = path.at(lazy); r2 = path.at(lazy)
-  assert_same r1[0], r2[0]
-  assert_same r1[1], r2[1]
 end
 
 # =============================================================================

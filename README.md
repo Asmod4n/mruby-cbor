@@ -227,11 +227,22 @@ Three encoding strategies, choose at runtime:
 
 ```ruby
 CBOR.no_symbols           # Default. Encode as plain string. No round-trip.
-CBOR.symbols_as_string    # Tag 39 + string.  RFC 8949 compatible.  Round-trip.
-CBOR.symbols_as_uint32    # Tag 39 + uint32.  mruby-only, fastest.   Round-trip.
+CBOR.symbols_as_string    # Tag 39 + string. RFC 8949 compatible. Round-trip.
+CBOR.symbols_as_uint32    # Tag 39 hybrid:  presym -> uint, runtime sym -> string.
 ```
 
-Use `symbols_as_string` for cross-language interop. `symbols_as_uint32` is faster but only works between mruby builds with identical presym tables — never use it for data that crosses build boundaries.
+`symbols_as_string` always emits a string payload — use this for cross-language interop.
+
+`symbols_as_uint32` picks per-symbol:
+
+- **Presym** (compile-time, `sym <= MRB_PRESYM_MAX`) → uint payload (the sym ID directly). Two bytes total for IDs `< 24`. Cheapest path; correct only between mruby builds with identical presym tables.
+- **Runtime sym** (`"foo_#{i}".to_sym`, anything `> MRB_PRESYM_MAX`) → string payload. Always portable, regardless of build.
+
+Decoders accept either payload under tag 39 in this mode and dispatch by type. Out-of-range presym IDs raise `RangeError`. The name is historical — the wire is no longer always uint32.
+
+The hybrid means runtime symbols always work across mismatched builds; only compile-time presyms care about build identity. If you don't control both ends, use `symbols_as_string`.
+
+Requires presym; on `MRB_NO_PRESYM` builds, `symbols_as_uint32` raises `NotImplementedError`.
 
 ---
 

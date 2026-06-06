@@ -45,7 +45,7 @@ assert('passes the official test vectors') do
       if roundtrip && !ROUNDTRIP_SKIP.include?(hex)
         reencoded = CBOR.encode(decoded)
         assert_equal wire, reencoded,
-          "roundtrip failed for #{hex}: got #{reencoded.bytes.map{|b| '%02x'%b}.join}"
+          "roundtrip failed for #{hex}: got #{reencoded.bytes.map{|b| '%02x'}.join}"
       end
 
     rescue NotImplementedError

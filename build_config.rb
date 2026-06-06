@@ -13,11 +13,7 @@ MRuby::Build.new do |conf|
     conf.cxx.defines << 'MRB_UTF8_STRING' << 'MRB_HIGH_PROFILE' << 'MRB_USE_MALLOC_TRIM'
     conf.enable_test
     conf.gembox 'default'
-    conf.cc.flags << '-O3' << '-march=native' << '-g -fno-omit-frame-pointer'
-    conf.cxx.flags << '-O3' << '-march=native' << '-g -fno-omit-frame-pointer'
-    conf.gem github: 'Asmod4n/mruby-benchmark-plus', branch: "main"
-    conf.gem mgem: 'mruby-simplemsgpack'
-    conf.gem mgem: 'mruby-fast-json'
-    conf.gem mgem: 'mruby-proc-irep-ext'
+    conf.cc.flags << '-O3' << '-march=native' << '-g' << '-fno-omit-frame-pointer'
+    conf.cxx.flags << '-O3' << '-march=native' << '-g' << '-fno-omit-frame-pointer'
     conf.gem File.expand_path(File.dirname(__FILE__))
 end

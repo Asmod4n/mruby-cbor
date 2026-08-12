@@ -604,10 +604,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 #ifndef MRB_ENDIAN_BIG
       if (likely(len > 1)) {
         uint8_t *tmp = mrb_alloca(mrb, len);
-        memcpy(tmp, buf, len);
-        for (mrb_int i = 0, j = len - 1; i < j; i++, j--) {
-          uint8_t t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t;
-        }
+        for (mrb_int i = 0, j = len - 1; i < len; i++, j--) tmp[i] = buf[j];
         bigbuf = tmp;
       }
 #endif

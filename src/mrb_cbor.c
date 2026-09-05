@@ -1656,7 +1656,7 @@ walk_count(CborWriter *w, mrb_value obj)
   if (mrb_integer_p(rc)) {
     /* Already counted; just bump. No recurse — children were walked when
      * we first saw this object. Cycles terminate here. */
-    mrb_hash_set(mrb, w->counts, id_key, mrb_num_add(mrb, rc, mrb_fixnum_value(1));
+    mrb_hash_set(mrb, w->counts, id_key, mrb_num_add(mrb, rc, mrb_fixnum_value(1)));
     return;
   }
   mrb_hash_set(mrb, w->counts, id_key, mrb_fixnum_value(1));

@@ -576,7 +576,7 @@ decode_float(mrb_state *mrb, Reader *r, uint8_t info)
 static mrb_value
 decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 {
-  mrb_int idx = mrb_gc_arena_save(mrb);
+  int idx = mrb_gc_arena_save(mrb);
 
   uint8_t b2 = reader_read8(mrb, r);
   uint8_t major2 = (uint8_t)(b2 >> 5);
@@ -707,7 +707,7 @@ decode_tag_sharedref(mrb_state* mrb, Reader* r, mrb_value sharedrefs)
 
     if (likely(ref_major == 0)) {
       mrb_value idx_v = read_cbor_uint(mrb, r, ref_info);
-      mrb_int idx = cbor_len_to_mrb_int(mrb, idx_v);
+      int idx = cbor_len_to_mrb_int(mrb, idx_v);
       mrb_int abs = idx + CBOR_SHAREDREFS_INDEX_BIAS;
       mrb_value found = mrb_ary_ref(mrb, sharedrefs, abs);
 
@@ -1173,7 +1173,7 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   CborWriter *w   = ctx->w;
   mrb_value   obj = ctx->obj;
 
-  mrb_int idx  = mrb_gc_arena_save(mrb);
+  int idx = mrb_gc_arena_save(mrb);
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
   if (mrb_bint_size(mrb, obj) <= 8 && sign >= 0) {
@@ -1656,7 +1656,7 @@ walk_count(CborWriter *w, mrb_value obj)
   if (mrb_integer_p(rc)) {
     /* Already counted; just bump. No recurse — children were walked when
      * we first saw this object. Cycles terminate here. */
-    mrb_hash_set(mrb, w->counts, id_key, mrb_fixnum_value(mrb_integer(rc) + 1));
+    mrb_hash_set(mrb, w->counts, id_key, mrb_num_add(mrb, rc, mrb_fixnum_value(1));
     return;
   }
   mrb_hash_set(mrb, w->counts, id_key, mrb_fixnum_value(1));
@@ -2876,7 +2876,7 @@ lazy_aref_array(mrb_state *mrb, Reader *r, mrb_value key,
 {
   mrb_value kcache = mrb_iv_get(mrb, self, MRB_SYM(kcache));
   mrb_assert(mrb_hash_p(kcache));
-  mrb_int idx = mrb_integer(mrb_ensure_int_type(mrb, key));
+  int idx = mrb_integer(mrb_ensure_int_type(mrb, key));
   mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, r, r->info));
 
   if (idx < 0) idx += len;
@@ -3065,7 +3065,7 @@ cbor_lazy_dig(mrb_state *mrb, mrb_value self)
 
     switch (major) {
       case 4: {
-        mrb_int idx = mrb_as_int(mrb, key);
+        int idx = mrb_as_int(mrb, key);
         mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
         if (idx < 0) idx += len;
         if (idx < 0 || idx >= len) { current = mrb_nil_value(); continue; }
@@ -3455,7 +3455,7 @@ cursor_walk_one_step(mrb_state *mrb, mrb_value buf, mrb_int offset,
   }
 
   if (major == 4) {
-    mrb_int idx = mrb_as_int(mrb, key);
+    int idx = mrb_as_int(mrb, key);
     mrb_int len = cbor_len_to_mrb_int(mrb, read_cbor_uint(mrb, &r, r.info));
     if (idx < 0) idx += len;
     if (idx < 0 || idx >= len)

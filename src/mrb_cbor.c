@@ -5,6 +5,19 @@
 #include <mruby/class.h>
 MRB_BEGIN_DECL
 #include <mruby/internal.h>
+
+/* mruby renamed the two Bignum byte entries on 2026-09-06 (mruby/mruby
+   053056f): mrb_bint_from_bytes is mrb_bint_new_bytes, and mrb_bint_size
+   is mrb_bint_bytes_size. Both names build here. mrbgem.rake reads the
+   header and defines MRB_CBOR_BINT_NEW_BYTES when the new names are
+   there, because the preprocessor cannot test for a name. */
+#ifdef MRB_CBOR_BINT_NEW_BYTES
+#define cbor_bint_new_bytes  mrb_bint_new_bytes
+#define cbor_bint_bytes_size mrb_bint_bytes_size
+#else
+#define cbor_bint_new_bytes  mrb_bint_from_bytes
+#define cbor_bint_bytes_size mrb_bint_size
+#endif
 MRB_END_DECL
 #include <mruby/num_helpers.h>
 #include <mruby/branch_pred.h>
@@ -609,7 +622,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
       }
 #endif
 
-      mrb_value n = mrb_bint_from_bytes(mrb, bigbuf, len);
+      mrb_value n = cbor_bint_new_bytes(mrb, bigbuf, len);
       mrb_gc_arena_restore(mrb, idx);
       mrb_gc_protect(mrb, n);
 
@@ -627,7 +640,7 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
         mrb_gc_protect(mrb, ret);
         return ret;
       } else {
-        mrb_bug(mrb, "mrb_bint_from_bytes didnt return a int or bigint");
+        mrb_bug(mrb, "the Bignum byte entry did not answer with an Integer or a Bignum");
       }
     } else {
       mrb_raise(mrb, E_RANGE_ERROR, "bignum payload length out of range");
@@ -1176,13 +1189,13 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   int idx = mrb_gc_arena_save(mrb);
   mrb_int sign = mrb_bint_sign(mrb, obj);
 
-  if (mrb_bint_size(mrb, obj) <= 8 && sign >= 0) {
+  if (cbor_bint_bytes_size(mrb, obj) <= 8 && sign >= 0) {
     encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
     mrb_gc_arena_restore(mrb, idx);
     return mrb_nil_value();
   }
 
-  if (mrb_bint_size(mrb, obj) <= 8 && sign < 0) {
+  if (cbor_bint_bytes_size(mrb, obj) <= 8 && sign < 0) {
     mrb_value abs_obj = mrb_bint_abs(mrb, obj);
     mrb_gc_protect(mrb, abs_obj);
     uint64_t n = mrb_bint_as_uint64(mrb, abs_obj) - UINT64_C(1);

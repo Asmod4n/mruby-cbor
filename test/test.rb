@@ -224,6 +224,23 @@ assert('bignum tag 3: negative bignum boundaries') do
   }
 end
 
+# RFC 8949 3.4.3: the magnitude is written most significant byte first.
+# The bytes on the wire are checked, not only the round trip: a reversed
+# order round-trips through the same code and would never be seen.
+assert('bignum: the wire carries the magnitude most significant byte first') do
+  assert_equal "\xC2\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00".b, CBOR.encode(1 << 64)
+  assert_equal "\xC2\x49\x01\x00\x00\x00\x00\x00\x00\x00\x02".b, CBOR.encode((1 << 64) + 2)
+  # -1 - n: -(2**64) - 1 carries the magnitude 2**64 under tag 3.
+  assert_equal "\xC3\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00".b, CBOR.encode(-(1 << 64) - 1)
+  assert_equal 1 << 64, CBOR.decode("\xC2\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00".b)
+  assert_equal(-(1 << 64) - 1, CBOR.decode("\xC3\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00".b))
+  # Leading zero bytes are allowed on the wire and drop out.
+  assert_equal 1 << 64, CBOR.decode("\xC2\x4A\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00".b)
+  # A magnitude that fits eight bytes is not a bignum: major type 0 or 1.
+  assert_equal "\x1B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF".b, CBOR.encode((1 << 64) - 1)
+  assert_equal "\x3B\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF".b, CBOR.encode(-(1 << 64))
+end
+
 assert('bignum §3.4.3: zero-length payload — tag(2,h\'\')=0, tag(3,h\'\')=-1') do
   assert_equal 0,  CBOR.decode("\xC2\x40")
   assert_equal(-1, CBOR.decode("\xC3\x40"))

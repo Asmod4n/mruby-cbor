@@ -6,18 +6,6 @@
 MRB_BEGIN_DECL
 #include <mruby/internal.h>
 
-/* mruby renamed the two Bignum byte entries on 2026-09-06 (mruby/mruby
-   053056f): mrb_bint_from_bytes is mrb_bint_new_bytes, and mrb_bint_size
-   is mrb_bint_bytes_size. Both names build here. mrbgem.rake reads the
-   header and defines MRB_CBOR_BINT_NEW_BYTES when the new names are
-   there, because the preprocessor cannot test for a name. */
-#ifdef MRB_CBOR_BINT_NEW_BYTES
-#define cbor_bint_new_bytes  mrb_bint_new_bytes
-#define cbor_bint_bytes_size mrb_bint_bytes_size
-#else
-#define cbor_bint_new_bytes  mrb_bint_from_bytes
-#define cbor_bint_bytes_size mrb_bint_size
-#endif
 MRB_END_DECL
 #include <mruby/num_helpers.h>
 #include <mruby/branch_pred.h>
@@ -229,22 +217,6 @@ cbor_pdiff(mrb_state *mrb, const uint8_t *p, const uint8_t *base)
   mrb_int i = mrb_as_int(mrb, mrb_convert_ptrdiff(mrb, p - base));
   mrb_assert(i >= 0);
   return i;
-}
-
-static uint8_t hex_nibble(uint8_t c)
-{
-  return (uint8_t)((c & 0xF) + ((c >> 6) & 1) * 9);
-}
-
-static void
-hex_decode_scalar(uint8_t * restrict out, const char * restrict in, size_t n)
-{
-  for (size_t i = 0; i < n; i++) {
-    out[i] = (uint8_t)(
-      (hex_nibble((uint8_t)in[2*i    ]) << 4) |
-       hex_nibble((uint8_t)in[2*i + 1])
-    );
-  }
 }
 
 // ============================================================================
@@ -612,17 +584,10 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 
       const uint8_t* buf = (const uint8_t*)RSTRING_PTR(src) + off;
       const mrb_bool negative = (mrb_cmp(mrb, tag, mrb_fixnum_value(3)) == 0);
-      const uint8_t* bigbuf = buf;
 
-#ifndef MRB_ENDIAN_BIG
-      if (likely(len > 1)) {
-        uint8_t *tmp = mrb_alloca(mrb, len);
-        for (mrb_int i = 0, j = len - 1; i < len; i++, j--) tmp[i] = buf[j];
-        bigbuf = tmp;
-      }
-#endif
-
-      mrb_value n = cbor_bint_new_bytes(mrb, bigbuf, len);
+      /* RFC 8949 3.4.3: the magnitude, most significant byte first, which
+         is the order mrb_integer_from_bytes reads. */
+      mrb_value n = mrb_integer_from_bytes(mrb, buf, (size_t)len, 1);
       mrb_gc_arena_restore(mrb, idx);
       mrb_gc_protect(mrb, n);
 
@@ -1175,96 +1140,51 @@ static mrb_value cbor_proc_cache_lookup(CborWriter *w, mrb_value obj);
 struct encode_bignum_ctx {
   CborWriter *w;
   mrb_value   obj;
-  char       *hbuf;
   uint8_t    *out;
 };
 
+/* RFC 8949 3.4.3: a bignum is tag 2 or 3 over the magnitude, most
+   significant byte first; a negative one carries -1 - n. A magnitude
+   that fits eight bytes is not a bignum at all and goes as major type
+   0 or 1, which is what a decoder expects of it. */
 static mrb_value
 encode_bignum_body(mrb_state *mrb, void *ud)
 {
   struct encode_bignum_ctx *ctx = (struct encode_bignum_ctx*) ud;
-  CborWriter *w   = ctx->w;
-  mrb_value   obj = ctx->obj;
+  CborWriter *w = ctx->w;
 
   int idx = mrb_gc_arena_save(mrb);
-  mrb_int sign = mrb_bint_sign(mrb, obj);
-
-  if (cbor_bint_bytes_size(mrb, obj) <= 8 && sign >= 0) {
-    encode_uint64(w, mrb_bint_as_uint64(mrb, obj));
-    mrb_gc_arena_restore(mrb, idx);
-    return mrb_nil_value();
-  }
-
-  if (cbor_bint_bytes_size(mrb, obj) <= 8 && sign < 0) {
-    mrb_value abs_obj = mrb_bint_abs(mrb, obj);
-    mrb_gc_protect(mrb, abs_obj);
-    uint64_t n = mrb_bint_as_uint64(mrb, abs_obj) - UINT64_C(1);
-    encode_len(w, 1, n);
-    mrb_gc_arena_restore(mrb, idx);
-    return mrb_nil_value();
-  }
-
-  mrb_value mag = mrb_bint_abs(mrb, obj);
+  const mrb_bool negative = mrb_bint_sign(mrb, ctx->obj) < 0;
+  mrb_value mag = mrb_bint_abs(mrb, ctx->obj);
   mrb_gc_protect(mrb, mag);
-  if (sign < 0) {
-    mrb_value one = mrb_fixnum_value(1);
-    mag = mrb_bint_sub(mrb, mag, one);
+  if (negative) {
+    mag = mrb_bint_sub(mrb, mag, mrb_fixnum_value(1));
     mrb_gc_protect(mrb, mag);
   }
 
-  mrb_value hex = mrb_bint_to_s(mrb, mag, 16);
-  mrb_gc_protect(mrb, hex);
+  const size_t len = mrb_integer_to_bytes(mrb, mag, NULL, 0, NULL);
+  if (len <= 8) {
+    uint8_t b[8] = {0};
+    mrb_integer_to_bytes(mrb, mag, b, sizeof b, NULL);
+    uint64_t n = 0;
+    for (size_t i = 0; i < len; i++) n = (n << 8) | b[i];
+    encode_len(w, negative ? 1 : 0, n);
+    mrb_gc_arena_restore(mrb, idx);
+    return mrb_nil_value();
+  }
 
-  mrb_int len  = RSTRING_LEN(hex);
-  char   *hbuf = (char*)mrb_malloc(mrb, len + 2);
-  ctx->hbuf    = hbuf;
-  memcpy(hbuf, RSTRING_PTR(hex), len);
-  hbuf[len] = '\0';
-
+  uint8_t *out = (uint8_t*)mrb_malloc(mrb, len);
+  ctx->out = out;
+  mrb_integer_to_bytes(mrb, mag, out, len, NULL);
   mrb_gc_arena_restore(mrb, idx);
 
-  char *p = hbuf;
-  while (len > 0 && *p == '0') { p++; len--; }
-
-  if (len == 0) {
-    uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
-    cbor_writer_write(w, &tag, 1);
-    encode_len(w, 2, 1);
-    uint8_t zero = 0;
-    cbor_writer_write(w, &zero, 1);
-    mrb_free(mrb, hbuf);
-    ctx->hbuf = NULL;
-    return mrb_nil_value();
-  }
-
-  mrb_bool odd      = (len & 1);
-  mrb_int  byte_len = (odd ? len + 1 : len) / 2;
-
-  if (sign < 0 && byte_len <= 8) {
-    uint64_t n = 0;
-    const char *q = p;
-    for (mrb_int i = 0; i < len; i++)
-      n = (n << 4) | hex_nibble((uint8_t)q[i]);
-    encode_len(w, 1, n);
-    mrb_free(mrb, hbuf);
-    ctx->hbuf = NULL;
-    return mrb_nil_value();
-  }
-
-  uint8_t tag = (sign < 0) ? 0xC3 : 0xC2;
+  const uint8_t tag = negative ? 0xC3 : 0xC2;
   cbor_writer_write(w, &tag, 1);
-  encode_len(w, 2, (uint64_t)byte_len);
+  encode_len(w, 2, (uint64_t)len);
+  cbor_writer_write(w, out, len);
 
-  if (odd) { memmove(p + 1, p, len); p[0] = '0'; }
-
-  uint8_t *out = (uint8_t*)mrb_malloc(mrb, byte_len);
-  ctx->out     = out;
-  hex_decode_scalar(out, p, byte_len);
-  cbor_writer_write(w, out, (size_t)byte_len);
-
-  mrb_free(mrb, hbuf); ctx->hbuf = NULL;
-  mrb_free(mrb, out);  ctx->out  = NULL;
-
+  mrb_free(mrb, out);
+  ctx->out = NULL;
   return mrb_nil_value();
 }
 
@@ -1273,12 +1193,11 @@ encode_bignum(CborWriter *w, mrb_value obj)
 {
   mrb_state *mrb = w->mrb;
 
-  struct encode_bignum_ctx ctx = { w, obj, NULL, NULL };
+  struct encode_bignum_ctx ctx = { w, obj, NULL };
   mrb_bool error = FALSE;
   mrb_value exc = mrb_protect_error(mrb, encode_bignum_body, &ctx, &error);
 
-  if (ctx.hbuf) { mrb_free(mrb, ctx.hbuf); }
-  if (ctx.out)  { mrb_free(mrb, ctx.out);  }
+  if (ctx.out) { mrb_free(mrb, ctx.out); }
 
   if (error) { mrb_exc_raise(mrb, exc); }
 }

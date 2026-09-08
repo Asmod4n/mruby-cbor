@@ -349,6 +349,26 @@ ensure_slice_bounds(mrb_state* mrb, mrb_value src, mrb_int off, mrb_int blen)
 // ============================================================================
 // Integers
 // ============================================================================
+/* CBOR writes a negative Integer as -1 - n, and n arrives as a magnitude,
+   most significant byte first. The answer's magnitude is n + 1, so the
+   carry runs backward over the bytes; the leading zero byte holds it when
+   every other byte is 0xFF. The buffer is a String, so a raise frees it
+   through the GC. */
+static mrb_value
+negative_from_magnitude(mrb_state *mrb, const uint8_t *mag, size_t len)
+{
+  mrb_value tmp = mrb_str_new(mrb, NULL, (mrb_int)len + 1);
+  uint8_t *buf = (uint8_t*)RSTRING_PTR(tmp);
+  buf[0] = 0;
+  memcpy(buf + 1, mag, len);
+
+  size_t i = len;
+  while (buf[i] == 0xFF) { buf[i] = 0; i--; }
+  buf[i]++;
+
+  return mrb_integer_from_bytes(mrb, buf, len + 1, -1);
+}
+
 static mrb_value
 decode_unsigned(mrb_state* mrb, Reader* r, uint8_t info)
 {
@@ -368,9 +388,9 @@ decode_negative(mrb_state* mrb, Reader* r, uint8_t info)
 
 #ifdef MRB_USE_BIGINT
   else if (mrb_bigint_p(n)) {
-    mrb_value np1 = mrb_bint_add(mrb, n, mrb_fixnum_value(1));
-    mrb_gc_protect(mrb, np1);
-    mrb_value res = mrb_bint_neg(mrb, np1);
+    uint8_t mag[8];
+    const size_t len = mrb_integer_to_bytes(mrb, n, mag, sizeof mag, NULL);
+    mrb_value res = negative_from_magnitude(mrb, mag, len);
     mrb_gc_arena_restore(mrb, idx);
     mrb_gc_protect(mrb, res);
     return res;
@@ -587,26 +607,11 @@ decode_tagged_bignum(mrb_state* mrb, Reader* r, mrb_value src, mrb_value tag)
 
       /* RFC 8949 3.4.3: the magnitude, most significant byte first, which
          is the order mrb_integer_from_bytes reads. */
-      mrb_value n = mrb_integer_from_bytes(mrb, buf, (size_t)len, 1);
+      mrb_value ret = negative ? negative_from_magnitude(mrb, buf, (size_t)len)
+                               : mrb_integer_from_bytes(mrb, buf, (size_t)len, 1);
       mrb_gc_arena_restore(mrb, idx);
-      mrb_gc_protect(mrb, n);
-
-      if (!negative) return n;
-
-      if (mrb_integer_p(n)) {
-        mrb_int v = mrb_integer(n);
-        return mrb_convert_mrb_int(mrb, -1 - v);
-      } else if (mrb_bigint_p(n)) {
-        mrb_value one = mrb_fixnum_value(1);
-        mrb_value n_plus_1 = mrb_bint_add(mrb, n, one);
-        mrb_gc_protect(mrb, n_plus_1);
-        mrb_value ret = mrb_bint_neg(mrb, n_plus_1);
-        mrb_gc_arena_restore(mrb, idx);
-        mrb_gc_protect(mrb, ret);
-        return ret;
-      } else {
-        mrb_bug(mrb, "the Bignum byte entry did not answer with an Integer or a Bignum");
-      }
+      mrb_gc_protect(mrb, ret);
+      return ret;
     } else {
       mrb_raise(mrb, E_RANGE_ERROR, "bignum payload length out of range");
     }
@@ -1140,7 +1145,6 @@ static mrb_value cbor_proc_cache_lookup(CborWriter *w, mrb_value obj);
 struct encode_bignum_ctx {
   CborWriter *w;
   mrb_value   obj;
-  uint8_t    *out;
 };
 
 /* RFC 8949 3.4.3: a bignum is tag 2 or 3 over the magnitude, most
@@ -1154,37 +1158,38 @@ encode_bignum_body(mrb_state *mrb, void *ud)
   CborWriter *w = ctx->w;
 
   int idx = mrb_gc_arena_save(mrb);
-  const mrb_bool negative = mrb_bint_sign(mrb, ctx->obj) < 0;
-  mrb_value mag = mrb_bint_abs(mrb, ctx->obj);
-  mrb_gc_protect(mrb, mag);
+  int sign = 0;
+  size_t len = mrb_integer_to_bytes(mrb, ctx->obj, NULL, 0, &sign);
+  const mrb_bool negative = sign < 0;
+
+  /* The buffer is a String, so a raise below frees it through the GC. */
+  mrb_value tmp = mrb_str_new(mrb, NULL, (mrb_int)len);
+  uint8_t *mag = (uint8_t*)RSTRING_PTR(tmp);
+  mrb_integer_to_bytes(mrb, ctx->obj, mag, len, NULL);
+
   if (negative) {
-    mag = mrb_bint_sub(mrb, mag, mrb_fixnum_value(1));
-    mrb_gc_protect(mrb, mag);
+    /* -1 - n has the magnitude |n| - 1, and the borrow runs backward
+       over the bytes. |n| is one or more, so the loop always ends. */
+    size_t i = len - 1;
+    while (mag[i] == 0) { mag[i] = 0xFF; i--; }
+    mag[i]--;
+    while (len > 1 && mag[0] == 0) { mag++; len--; }
   }
 
-  const size_t len = mrb_integer_to_bytes(mrb, mag, NULL, 0, NULL);
   if (len <= 8) {
-    uint8_t b[8] = {0};
-    mrb_integer_to_bytes(mrb, mag, b, sizeof b, NULL);
     uint64_t n = 0;
-    for (size_t i = 0; i < len; i++) n = (n << 8) | b[i];
+    for (size_t i = 0; i < len; i++) n = (n << 8) | mag[i];
     encode_len(w, negative ? 1 : 0, n);
     mrb_gc_arena_restore(mrb, idx);
     return mrb_nil_value();
   }
 
-  uint8_t *out = (uint8_t*)mrb_malloc(mrb, len);
-  ctx->out = out;
-  mrb_integer_to_bytes(mrb, mag, out, len, NULL);
-  mrb_gc_arena_restore(mrb, idx);
-
   const uint8_t tag = negative ? 0xC3 : 0xC2;
   cbor_writer_write(w, &tag, 1);
   encode_len(w, 2, (uint64_t)len);
-  cbor_writer_write(w, out, len);
+  cbor_writer_write(w, mag, len);
 
-  mrb_free(mrb, out);
-  ctx->out = NULL;
+  mrb_gc_arena_restore(mrb, idx);
   return mrb_nil_value();
 }
 
@@ -1193,11 +1198,9 @@ encode_bignum(CborWriter *w, mrb_value obj)
 {
   mrb_state *mrb = w->mrb;
 
-  struct encode_bignum_ctx ctx = { w, obj, NULL };
+  struct encode_bignum_ctx ctx = { w, obj };
   mrb_bool error = FALSE;
   mrb_value exc = mrb_protect_error(mrb, encode_bignum_body, &ctx, &error);
-
-  if (ctx.out) { mrb_free(mrb, ctx.out); }
 
   if (error) { mrb_exc_raise(mrb, exc); }
 }

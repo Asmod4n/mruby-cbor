@@ -3,13 +3,20 @@
 #include <mruby/array.h>
 #include <mruby/hash.h>
 #include <mruby/class.h>
-MRB_BEGIN_DECL
-#include <mruby/internal.h>
-
-MRB_END_DECL
 #include <mruby/num_helpers.h>
 #include <mruby/branch_pred.h>
 #include <mruby/presym.h>
+/* MRB_PRESYM_MAX: mruby moved it out of presym/id.h, which
+ * mruby/presym.h includes, into the table header. Tag 39 names a symbol
+ * by its presym number, so this file needs the count.
+ *
+ * The guard is the one mruby/presym.h and src/symbol.c both use. The
+ * build preprocesses every source to find the symbol literals in it, and
+ * it writes these headers from what it finds - so during that pass the
+ * header this asks for does not exist yet. */
+#ifndef MRB_PRESYM_SCANNING
+#include <mruby/presym/table.h>
+#endif
 #include <mruby/string_is_utf8.h>
 #include <mruby/data.h>
 #include <mruby/variable.h>

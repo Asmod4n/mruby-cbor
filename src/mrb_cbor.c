@@ -183,24 +183,16 @@ reader_check_depth(mrb_state *mrb, Reader *r)
     mrb_raise(mrb, E_RUNTIME_ERROR, "CBOR nesting depth exceeded");
 }
 
-#define CBOR_SBO_STACK_CAP (16 * 1024)
-
 typedef struct {
-  uint8_t stack_buf[CBOR_SBO_STACK_CAP];
-
   mrb_state *mrb;
-  char      *heap_ptr;
-  mrb_value  heap_str;
+  mrb_value  str;        /* the result; every write appends to it, so its
+                            bytes are always RSTRING_PTR(str). */
   mrb_value  counts;     /* obj_id -> refcount (Pass 1).
                             mrb_undef_value() = sharedrefs encoding inactive. */
   mrb_value  slots;      /* obj_id -> assigned slot (Pass 2, lazy). */
   mrb_value  proc_cache; /* obj_id -> transformed value (proc tag encode-proc
                             results / _before_encode results); cached in Pass 1
                             to avoid re-invocation in Pass 2. */
-  size_t     stack_len;
-  size_t     heap_len;
-  size_t     heap_capa;
-  mrb_int    arena_index;
   mrb_int    depth;
   mrb_int    next_slot;  /* next sharedref slot index (Pass 2). */
 } CborWriter;
@@ -942,96 +934,21 @@ decode_value(mrb_state* mrb, Reader* r, mrb_value src, mrb_value sharedrefs)
 static void
 cbor_writer_init(CborWriter *w, mrb_state *mrb)
 {
-  w->stack_len   = 0;
   w->mrb         = mrb;
-  w->heap_ptr    = NULL;
-  w->heap_str    = mrb_undef_value();
+  /* In the caller's arena, below every element: the per-element arena
+     restores in encode_array and encode_map_foreach never reach it. */
+  w->str         = mrb_str_new_capa(mrb, 64);
   w->counts      = mrb_undef_value();
   w->slots       = mrb_undef_value();
   w->proc_cache  = mrb_undef_value();
-  w->heap_len    = 0;
-  w->heap_capa   = 0;
-  w->arena_index = mrb_gc_arena_save(mrb);
   w->depth       = 0;
   w->next_slot   = 0;
-}
-
-static size_t next_pow2(size_t x)
-{
-  x--;
-  x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
-#if SIZE_MAX > UINT32_MAX
-  x |= x >> 32;
-#endif
-  x++;
-  return x;
-}
-
-static void
-cbor_writer_init_heap(CborWriter *w, size_t need)
-{
-  mrb_state *mrb = w->mrb;
-  size_t stack_len = w->stack_len;
-
-  if (likely(need <= SIZE_MAX - stack_len)) {
-    size_t capa = next_pow2(stack_len + need);
-    w->heap_str = mrb_str_new_capa(mrb, (mrb_int)capa);
-    mrb_gc_register(mrb, w->heap_str);
-    w->arena_index = mrb_gc_arena_save(mrb);
-    struct RString *s = RSTRING(w->heap_str);
-    w->heap_ptr  = RSTR_PTR(s);
-    w->heap_capa = (size_t)RSTR_CAPA(s);
-    if (likely(stack_len > 0)) {
-      memcpy(w->heap_ptr, w->stack_buf, stack_len);
-      w->heap_len = stack_len;
-    } else {
-      w->heap_len = 0;
-    }
-    return;
-  }
-  mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
-}
-
-static void
-cbor_writer_ensure_heap(CborWriter *w, size_t add)
-{
-  if (add <= w->heap_capa - w->heap_len) return;
-
-  if (likely(add <= SIZE_MAX - w->heap_len)) {
-    size_t capa = next_pow2(w->heap_len + add);
-    mrb_str_resize(w->mrb, w->heap_str, (mrb_int)capa);
-    struct RString *s = RSTRING(w->heap_str);
-    w->heap_ptr  = RSTR_PTR(s);
-    w->heap_capa = (size_t)RSTR_CAPA(s);
-  } else {
-    mrb_state *mrb = w->mrb;
-    mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
-  }
 }
 
 static void
 cbor_writer_write(CborWriter *w, const uint8_t *buf, size_t len)
 {
-  if (likely(len > 0)) {
-    size_t stack_len = w->stack_len;
-    if (mrb_undef_p(w->heap_str) && len <= CBOR_SBO_STACK_CAP - stack_len) {
-      memcpy(w->stack_buf + stack_len, buf, len);
-      w->stack_len = stack_len + len;
-    } else {
-      if (mrb_undef_p(w->heap_str)) {
-        if (likely(len <= SIZE_MAX - stack_len)) {
-          cbor_writer_init_heap(w, len);
-        } else {
-          mrb_state *mrb = w->mrb;
-          mrb_raise(mrb, E_RANGE_ERROR, "heap size overflow");
-        }
-      }
-      cbor_writer_ensure_heap(w, len);
-      memcpy(w->heap_ptr + w->heap_len, buf, len);
-      w->heap_len += len;
-      mrb_gc_arena_restore(w->mrb, w->arena_index);
-    }
-  }
+  mrb_str_cat(w->mrb, w->str, (const char*)buf, len);
 }
 
 static mrb_value
@@ -1041,18 +958,7 @@ cbor_writer_finish(CborWriter *w)
   if (mrb_hash_p(w->counts))     mrb_gc_unregister(mrb, w->counts);
   if (mrb_hash_p(w->slots))      mrb_gc_unregister(mrb, w->slots);
   if (mrb_hash_p(w->proc_cache)) mrb_gc_unregister(mrb, w->proc_cache);
-  if (likely(mrb_undef_p(w->heap_str))) {
-    return mrb_str_new(mrb, (const char*)w->stack_buf, (mrb_int)w->stack_len);
-  } else if (mrb_string_p(w->heap_str)) {
-    struct RString *s = RSTRING(w->heap_str);
-    RSTR_SET_LEN(s, (mrb_int)w->heap_len);
-    w->heap_ptr[w->heap_len] = '\0';
-    mrb_gc_unregister(mrb, w->heap_str);
-    return w->heap_str;
-  } else {
-    mrb_bug(mrb, "CBOR internal error: heap string is not a string");
-  }
-  return mrb_undef_value();
+  return w->str;
 }
 
 static void
@@ -1227,7 +1133,11 @@ encode_array(CborWriter* w, mrb_value ary)
   basic_ary->frozen = TRUE;
   mrb_int len = RARRAY_LEN(ary);
   encode_len(w, 4, (uint64_t)len);
-  for (mrb_int i = 0; i < len; i++) encode_value(w, mrb_ary_ref(w->mrb, ary, i));
+  int ai = mrb_gc_arena_save(w->mrb);
+  for (mrb_int i = 0; i < len; i++) {
+    encode_value(w, mrb_ary_ref(w->mrb, ary, i));
+    mrb_gc_arena_restore(w->mrb, ai);
+  }
   basic_ary->frozen = was_frozen;
 }
 
@@ -1235,6 +1145,7 @@ static int
 encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
   CborWriter *w = (CborWriter*)data;
+  int ai = mrb_gc_arena_save(mrb);
   /* Suppress sharedref tracking while encoding the key.
    * Hash keys do not participate in Tag 28/29 deduplication. Pass 1's
    * walk already skipped Hash keys — so even if a key obj_id collides
@@ -1246,6 +1157,7 @@ encode_map_foreach(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
   encode_value(w, key);
   w->counts = saved_counts;
   encode_value(w, val);
+  mrb_gc_arena_restore(mrb, ai);
   return 0;
 }
 
